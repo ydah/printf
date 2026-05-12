@@ -27,6 +27,8 @@ module PFC
     def optimize_loop(loop)
       body = optimize_instructions(loop.body)
       return IR::ClearCell.new if clear_loop?(body)
+      transfer = transfer_loop(body)
+      return transfer if transfer
 
       IR::Loop.new(body)
     end
@@ -35,6 +37,32 @@ module PFC
       body.length == 1 &&
         body.first.is_a?(IR::AddCell) &&
         [1, -1].include?(body.first.delta)
+    end
+
+    def transfer_loop(body)
+      return nil unless body.first.is_a?(IR::AddCell) && body.first.delta == -1
+
+      cursor = 0
+      transfers = Hash.new(0)
+      body[1..].each do |instruction|
+        case instruction
+        when IR::MovePtr
+          cursor += instruction.delta
+        when IR::AddCell
+          return nil if cursor.zero?
+
+          transfers[cursor] += instruction.delta
+        else
+          return nil
+        end
+      end
+
+      return nil unless cursor.zero?
+
+      compacted = transfers.reject { |_offset, scale| scale.zero? }.sort.to_h
+      return nil if compacted.empty?
+
+      IR::TransferCell.new(compacted.to_a)
     end
 
     def coalesce(instructions)

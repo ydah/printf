@@ -67,4 +67,10 @@ class LLVMSubsetTest < Minitest::Test
 
     assert program.instructions.any? { |instruction| instruction.is_a?(PFC::IR::OutputCell) }
   end
+
+  def test_dumps_cfg_for_dynamic_programs
+    source = File.read(File.expand_path("../samples/dynamic_branch.ll", __dir__))
+
+    assert_includes PFC::Backend::LLVMCEmitter.new(source).dump_ir, "LLVMSubsetCFG(blocks: entry, yes, no, merge"
+  end
 end

@@ -75,6 +75,8 @@ module PFC
           ["#{spaces}pf_read_cell(pf_sink, &tape[dp]);"]
         when IR::ClearCell
           ["#{spaces}pf_clear_cell(pf_sink, &tape[dp]);"]
+        when IR::TransferCell
+          emit_transfer_cell(instruction, spaces)
         when IR::Loop
           emit_loop(instruction, indent:)
         else
@@ -102,6 +104,15 @@ module PFC
       def emit_move_ptr(instruction, spaces)
         helper = strict_printf? ? "pf_move_ptr_strict" : "pf_move_ptr"
         ["#{spaces}if (#{helper}(pf_sink, &dp, #{instruction.delta}) != 0) PF_ABORT();"]
+      end
+
+      def emit_transfer_cell(instruction, spaces)
+        helper = strict_printf? ? "pf_transfer_cell_strict" : "pf_transfer_cell"
+        lines = instruction.transfers.map do |offset, scale|
+          "#{spaces}if (#{helper}(pf_sink, tape, dp, #{offset}, #{scale}) != 0) PF_ABORT();"
+        end
+        lines << "#{spaces}pf_clear_cell(pf_sink, &tape[dp]);"
+        lines
       end
 
       def strict_cell_steps(delta)

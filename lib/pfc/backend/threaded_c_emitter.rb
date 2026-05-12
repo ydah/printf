@@ -9,10 +9,11 @@ module PFC
       DEFAULT_TAPE_SIZE = 30_000
       MAX_PROGRAM_LENGTH = 65_535
 
-      FlatInstruction = Struct.new(:opcode, :operand, keyword_init: true)
+      FlatInstruction = Struct.new(:opcode, :operand, :operand2, keyword_init: true)
 
-      def initialize(tape_size: DEFAULT_TAPE_SIZE)
+      def initialize(tape_size: DEFAULT_TAPE_SIZE, strict_printf: false)
         @tape_size = Integer(tape_size)
+        @strict_printf = strict_printf
         validate_tape_size!
       end
 
@@ -38,6 +39,10 @@ module PFC
 
       attr_reader :tape_size
 
+      def strict_printf?
+        @strict_printf
+      end
+
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
 
@@ -53,7 +58,7 @@ module PFC
       def flatten(instructions)
         output = []
         flatten_into(instructions, output)
-        output << FlatInstruction.new(opcode: "PF_OP_HALT", operand: 0)
+        output << FlatInstruction.new(opcode: "PF_OP_HALT", operand: 0, operand2: 0)
         output
       end
 
@@ -61,15 +66,17 @@ module PFC
         instructions.each do |instruction|
           case instruction
           when IR::AddCell
-            output << FlatInstruction.new(opcode: "PF_OP_ADD", operand: instruction.delta)
+            output << FlatInstruction.new(opcode: "PF_OP_ADD", operand: instruction.delta, operand2: 0)
           when IR::MovePtr
-            output << FlatInstruction.new(opcode: "PF_OP_MOVE", operand: instruction.delta)
+            output << FlatInstruction.new(opcode: "PF_OP_MOVE", operand: instruction.delta, operand2: 0)
           when IR::OutputCell
-            output << FlatInstruction.new(opcode: "PF_OP_OUTPUT", operand: 0)
+            output << FlatInstruction.new(opcode: "PF_OP_OUTPUT", operand: 0, operand2: 0)
           when IR::InputCell
-            output << FlatInstruction.new(opcode: "PF_OP_INPUT", operand: 0)
+            output << FlatInstruction.new(opcode: "PF_OP_INPUT", operand: 0, operand2: 0)
           when IR::ClearCell
-            output << FlatInstruction.new(opcode: "PF_OP_CLEAR", operand: 0)
+            output << FlatInstruction.new(opcode: "PF_OP_CLEAR", operand: 0, operand2: 0)
+          when IR::TransferCell
+            flatten_transfer(instruction, output)
           when IR::Loop
             flatten_loop(instruction, output)
           else
@@ -80,10 +87,17 @@ module PFC
 
       def flatten_loop(loop, output)
         start_index = output.length
-        output << FlatInstruction.new(opcode: "PF_OP_JZ", operand: 0)
+        output << FlatInstruction.new(opcode: "PF_OP_JZ", operand: 0, operand2: 0)
         flatten_into(loop.body, output)
-        output << FlatInstruction.new(opcode: "PF_OP_JNZ", operand: start_index)
+        output << FlatInstruction.new(opcode: "PF_OP_JNZ", operand: start_index, operand2: 0)
         output[start_index].operand = output.length
+      end
+
+      def flatten_transfer(instruction, output)
+        instruction.transfers.each do |offset, scale|
+          output << FlatInstruction.new(opcode: "PF_OP_TRANSFER", operand: offset, operand2: scale)
+        end
+        output << FlatInstruction.new(opcode: "PF_OP_CLEAR", operand: 0, operand2: 0)
       end
 
       def type_definitions
@@ -94,6 +108,7 @@ module PFC
           "    PF_OP_OUTPUT,",
           "    PF_OP_INPUT,",
           "    PF_OP_CLEAR,",
+          "    PF_OP_TRANSFER,",
           "    PF_OP_JZ,",
           "    PF_OP_JNZ,",
           "    PF_OP_HALT",
@@ -102,6 +117,7 @@ module PFC
           "typedef struct {",
           "    unsigned char opcode;",
           "    int operand;",
+          "    int operand2;",
           "} PFInstruction;"
         ]
       end
@@ -109,7 +125,7 @@ module PFC
       def program_table(flat_program)
         lines = ["static const PFInstruction pf_program[] = {"]
         flat_program.each do |instruction|
-          lines << "    {#{instruction.opcode}, #{instruction.operand}},"
+          lines << "    {#{instruction.opcode}, #{instruction.operand}, #{instruction.operand2}},"
         end
         lines << "};"
         lines
@@ -137,11 +153,11 @@ module PFC
           "",
           "        switch ((PFOpcode)opcode) {",
           "        case PF_OP_ADD:",
-          "            pf_add_cell(pf_sink, &tape[dp], instruction.operand);",
+          add_cell_dispatch_line,
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
           "        case PF_OP_MOVE:",
-          "            if (pf_move_ptr(pf_sink, &dp, instruction.operand) != 0) PF_ABORT();",
+          "            if (#{move_ptr_helper}(pf_sink, &dp, instruction.operand) != 0) PF_ABORT();",
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
           "        case PF_OP_OUTPUT:",
@@ -154,6 +170,10 @@ module PFC
           "            break;",
           "        case PF_OP_CLEAR:",
           "            pf_clear_cell(pf_sink, &tape[dp]);",
+          "            pf_advance_ip(pf_sink, &ip);",
+          "            break;",
+          "        case PF_OP_TRANSFER:",
+          "            if (#{transfer_cell_helper}(pf_sink, tape, dp, instruction.operand, instruction.operand2) != 0) PF_ABORT();",
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
           "        case PF_OP_JZ:",
@@ -184,6 +204,19 @@ module PFC
           "    return 0;",
           "}"
         ]
+      end
+
+      def add_cell_dispatch_line
+        helper = strict_printf? ? "pf_add_cell_strict" : "pf_add_cell"
+        "            #{helper}(pf_sink, &tape[dp], instruction.operand);"
+      end
+
+      def move_ptr_helper
+        strict_printf? ? "pf_move_ptr_strict" : "pf_move_ptr"
+      end
+
+      def transfer_cell_helper
+        strict_printf? ? "pf_transfer_cell_strict" : "pf_transfer_cell"
       end
     end
   end

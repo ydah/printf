@@ -50,4 +50,26 @@ class CEmitterTest < Minitest::Test
     assert_includes source, "PF_OP_JZ"
     assert_includes source, "PF_OP_JNZ"
   end
+
+  def test_threaded_emitter_can_use_strict_primitives
+    source = PFC::Backend::ThreadedCEmitter.new(strict_printf: true).emit(PFC::Frontend::Brainfuck.parse("+>"))
+
+    assert_includes source, "pf_add_cell_strict(pf_sink, &tape[dp], instruction.operand);"
+    assert_includes source, "pf_move_ptr_strict(pf_sink, &dp, instruction.operand)"
+  end
+
+  def test_emits_transfer_cell_primitive
+    program = PFC::IR::Program.new([PFC::IR::TransferCell.new([[1, 2]])])
+    source = PFC::Backend::CEmitter.new.emit(program)
+
+    assert_includes source, "pf_transfer_cell(pf_sink, tape, dp, 1, 2)"
+    assert_includes source, "pf_clear_cell(pf_sink, &tape[dp]);"
+  end
+
+  def test_strict_emits_strict_transfer_cell_primitive
+    program = PFC::IR::Program.new([PFC::IR::TransferCell.new([[1, 2]])])
+    source = PFC::Backend::CEmitter.new(strict_printf: true).emit(program)
+
+    assert_includes source, "pf_transfer_cell_strict(pf_sink, tape, dp, 1, 2)"
+  end
 end

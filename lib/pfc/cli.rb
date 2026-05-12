@@ -6,6 +6,7 @@ require "optparse"
 require "tmpdir"
 
 require_relative "backend/c_emitter"
+require_relative "backend/llvm_c_emitter"
 require_relative "backend/threaded_c_emitter"
 require_relative "frontend/brainfuck"
 require_relative "frontend/llvm_subset"
@@ -94,6 +95,11 @@ module PFC
     def dump_ir_command
       options = parse_options
       source_path = require_input_path!
+      if llvm_source?(source_path)
+        puts Backend::LLVMCEmitter.new(File.read(source_path), tape_size: options[:tape_size]).dump_ir
+        return 0
+      end
+
       puts compile_ir(File.read(source_path), options, source_path:).inspect
       0
     end
@@ -148,13 +154,20 @@ module PFC
     end
 
     def compile_source(source, options, source_path: nil)
+      if llvm_source?(source_path)
+        return Backend::LLVMCEmitter.new(source, tape_size: options[:tape_size]).emit
+      end
+
       program = compile_ir(source, options, source_path:)
       emitter_for(options).emit(program)
     end
 
     def emitter_for(options)
       if options[:backend] == "printf-threaded"
-        return Backend::ThreadedCEmitter.new(tape_size: options[:tape_size])
+        return Backend::ThreadedCEmitter.new(
+          tape_size: options[:tape_size],
+          strict_printf: options[:strict_printf]
+        )
       end
 
       Backend::CEmitter.new(
@@ -171,9 +184,13 @@ module PFC
     end
 
     def parse_program(source, source_path)
-      return Frontend::LLVMSubset.parse(source) if File.extname(source_path.to_s) == ".ll"
+      return Frontend::LLVMSubset.parse(source) if llvm_source?(source_path)
 
       Frontend::Brainfuck.parse(source)
+    end
+
+    def llvm_source?(source_path)
+      File.extname(source_path.to_s) == ".ll"
     end
 
     def compile_c(c_path, output, cc:, debug:)

@@ -47,6 +47,12 @@ class IntegrationTest < Minitest::Test
     assert_equal "abc", compile_and_run(source, input: "abc\x00tail", backend: :threaded)
   end
 
+  def test_threaded_backend_runs_strict_hello_world
+    source = File.read(File.expand_path("../samples/hello.bf", __dir__))
+
+    assert_equal "Hello World!\n", compile_and_run(source, backend: :threaded, strict_printf: true)
+  end
+
   def test_runs_llvm_constant_putchar_sample
     ir = PFC::Frontend::LLVMSubset.parse(File.read(File.expand_path("../samples/putchar.ll", __dir__)))
     ir = PFC::Optimizer.optimize(ir)
@@ -59,5 +65,18 @@ class IntegrationTest < Minitest::Test
     ir = PFC::Optimizer.optimize(ir)
 
     assert_equal "B", compile_ir_and_run(ir, input: "A")
+  end
+
+  def test_runs_llvm_dynamic_branch_sample
+    assert_equal "Y", compile_llvm_and_run("samples/dynamic_branch.ll", input: "A")
+    assert_equal "N", compile_llvm_and_run("samples/dynamic_branch.ll", input: "B")
+  end
+
+  def test_runs_llvm_loop_sample
+    assert_equal "XXX", compile_llvm_and_run("samples/countdown.ll")
+  end
+
+  def test_runs_llvm_gep_array_sample
+    assert_equal "AB", compile_llvm_and_run("samples/gep_array.ll")
   end
 end

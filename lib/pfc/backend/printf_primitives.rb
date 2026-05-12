@@ -36,6 +36,49 @@ module PFC
               pf_set_cell(pf_sink, cell, 0);
           }
 
+          static inline void PF_MAYBE_UNUSED pf_add_cell_strict(FILE *pf_sink, unsigned char *cell, int delta) {
+              int steps = delta % 256;
+              if (steps < 0) {
+                  steps += 256;
+              }
+
+              if (steps <= 128) {
+                  while (steps > 0) {
+                      pf_inc_cell(pf_sink, cell);
+                      steps--;
+                  }
+                  return;
+              }
+
+              steps = 256 - steps;
+              while (steps > 0) {
+                  pf_dec_cell(pf_sink, cell);
+                  steps--;
+              }
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_transfer_cell(FILE *pf_sink, unsigned char *tape, unsigned short dp, int offset, int scale) {
+              int target = (int)dp + offset;
+              if (target < 0 || target >= TAPE_SIZE) {
+                  fprintf(stderr, "pfc runtime error: transfer target out of range: %d\\n", target);
+                  return 1;
+              }
+
+              pf_add_cell(pf_sink, &tape[target], (int)tape[dp] * scale);
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_transfer_cell_strict(FILE *pf_sink, unsigned char *tape, unsigned short dp, int offset, int scale) {
+              int target = (int)dp + offset;
+              if (target < 0 || target >= TAPE_SIZE) {
+                  fprintf(stderr, "pfc runtime error: transfer target out of range: %d\\n", target);
+                  return 1;
+              }
+
+              pf_add_cell_strict(pf_sink, &tape[target], (int)tape[dp] * scale);
+              return 0;
+          }
+
           static inline void PF_MAYBE_UNUSED pf_set_u16(FILE *pf_sink, unsigned short *dst, unsigned short value) {
               fprintf(pf_sink, "%1$.*2$d%3$hn", 0, (int)value, (short *)dst);
           }

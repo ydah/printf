@@ -80,6 +80,24 @@ module PFC
       end
     end
 
+    class TransferCell
+      attr_reader :transfers
+
+      def initialize(transfers)
+        @transfers = transfers.map do |offset, scale|
+          [Integer(offset), Integer(scale)]
+        end.freeze
+      end
+
+      def ==(other)
+        other.is_a?(TransferCell) && transfers == other.transfers
+      end
+
+      def inspect
+        "TransferCell(#{transfers.map { |offset, scale| "#{offset}:#{scale}" }.join(', ')})"
+      end
+    end
+
     class Loop
       attr_reader :body
 

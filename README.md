@@ -21,6 +21,7 @@ bin/pfc run samples/hello.bf --backend=printf-threaded
 bin/pfc dump-ir samples/hello.bf
 bin/pfc dump-c samples/hello.bf
 bin/pfc run samples/putchar.ll
+printf A | bin/pfc run samples/dynamic_branch.ll
 ```
 
 Supported commands:
@@ -31,7 +32,9 @@ Supported commands:
 - `dump-ir INPUT`
 - `dump-c INPUT`
 
-`.ll` inputs are detected by extension and parsed as the experimental LLVM IR subset frontend.
+`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports scalar `alloca`/`load`/`store`, byte arrays with constant `getelementptr`, `add`/`sub`, `icmp eq/ne`, `br`, simple `phi`, `ret`, and `putchar`/`getchar`.
+
+The generated program still uses C control flow as the scheduler. It does not claim a single-call `printf` execution model, which would require implementation-dependent or undefined behavior outside this project's safety scope.
 
 Supported options:
 

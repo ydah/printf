@@ -22,11 +22,30 @@ module PFCTestHelper
                 when :scheduler
                   PFC::Backend::CEmitter.new(strict_printf: strict_printf)
                 when :threaded
-                  PFC::Backend::ThreadedCEmitter.new
+                  PFC::Backend::ThreadedCEmitter.new(strict_printf:)
                 else
                   raise ArgumentError, "unknown backend: #{backend}"
                 end
       File.write(c_path, emitter.emit(ir))
+
+      compile_out, compile_status = Open3.capture2e(
+        "cc", "-std=c11", "-Wall", "-Wextra", "-O0", c_path, "-o", exe_path
+      )
+      assert compile_status.success?, compile_out
+
+      stdout, stderr, status = Open3.capture3(exe_path, stdin_data: input)
+      assert status.success?, stderr
+
+      stdout
+    end
+  end
+
+  def compile_llvm_and_run(path, input: "")
+    Dir.mktmpdir("pfc-llvm-test") do |dir|
+      c_path = File.join(dir, "test.c")
+      exe_path = File.join(dir, "test")
+      source = File.read(File.expand_path("../#{path}", __dir__))
+      File.write(c_path, PFC::Backend::LLVMCEmitter.new(source).emit)
 
       compile_out, compile_status = Open3.capture2e(
         "cc", "-std=c11", "-Wall", "-Wextra", "-O0", c_path, "-o", exe_path

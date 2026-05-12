@@ -35,4 +35,13 @@ class OptimizerTest < Minitest::Test
       PFC::Optimizer.optimize(program)
     )
   end
+
+  def test_optimizes_transfer_loop
+    program = PFC::Frontend::Brainfuck.parse("[->+>++<<]")
+
+    assert_equal(
+      PFC::IR::Program.new([PFC::IR::TransferCell.new([[1, 1], [2, 2]])]),
+      PFC::Optimizer.optimize(program)
+    )
+  end
 end
