@@ -20,15 +20,18 @@ bin/pfc run samples/hello.bf --strict-printf
 bin/pfc run samples/hello.bf --backend=printf-threaded
 bin/pfc dump-ir samples/hello.bf
 bin/pfc dump-c samples/hello.bf
+bin/pfc run samples/putchar.ll
 ```
 
 Supported commands:
 
-- `compile INPUT.bf -o OUTPUT.c`
-- `build INPUT.bf -o OUTPUT`
-- `run INPUT.bf`
-- `dump-ir INPUT.bf`
-- `dump-c INPUT.bf`
+- `compile INPUT -o OUTPUT.c`
+- `build INPUT -o OUTPUT`
+- `run INPUT`
+- `dump-ir INPUT`
+- `dump-c INPUT`
+
+`.ll` inputs are detected by extension and parsed as the experimental LLVM IR subset frontend.
 
 Supported options:
 

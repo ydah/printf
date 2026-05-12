@@ -9,11 +9,15 @@ require_relative "../lib/pfc"
 
 module PFCTestHelper
   def compile_and_run(program, input: "", optimize: true, strict_printf: false, backend: :scheduler)
+    ir = PFC::Frontend::Brainfuck.parse(program)
+    ir = PFC::Optimizer.optimize(ir) if optimize
+    compile_ir_and_run(ir, input:, strict_printf:, backend:)
+  end
+
+  def compile_ir_and_run(ir, input: "", strict_printf: false, backend: :scheduler)
     Dir.mktmpdir("pfc-test") do |dir|
       c_path = File.join(dir, "test.c")
       exe_path = File.join(dir, "test")
-      ir = PFC::Frontend::Brainfuck.parse(program)
-      ir = PFC::Optimizer.optimize(ir) if optimize
       emitter = case backend
                 when :scheduler
                   PFC::Backend::CEmitter.new(strict_printf: strict_printf)

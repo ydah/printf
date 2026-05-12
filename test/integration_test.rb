@@ -46,4 +46,18 @@ class IntegrationTest < Minitest::Test
 
     assert_equal "abc", compile_and_run(source, input: "abc\x00tail", backend: :threaded)
   end
+
+  def test_runs_llvm_constant_putchar_sample
+    ir = PFC::Frontend::LLVMSubset.parse(File.read(File.expand_path("../samples/putchar.ll", __dir__)))
+    ir = PFC::Optimizer.optimize(ir)
+
+    assert_equal "B", compile_ir_and_run(ir)
+  end
+
+  def test_runs_llvm_getchar_add_sample
+    ir = PFC::Frontend::LLVMSubset.parse(File.read(File.expand_path("../samples/getchar_add.ll", __dir__)))
+    ir = PFC::Optimizer.optimize(ir)
+
+    assert_equal "B", compile_ir_and_run(ir, input: "A")
+  end
 end

@@ -8,6 +8,7 @@ require "tmpdir"
 require_relative "backend/c_emitter"
 require_relative "backend/threaded_c_emitter"
 require_relative "frontend/brainfuck"
+require_relative "frontend/llvm_subset"
 require_relative "optimizer"
 
 module PFC
@@ -41,7 +42,7 @@ module PFC
       else
         usage("unknown command: #{command}")
       end
-    rescue Frontend::Brainfuck::ParseError, OptionParser::ParseError, ArgumentError => e
+    rescue Frontend::Brainfuck::ParseError, Frontend::LLVMSubset::ParseError, OptionParser::ParseError, ArgumentError => e
       warn "pfc: #{e.message}"
       1
     end
@@ -51,7 +52,7 @@ module PFC
     def compile_command
       options = parse_options
       source_path = require_input_path!
-      c_source = compile_source(File.read(source_path), options)
+      c_source = compile_source(File.read(source_path), options, source_path:)
 
       if options[:output]
         File.write(options[:output], c_source)
@@ -69,7 +70,7 @@ module PFC
 
       Dir.mktmpdir("pfc") do |dir|
         c_path = File.join(dir, "generated.c")
-        File.write(c_path, compile_source(File.read(source_path), options))
+        File.write(c_path, compile_source(File.read(source_path), options, source_path:))
         return compile_c(c_path, output, cc: options[:cc], debug: options[:debug])
       end
     end
@@ -81,7 +82,7 @@ module PFC
       Dir.mktmpdir("pfc") do |dir|
         c_path = File.join(dir, "generated.c")
         exe_path = File.join(dir, "generated")
-        File.write(c_path, compile_source(File.read(source_path), options))
+        File.write(c_path, compile_source(File.read(source_path), options, source_path:))
         status = compile_c(c_path, exe_path, cc: options[:cc], debug: options[:debug])
         return status unless status.zero?
 
@@ -93,14 +94,14 @@ module PFC
     def dump_ir_command
       options = parse_options
       source_path = require_input_path!
-      puts compile_ir(File.read(source_path), options).inspect
+      puts compile_ir(File.read(source_path), options, source_path:).inspect
       0
     end
 
     def dump_c_command
       options = parse_options
       source_path = require_input_path!
-      puts compile_source(File.read(source_path), options)
+      puts compile_source(File.read(source_path), options, source_path:)
       0
     end
 
@@ -146,8 +147,8 @@ module PFC
       path
     end
 
-    def compile_source(source, options)
-      program = compile_ir(source, options)
+    def compile_source(source, options, source_path: nil)
+      program = compile_ir(source, options, source_path:)
       emitter_for(options).emit(program)
     end
 
@@ -162,11 +163,17 @@ module PFC
       )
     end
 
-    def compile_ir(source, options)
-      program = Frontend::Brainfuck.parse(source)
+    def compile_ir(source, options, source_path: nil)
+      program = parse_program(source, source_path)
       return program unless options[:optimize]
 
       Optimizer.optimize(program)
+    end
+
+    def parse_program(source, source_path)
+      return Frontend::LLVMSubset.parse(source) if File.extname(source_path.to_s) == ".ll"
+
+      Frontend::Brainfuck.parse(source)
     end
 
     def compile_c(c_path, output, cc:, debug:)
