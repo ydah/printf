@@ -36,8 +36,24 @@ module PFC
               pf_set_cell(pf_sink, cell, 0);
           }
 
+          static inline void PF_MAYBE_UNUSED pf_set_u16(FILE *pf_sink, unsigned short *dst, unsigned short value) {
+              fprintf(pf_sink, "%1$.*2$d%3$hn", 0, (int)value, (short *)dst);
+          }
+
           static inline void PF_MAYBE_UNUSED pf_set_dp(FILE *pf_sink, unsigned short *dp, unsigned short value) {
-              fprintf(pf_sink, "%1$.*2$d%3$hn", 0, (int)value, (short *)dp);
+              pf_set_u16(pf_sink, dp, value);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_set_opcode(FILE *pf_sink, unsigned char *opcode, int value) {
+              pf_set_cell(pf_sink, opcode, value);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_advance_ip(FILE *pf_sink, unsigned short *ip) {
+              pf_set_u16(pf_sink, ip, (unsigned short)(*ip + 1));
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_jump_ip(FILE *pf_sink, unsigned short *ip, unsigned short target) {
+              pf_set_u16(pf_sink, ip, target);
           }
 
           static inline void PF_MAYBE_UNUSED pf_inc_dp(FILE *pf_sink, unsigned short *dp) {

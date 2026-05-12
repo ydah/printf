@@ -6,12 +6,14 @@ require "optparse"
 require "tmpdir"
 
 require_relative "backend/c_emitter"
+require_relative "backend/threaded_c_emitter"
 require_relative "frontend/brainfuck"
 require_relative "optimizer"
 
 module PFC
   class CLI
-    SUPPORTED_BACKEND = "printf-c-scheduler"
+    SUPPORTED_BACKENDS = ["printf-c-scheduler", "printf-threaded"].freeze
+    DEFAULT_BACKEND = "printf-c-scheduler"
     DEFAULT_CC = ENV.fetch("CC", "cc")
 
     def initialize(argv)
@@ -104,7 +106,7 @@ module PFC
 
     def parse_options
       options = {
-        backend: SUPPORTED_BACKEND,
+        backend: DEFAULT_BACKEND,
         cell_bits: 8,
         debug: false,
         optimize: true,
@@ -129,7 +131,7 @@ module PFC
     end
 
     def validate_options!(options)
-      unless options[:backend] == SUPPORTED_BACKEND
+      unless SUPPORTED_BACKENDS.include?(options[:backend])
         raise ArgumentError, "unsupported backend: #{options[:backend]}"
       end
 
@@ -146,10 +148,18 @@ module PFC
 
     def compile_source(source, options)
       program = compile_ir(source, options)
+      emitter_for(options).emit(program)
+    end
+
+    def emitter_for(options)
+      if options[:backend] == "printf-threaded"
+        return Backend::ThreadedCEmitter.new(tape_size: options[:tape_size])
+      end
+
       Backend::CEmitter.new(
         tape_size: options[:tape_size],
         strict_printf: options[:strict_printf]
-      ).emit(program)
+      )
     end
 
     def compile_ir(source, options)
@@ -191,7 +201,7 @@ module PFC
           pfc dump-c INPUT.bf
 
         Options:
-          --backend=printf-c-scheduler
+          --backend=printf-c-scheduler|printf-threaded
           --no-opt
           --tape-size=30000
           --cell-bits=8

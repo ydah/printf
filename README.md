@@ -17,6 +17,7 @@ Or let the CLI build and run it:
 ```sh
 bin/pfc run samples/hello.bf
 bin/pfc run samples/hello.bf --strict-printf
+bin/pfc run samples/hello.bf --backend=printf-threaded
 bin/pfc dump-ir samples/hello.bf
 bin/pfc dump-c samples/hello.bf
 ```
@@ -32,6 +33,7 @@ Supported commands:
 Supported options:
 
 - `--backend=printf-c-scheduler`
+- `--backend=printf-threaded`
 - `--no-opt`
 - `--tape-size=30000`
 - `--cell-bits=8`

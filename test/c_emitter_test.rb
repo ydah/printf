@@ -39,4 +39,15 @@ class CEmitterTest < Minitest::Test
     assert_includes source, "pf_move_ptr_strict(pf_sink, &dp, 1)"
     refute_includes source, "pf_add_cell(pf_sink, &tape[dp], 2);"
   end
+
+  def test_threaded_emitter_uses_vm_state_and_instruction_table
+    source = PFC::Backend::ThreadedCEmitter.new.emit(PFC::Frontend::Brainfuck.parse("+[.-]"))
+
+    assert_includes source, "static const PFInstruction pf_program[]"
+    assert_includes source, "unsigned short ip = 0;"
+    assert_includes source, "unsigned char opcode = 0;"
+    assert_includes source, "pf_set_opcode(pf_sink, &opcode, instruction.opcode);"
+    assert_includes source, "PF_OP_JZ"
+    assert_includes source, "PF_OP_JNZ"
+  end
 end
