@@ -1,0 +1,7 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "English"
+require_relative "../lib/pfc/cli"
+
+exit PFC::CLI.new(ARGV).run
