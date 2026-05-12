@@ -16,6 +16,7 @@ Or let the CLI build and run it:
 
 ```sh
 bin/pfc run samples/hello.bf
+bin/pfc run samples/hello.bf --strict-printf
 bin/pfc dump-ir samples/hello.bf
 bin/pfc dump-c samples/hello.bf
 ```
@@ -34,6 +35,7 @@ Supported options:
 - `--no-opt`
 - `--tape-size=30000`
 - `--cell-bits=8`
+- `--strict-printf`
 - `--debug`
 
 ## Safety Scope

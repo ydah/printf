@@ -108,6 +108,7 @@ module PFC
         cell_bits: 8,
         debug: false,
         optimize: true,
+        strict_printf: false,
         tape_size: Backend::CEmitter::DEFAULT_TAPE_SIZE
       }
 
@@ -117,6 +118,7 @@ module PFC
         opts.on("--no-opt") { options[:optimize] = false }
         opts.on("--tape-size=N", Integer) { |size| options[:tape_size] = size }
         opts.on("--cell-bits=N", Integer) { |bits| options[:cell_bits] = bits }
+        opts.on("--strict-printf") { options[:strict_printf] = true }
         opts.on("--debug") { options[:debug] = true }
         opts.on("--cc=PATH") { |cc| options[:cc] = cc }
       end
@@ -144,7 +146,10 @@ module PFC
 
     def compile_source(source, options)
       program = compile_ir(source, options)
-      Backend::CEmitter.new(tape_size: options[:tape_size]).emit(program)
+      Backend::CEmitter.new(
+        tape_size: options[:tape_size],
+        strict_printf: options[:strict_printf]
+      ).emit(program)
     end
 
     def compile_ir(source, options)
@@ -190,6 +195,7 @@ module PFC
           --no-opt
           --tape-size=30000
           --cell-bits=8
+          --strict-printf
           --debug
       HELP
     end

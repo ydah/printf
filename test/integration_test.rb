@@ -28,4 +28,10 @@ class IntegrationTest < Minitest::Test
   def test_runs_loop_add_sample
     assert_equal "\b".b, compile_and_run("+++++>+++<[->+<]>.")
   end
+
+  def test_strict_printf_runs_hello_world
+    source = File.read(File.expand_path("../samples/hello.bf", __dir__))
+
+    assert_equal "Hello World!\n", compile_and_run(source, strict_printf: true)
+  end
 end

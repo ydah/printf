@@ -8,13 +8,13 @@ require "tmpdir"
 require_relative "../lib/pfc"
 
 module PFCTestHelper
-  def compile_and_run(program, input: "", optimize: true)
+  def compile_and_run(program, input: "", optimize: true, strict_printf: false)
     Dir.mktmpdir("pfc-test") do |dir|
       c_path = File.join(dir, "test.c")
       exe_path = File.join(dir, "test")
       ir = PFC::Frontend::Brainfuck.parse(program)
       ir = PFC::Optimizer.optimize(ir) if optimize
-      File.write(c_path, PFC::Backend::CEmitter.new.emit(ir))
+      File.write(c_path, PFC::Backend::CEmitter.new(strict_printf: strict_printf).emit(ir))
 
       compile_out, compile_status = Open3.capture2e(
         "cc", "-std=c11", "-Wall", "-Wextra", "-O0", c_path, "-o", exe_path

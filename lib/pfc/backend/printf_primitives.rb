@@ -24,12 +24,28 @@ module PFC
               pf_set_cell(pf_sink, cell, (int)*cell + delta);
           }
 
+          static inline void PF_MAYBE_UNUSED pf_inc_cell(FILE *pf_sink, unsigned char *cell) {
+              fprintf(pf_sink, "%1$.*2$d %3$hhn", 0, (int)*cell, (signed char *)cell);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_dec_cell(FILE *pf_sink, unsigned char *cell) {
+              fprintf(pf_sink, "%1$.*2$d%3$255d%4$hhn", 0, (int)*cell, 0, (signed char *)cell);
+          }
+
           static inline void PF_MAYBE_UNUSED pf_clear_cell(FILE *pf_sink, unsigned char *cell) {
               pf_set_cell(pf_sink, cell, 0);
           }
 
           static inline void PF_MAYBE_UNUSED pf_set_dp(FILE *pf_sink, unsigned short *dp, unsigned short value) {
               fprintf(pf_sink, "%1$.*2$d%3$hn", 0, (int)value, (short *)dp);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_inc_dp(FILE *pf_sink, unsigned short *dp) {
+              fprintf(pf_sink, "%1$.*2$d %3$hn", 0, (int)*dp, (short *)dp);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_dec_dp(FILE *pf_sink, unsigned short *dp) {
+              fprintf(pf_sink, "%1$.*2$d%3$65535d%4$hn", 0, (int)*dp, 0, (short *)dp);
           }
 
           static inline int PF_MAYBE_UNUSED pf_move_ptr(FILE *pf_sink, unsigned short *dp, int delta) {
@@ -40,6 +56,29 @@ module PFC
               }
 
               pf_set_dp(pf_sink, dp, (unsigned short)next);
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_move_ptr_strict(FILE *pf_sink, unsigned short *dp, int delta) {
+              int steps = delta;
+              while (steps > 0) {
+                  if (*dp + 1 >= TAPE_SIZE) {
+                      fprintf(stderr, "pfc runtime error: data pointer out of range: %u\\n", (unsigned)(*dp + 1));
+                      return 1;
+                  }
+                  pf_inc_dp(pf_sink, dp);
+                  steps--;
+              }
+
+              while (steps < 0) {
+                  if (*dp == 0) {
+                      fprintf(stderr, "pfc runtime error: data pointer out of range: -1\\n");
+                      return 1;
+                  }
+                  pf_dec_dp(pf_sink, dp);
+                  steps++;
+              }
+
               return 0;
           }
 

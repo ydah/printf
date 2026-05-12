@@ -8,8 +8,9 @@ module PFC
     class CEmitter
       DEFAULT_TAPE_SIZE = 30_000
 
-      def initialize(tape_size: DEFAULT_TAPE_SIZE)
+      def initialize(tape_size: DEFAULT_TAPE_SIZE, strict_printf: false)
         @tape_size = Integer(tape_size)
+        @strict_printf = strict_printf
         validate_tape_size!
       end
 
@@ -46,6 +47,10 @@ module PFC
 
       attr_reader :tape_size
 
+      def strict_printf?
+        @strict_printf
+      end
+
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
 
@@ -61,9 +66,9 @@ module PFC
 
         case instruction
         when IR::AddCell
-          ["#{spaces}pf_add_cell(pf_sink, &tape[dp], #{instruction.delta});"]
+          emit_add_cell(instruction, spaces)
         when IR::MovePtr
-          ["#{spaces}if (pf_move_ptr(pf_sink, &dp, #{instruction.delta}) != 0) PF_ABORT();"]
+          emit_move_ptr(instruction, spaces)
         when IR::OutputCell
           ["#{spaces}if (pf_output_cell(tape[dp]) != 0) PF_ABORT();"]
         when IR::InputCell
@@ -83,6 +88,31 @@ module PFC
         lines.concat(emit_instructions(loop.body, indent: indent + 1))
         lines << "#{spaces}}"
         lines
+      end
+
+      def emit_add_cell(instruction, spaces)
+        return ["#{spaces}pf_add_cell(pf_sink, &tape[dp], #{instruction.delta});"] unless strict_printf?
+
+        strict_cell_steps(instruction.delta).map do |step|
+          helper = step.positive? ? "pf_inc_cell" : "pf_dec_cell"
+          "#{spaces}#{helper}(pf_sink, &tape[dp]);"
+        end
+      end
+
+      def emit_move_ptr(instruction, spaces)
+        helper = strict_printf? ? "pf_move_ptr_strict" : "pf_move_ptr"
+        ["#{spaces}if (#{helper}(pf_sink, &dp, #{instruction.delta}) != 0) PF_ABORT();"]
+      end
+
+      def strict_cell_steps(delta)
+        normalized = delta % 256
+        return [] if normalized.zero?
+
+        if normalized <= 128
+          Array.new(normalized, 1)
+        else
+          Array.new(256 - normalized, -1)
+        end
       end
     end
   end
