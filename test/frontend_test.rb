@@ -23,14 +23,18 @@ class FrontendTest < Minitest::Test
   end
 
   def test_rejects_unmatched_open_bracket
-    assert_raises(PFC::Frontend::Brainfuck::ParseError) do
+    error = assert_raises(PFC::Frontend::Brainfuck::ParseError) do
       PFC::Frontend::Brainfuck.parse("[+")
     end
+
+    assert_equal "unmatched '[' at line 1, column 1", error.message
   end
 
   def test_rejects_unmatched_close_bracket
-    assert_raises(PFC::Frontend::Brainfuck::ParseError) do
-      PFC::Frontend::Brainfuck.parse("+]")
+    error = assert_raises(PFC::Frontend::Brainfuck::ParseError) do
+      PFC::Frontend::Brainfuck.parse("+\n]")
     end
+
+    assert_equal "unmatched ']' at line 2, column 1", error.message
   end
 end

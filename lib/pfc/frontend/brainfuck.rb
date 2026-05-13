@@ -14,6 +14,8 @@ module PFC
       def initialize(source)
         @source = source
         @index = 0
+        @line = 1
+        @column = 1
       end
 
       def parse
@@ -25,12 +27,14 @@ module PFC
 
       attr_reader :source
 
-      def parse_block(until_bracket:)
+      def parse_block(until_bracket:, opening_location: nil)
         instructions = []
 
         while @index < source.length
+          location = [@line, @column]
           char = source[@index]
           @index += 1
+          advance_position(char)
 
           case char
           when "+"
@@ -46,17 +50,32 @@ module PFC
           when ","
             instructions << IR::InputCell.new
           when "["
-            instructions << IR::Loop.new(parse_block(until_bracket: true))
+            instructions << IR::Loop.new(parse_block(until_bracket: true, opening_location: location))
           when "]"
-            raise ParseError, "unmatched ']'" unless until_bracket
+            raise ParseError, "unmatched ']' at #{format_location(location)}" unless until_bracket
 
             return coalesce(instructions)
           end
         end
 
-        raise ParseError, "unmatched '['" if until_bracket
+        raise ParseError, "unmatched '[' at #{format_location(opening_location)}" if until_bracket
 
         coalesce(instructions)
+      end
+
+      def advance_position(char)
+        if char == "\n"
+          @line += 1
+          @column = 1
+          return
+        end
+
+        @column += 1
+      end
+
+      def format_location(location)
+        line, column = location
+        "line #{line}, column #{column}"
       end
 
       def coalesce(instructions)

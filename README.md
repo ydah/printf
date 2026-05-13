@@ -40,9 +40,11 @@ Supported commands:
 - `dump-ir INPUT`
 - `dump-c INPUT`
 
-`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports scalar and fixed-array `alloca`/`load`/`store`, constant or dynamic `getelementptr`, `add`/`sub`/`mul`/division/remainder, bitwise and shift operations, `icmp`, `select`, `switch`, `br`, simple `phi`, `ret`, `void @main`, nested internal `i32` calls with local CFG and memory, and `putchar`/`getchar`.
+`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports scalar and fixed-array `alloca`/`load`/`store` for `i1`/`i8`/`i16`/`i32`, constant or dynamic `getelementptr`, `add`/`sub`/`mul`/division/remainder, bitwise and shift operations, `icmp`, `select`, `switch`, `br`, simple `phi`, `ret`, `void @main`, nested internal `i32` and `void` calls with local CFG and memory, and `putchar`/`getchar`.
 
 The generated program still uses C control flow as the scheduler. It does not claim a single-call `printf` execution model, which would require implementation-dependent or undefined behavior outside this project's safety scope.
+
+Generated C uses `tmpfile()` as the internal printf sink, so it does not depend on `/dev/null`.
 
 Supported options:
 

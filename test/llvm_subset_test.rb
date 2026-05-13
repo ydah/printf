@@ -106,6 +106,64 @@ class LLVMSubsetTest < Minitest::Test
     error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
       PFC::Backend::LLVMCEmitter.new(source).emit
     end
-    assert_equal "recursive internal call is unsupported: @loop", error.message
+    assert_equal "line 3: recursive internal call is unsupported: @loop", error.message
+  end
+
+  def test_supports_i1_memory_and_comparison
+    source = <<~LLVM
+      define i32 @main() {
+      entry:
+        %flag = alloca i1, align 1
+        store i1 1, ptr %flag, align 1
+        %value = load i1, ptr %flag, align 1
+        %cmp = icmp eq i1 %value, 1
+        %out = select i1 %cmp, i32 89, i32 78
+        call i32 @putchar(i32 %out)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "llvm_slots[pf_slot_index] & 1u"
+    assert_includes generated, "pf_v_cmp = ((pf_v_value) == (1)) ? 1u : 0u;"
+  end
+
+  def test_supports_void_internal_calls
+    source = <<~LLVM
+      define void @emit(i32 %ch) {
+      entry:
+        call i32 @putchar(i32 %ch)
+        ret void
+      }
+
+      define i32 @main() {
+      entry:
+        call void @emit(i32 65)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "goto pf_call_0_block_entry;"
+    assert_includes generated, "goto pf_call_0_return;"
+    refute_includes generated, "pf_call_0_ignored_return"
+  end
+
+  def test_reports_source_line_for_unsupported_llvm_instruction
+    source = <<~LLVM
+      define i32 @main() {
+      entry:
+        fence seq_cst
+        ret i32 0
+      }
+    LLVM
+
+    error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(source).emit
+    end
+
+    assert_equal "line 3: unsupported LLVM instruction: fence seq_cst", error.message
   end
 end

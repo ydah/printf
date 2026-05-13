@@ -69,13 +69,14 @@ module PFC
 
         while index < lines.length
           header = lines[index].strip
-          match = header.match(/\Adefine\s+(?:[-\w]+\s+)*i32\s+@([-A-Za-z$._0-9]+)\((.*?)\)\s*\{\z/)
+          match = header.match(/\Adefine\s+(?:[-\w]+\s+)*(i32|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)\s*\{\z/)
           unless match
             index += 1
             next
           end
 
-          name = match[1]
+          return_type = match[1]
+          name = match[2]
           body = []
           index += 1
           while index < lines.length && lines[index].strip != "}"
@@ -89,7 +90,8 @@ module PFC
               blocks:,
               block_order: order,
               name:,
-              params: parse_parameters(match[2])
+              params: parse_parameters(match[3]),
+              return_type:
             }
           end
           index += 1
@@ -162,7 +164,7 @@ module PFC
       def extract_main_body(source)
         lines = source.each_line.to_a
         start = lines.index { |line| line.match?(/\A\s*define\s+(?:[-\w]+\s+)*(?:i32|void)\s+@main\s*\(/) }
-        raise Frontend::LLVMSubset::ParseError, "missing define i32 @main()" if start.nil?
+        raise Frontend::LLVMSubset::ParseError, "missing define @main()" if start.nil?
 
         body = []
         lines[(start + 1)..].each do |line|
@@ -176,18 +178,18 @@ module PFC
 
       def analyze_allocations
         all_lines.each do |line|
-          if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:8|16|32)\](?:,\s+align\s+\d+)?\z/))
+          if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\](?:,\s+align\s+\d+)?\z/))
             allocate_pointer(match[1], match[2].to_i)
-          elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(8|16|32)(?:,\s+align\s+\d+)?\z/))
+          elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32)(?:,\s+align\s+\d+)?\z/))
             allocate_pointer(match[1], 1)
           end
         end
 
         internal_functions.each_value do |function|
           function.fetch(:blocks).values.flatten.each do |line|
-            if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:8|16|32)\](?:,\s+align\s+\d+)?\z/))
+            if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\](?:,\s+align\s+\d+)?\z/))
               function.fetch(:allocations)[match[1]] = allocate_slots(match[2].to_i)
-            elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(8|16|32)(?:,\s+align\s+\d+)?\z/))
+            elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32)(?:,\s+align\s+\d+)?\z/))
               function.fetch(:allocations)[match[1]] = allocate_slots(1)
             end
           end
@@ -224,9 +226,9 @@ module PFC
 
       def main_prelude
         lines = [
-          "    FILE *pf_sink = fopen(\"/dev/null\", \"w\");",
+          "    FILE *pf_sink = tmpfile();",
           "    if (pf_sink == NULL) {",
-          "        perror(\"fopen\");",
+          "        perror(\"tmpfile\");",
           "        return 1;",
           "    }",
           "",
@@ -277,24 +279,26 @@ module PFC
       end
 
       def emit_statement(label, line)
-        return emit_gep(line) if line.include?("getelementptr")
-        return [] if alloca?(line)
-        return emit_store(line) if line.start_with?("store ")
-        return emit_load(line) if line.include?(" load ")
-        return emit_binary(line) if line.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
-        return emit_select(line) if line.match?(/\A#{NAME}\s*=\s*select\b/)
-        return emit_cast(line) if line.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc)\b/)
-        return emit_icmp(line) if line.match?(/\A#{NAME}\s*=\s*icmp\b/)
-        return emit_call(line) if line.include?("call ")
-        return emit_switch(label, line) if line.start_with?("switch ")
-        return emit_branch(label, line) if line.start_with?("br ")
-        return emit_return(line) if line.start_with?("ret ")
+        with_statement_context(line) do
+          return emit_gep(line) if line.include?("getelementptr")
+          return [] if alloca?(line)
+          return emit_store(line) if line.start_with?("store ")
+          return emit_load(line) if line.include?(" load ")
+          return emit_binary(line) if line.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
+          return emit_select(line) if line.match?(/\A#{NAME}\s*=\s*select\b/)
+          return emit_cast(line) if line.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc)\b/)
+          return emit_icmp(line) if line.match?(/\A#{NAME}\s*=\s*icmp\b/)
+          return emit_call(line) if line.include?("call ")
+          return emit_switch(label, line) if line.start_with?("switch ")
+          return emit_branch(label, line) if line.start_with?("br ")
+          return emit_return(line) if line.start_with?("ret ")
 
-        raise Frontend::LLVMSubset::ParseError, "unsupported LLVM instruction: #{line}"
+          raise Frontend::LLVMSubset::ParseError, "unsupported LLVM instruction: #{line}"
+        end
       end
 
       def emit_gep(line)
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:8|16|32)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           width = match[2].to_i
           base = pointer_expr(match[3])
           first_index = llvm_value(match[4])
@@ -303,7 +307,7 @@ module PFC
           return []
         end
 
-        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(8|16|32),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
         pointers[match[1]] = "((#{pointer_expr(match[3])}) + (#{llvm_value(match[4])}))"
@@ -311,7 +315,7 @@ module PFC
       end
 
       def emit_store(line)
-        match = line.match(/\Astore\s+i(8|16|32)\s+(.+?),\s+(?:ptr|i(?:8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
+        match = line.match(/\Astore\s+i(1|8|16|32)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
         slot_lines(match[3]) + [
@@ -320,7 +324,7 @@ module PFC
       end
 
       def emit_load(line)
-        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(8|16|32),\s+(?:ptr|i(?:8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32),\s+(?:ptr|i(?:1|8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
         slot_lines(match[3]) + [
@@ -329,7 +333,7 @@ module PFC
       end
 
       def emit_binary(line)
-        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(8|16|32)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(1|8|16|32)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
 
         bits = match[3].to_i
@@ -358,7 +362,7 @@ module PFC
       end
 
       def emit_icmp(line)
-        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(8|16|32)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
 
         operator = icmp_operator(match[2])
@@ -388,14 +392,20 @@ module PFC
       end
 
       def emit_internal_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i32|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         destination = match[1]
-        function = internal_functions.fetch(match[2]) do
+        return_type = match[2]
+        function = internal_functions.fetch(match[3]) do
           raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}"
         end
-        inline_function_call(destination, function, parse_call_arguments(match[3]))
+        raise Frontend::LLVMSubset::ParseError, "void call cannot assign a result: #{line}" if destination && return_type == "void"
+        unless return_type == function.fetch(:return_type)
+          raise Frontend::LLVMSubset::ParseError, "internal call return type mismatch: #{line}"
+        end
+
+        inline_function_call(destination, function, parse_call_arguments(match[4]))
       end
 
       def parse_call_arguments(raw)
@@ -412,6 +422,9 @@ module PFC
       def inline_function_call(destination, function, arguments, caller_context: nil)
         unless arguments.length == function.fetch(:params).length
           raise Frontend::LLVMSubset::ParseError, "wrong argument count for internal call"
+        end
+        if destination && function.fetch(:return_type) == "void"
+          raise Frontend::LLVMSubset::ParseError, "void internal call cannot assign a result: @#{function.fetch(:name)}"
         end
 
         prefix = "pf_call_#{@inline_call_index}"
@@ -454,7 +467,8 @@ module PFC
         end
         {
           call_stack:,
-          declare_return_destination: return_destination.start_with?("#{prefix}_ignored_return"),
+          declare_return_destination: function.fetch(:return_type) != "void" &&
+            return_destination.start_with?("#{prefix}_ignored_return"),
           function:,
           pointers:,
           prefix:,
@@ -503,24 +517,26 @@ module PFC
       end
 
       def emit_inline_statement(line, context, label)
-        return emit_inline_gep(line, context) if line.include?("getelementptr")
-        return [] if alloca?(line)
-        return emit_inline_store(line, context) if line.start_with?("store ")
-        return emit_inline_load(line, context) if line.include?(" load ")
-        return emit_inline_binary(line, context) if line.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
-        return emit_inline_select(line, context) if line.match?(/\A#{NAME}\s*=\s*select\b/)
-        return emit_inline_cast(line, context) if line.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc)\b/)
-        return emit_inline_icmp(line, context) if line.match?(/\A#{NAME}\s*=\s*icmp\b/)
-        return emit_inline_call(line, context) if line.include?("call ")
-        return emit_inline_switch(line, context, label) if line.start_with?("switch ")
-        return emit_inline_branch(line, context, label) if line.start_with?("br ")
-        return emit_inline_return(line, context) if line.start_with?("ret ")
+        with_statement_context(line) do
+          return emit_inline_gep(line, context) if line.include?("getelementptr")
+          return [] if alloca?(line)
+          return emit_inline_store(line, context) if line.start_with?("store ")
+          return emit_inline_load(line, context) if line.include?(" load ")
+          return emit_inline_binary(line, context) if line.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
+          return emit_inline_select(line, context) if line.match?(/\A#{NAME}\s*=\s*select\b/)
+          return emit_inline_cast(line, context) if line.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc)\b/)
+          return emit_inline_icmp(line, context) if line.match?(/\A#{NAME}\s*=\s*icmp\b/)
+          return emit_inline_call(line, context) if line.include?("call ")
+          return emit_inline_switch(line, context, label) if line.start_with?("switch ")
+          return emit_inline_branch(line, context, label) if line.start_with?("br ")
+          return emit_inline_return(line, context) if line.start_with?("ret ")
 
-        raise Frontend::LLVMSubset::ParseError, "unsupported internal function instruction: #{line}"
+          raise Frontend::LLVMSubset::ParseError, "unsupported internal function instruction: #{line}"
+        end
       end
 
       def emit_inline_gep(line, context)
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:8|16|32)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           width = match[2].to_i
           base = inline_pointer_expr(context, match[3])
           first_index = inline_value(match[4], context)
@@ -529,7 +545,7 @@ module PFC
           return []
         end
 
-        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(8|16|32),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
         context.fetch(:pointers)[match[1]] = "((#{inline_pointer_expr(context, match[3])}) + (#{inline_value(match[4], context)}))"
@@ -537,7 +553,7 @@ module PFC
       end
 
       def emit_inline_store(line, context)
-        match = line.match(/\Astore\s+i(8|16|32)\s+(.+?),\s+(?:ptr|i(?:8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
+        match = line.match(/\Astore\s+i(1|8|16|32)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
         inline_slot_lines(context, match[3]) + [
@@ -546,7 +562,7 @@ module PFC
       end
 
       def emit_inline_load(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(8|16|32),\s+(?:ptr|i(?:8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32),\s+(?:ptr|i(?:1|8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
         inline_slot_lines(context, match[3]) + [
@@ -555,7 +571,7 @@ module PFC
       end
 
       def emit_inline_binary(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(8|16|32)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(1|8|16|32)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
 
         local = inline_register(context, match[1])
@@ -583,7 +599,7 @@ module PFC
       end
 
       def emit_inline_icmp(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(8|16|32)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
 
         left = inline_value(match[4], context)
@@ -606,13 +622,18 @@ module PFC
 
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@putchar\(i32\s+(.+)\)\z/)
         unless match
-          match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+          match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i32|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported internal call: #{line}" unless match
 
-          function = internal_functions.fetch(match[2]) do
+          raise Frontend::LLVMSubset::ParseError, "void call cannot assign a result: #{line}" if match[1] && match[2] == "void"
+
+          function = internal_functions.fetch(match[3]) do
             raise Frontend::LLVMSubset::ParseError, "unsupported internal call: #{line}"
           end
-          return inline_function_call(match[1], function, parse_call_arguments(match[3]), caller_context: context)
+          unless match[2] == function.fetch(:return_type)
+            raise Frontend::LLVMSubset::ParseError, "internal call return type mismatch: #{line}"
+          end
+          return inline_function_call(match[1], function, parse_call_arguments(match[4]), caller_context: context)
         end
 
         output = ["    if (pf_output_cell((unsigned char)(#{inline_value(match[2], context)})) != 0) PF_ABORT();"]
@@ -621,12 +642,12 @@ module PFC
       end
 
       def emit_inline_switch(line, context, label)
-        match = line.match(/\Aswitch\s+i(8|16|32)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
+        match = line.match(/\Aswitch\s+i(1|8|16|32)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported switch: #{line}" unless match
 
         value = inline_value(match[2], context)
         default_label = match[3]
-        cases = match[4].scan(/i(?:8|16|32)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
+        cases = match[4].scan(/i(?:1|8|16|32)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
@@ -659,8 +680,19 @@ module PFC
       end
 
       def emit_inline_return(line, context)
+        if line == "ret void"
+          unless context.fetch(:function).fetch(:return_type) == "void"
+            raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}"
+          end
+
+          return ["    goto #{context.fetch(:return_label)};"]
+        end
+
         match = line.match(/\Aret\s+i32\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}" unless match
+        if context.fetch(:function).fetch(:return_type) == "void"
+          raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}"
+        end
 
         [
           "    #{context.fetch(:return_destination)} = (unsigned int)(#{inline_value(match[1], context)});",
@@ -687,12 +719,12 @@ module PFC
       end
 
       def emit_switch(label, line)
-        match = line.match(/\Aswitch\s+i(8|16|32)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
+        match = line.match(/\Aswitch\s+i(1|8|16|32)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported switch: #{line}" unless match
 
         value = llvm_value(match[2])
         default_label = match[3]
-        cases = match[4].scan(/i(?:8|16|32)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
+        cases = match[4].scan(/i(?:1|8|16|32)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
@@ -789,6 +821,29 @@ module PFC
       def inline_register(context, name)
         context.fetch(:values).fetch(name) do
           raise Frontend::LLVMSubset::ParseError, "unknown internal register: #{name}"
+        end
+      end
+
+      def with_statement_context(line)
+        yield
+      rescue Frontend::LLVMSubset::ParseError => e
+        raise e if e.message.start_with?("line ")
+
+        line_number = source_line_number(line)
+        prefix = line_number ? "line #{line_number}: " : ""
+        raise Frontend::LLVMSubset::ParseError, "#{prefix}#{e.message}"
+      end
+
+      def source_line_number(line)
+        source_line_numbers.fetch(line, nil)
+      end
+
+      def source_line_numbers
+        @source_line_numbers ||= source.each_line.with_index(1).each_with_object({}) do |(raw_line, line_number), output|
+          normalized = raw_line.sub(/;.*/, "").strip.gsub(/\s+/, " ")
+          next if normalized.empty?
+
+          output[normalized] ||= line_number
         end
       end
 
