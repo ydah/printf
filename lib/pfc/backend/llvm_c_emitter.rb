@@ -287,9 +287,11 @@ module PFC
         match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
 
+        operator = match[2]
+        from_bits = match[3].to_i
         value = llvm_value(match[4])
-        bits = match[5].to_i
-        ["    #{register(match[1])} = #{unsigned_cast(bits)}((#{value}) & #{integer_mask_literal(bits)});"]
+        to_bits = match[5].to_i
+        ["    #{register(match[1])} = #{cast_expression(operator, from_bits, to_bits, value)};"]
       end
 
       def emit_icmp(line)
@@ -542,7 +544,8 @@ module PFC
         raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
 
         local = inline_register(context, match[1])
-        ["    #{local} = #{unsigned_cast(match[5].to_i)}((#{inline_value(match[4], context)}) & #{integer_mask_literal(match[5].to_i)});"]
+        value = inline_value(match[4], context)
+        ["    #{local} = #{cast_expression(match[2], match[3].to_i, match[5].to_i, value)};"]
       end
 
       def emit_inline_icmp(line, context)
@@ -1086,6 +1089,11 @@ module PFC
         when "lshr" then "(#{left}) >> (#{right})"
         when "ashr" then "#{unsigned_cast(bits)}((#{signed_expression(left, bits)}) >> (#{right}))"
         end
+      end
+
+      def cast_expression(operator, from_bits, to_bits, value)
+        expression = operator == "sext" ? signed_expression(value, from_bits) : value
+        "#{unsigned_cast(to_bits)}((#{expression}) & #{integer_mask_literal(to_bits)})"
       end
 
       def signed_expression(value, bits)

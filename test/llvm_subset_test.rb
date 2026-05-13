@@ -308,6 +308,27 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "pf_output_i64_decimal((long long)(pf_v_minus), &pf_printf_count_0)"
   end
 
+  def test_supports_signed_extension
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %wide = sext i8 -1 to i64
+        %cmp = icmp eq i64 %wide, 18446744073709551615
+        %out = select i1 %cmp, i32 89, i32 78
+        call i32 @putchar(i32 %out)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "? ((-1) | ~255u)"
+    assert_includes generated, "& 18446744073709551615ull"
+    assert_includes generated, "pf_v_cmp = ((pf_v_wide) == (18446744073709551615)) ? 1u : 0u;"
+  end
+
   def test_supports_void_internal_calls
     source = <<~LLVM
       define void @emit(i32 %ch) {
