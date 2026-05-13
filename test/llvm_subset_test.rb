@@ -21,8 +21,18 @@ class LLVMSubsetTest < Minitest::Test
 
     assert_equal ["entry"], parsed.fetch(:block_order)
     assert_equal ["%value = call i32 @id(i32 7)", "ret i32 %value"], parsed.fetch(:blocks).fetch("entry")
-    assert_equal :call, parsed.fetch(:blocks).fetch("entry").first.kind
-    assert_equal :return, parsed.fetch(:blocks).fetch("entry").last.kind
+    call = parsed.fetch(:blocks).fetch("entry").first
+    ret = parsed.fetch(:blocks).fetch("entry").last
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::CallInstruction, call
+    assert_equal :call, call.kind
+    assert_equal "%value", call.destination
+    assert_equal "i32", call.return_type
+    assert_equal "id", call.function_name
+    assert_equal ["i32 7"], call.arguments
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::ReturnInstruction, ret
+    assert_equal :return, ret.kind
+    assert_equal "i32", ret.return_type
+    assert_equal "%value", ret.value
     assert_equal ["id"], parsed.fetch(:internal_functions).keys
     assert_equal ["ret i32 %x"], parsed.fetch(:internal_functions).fetch("id").fetch(:blocks).fetch("entry")
   end
@@ -90,6 +100,36 @@ class LLVMSubsetTest < Minitest::Test
     end
 
     assert_equal "line 5: undefined label %missing in main block %merge", error.message
+  end
+
+  def test_parser_exposes_structured_branch_and_phi_instructions
+    source = <<~LLVM
+      define i32 @main() {
+      entry:
+        br i1 1, label %yes, label %no
+      yes:
+        br label %merge
+      no:
+        br label %merge
+      merge:
+        %value = phi i32 [ 89, %yes ], [ 78, %no ]
+        ret i32 %value
+      }
+    LLVM
+
+    parsed = PFC::Frontend::LLVMSubset::Parser.parse(source)
+    conditional_branch = parsed.fetch(:blocks).fetch("entry").first
+    phi = parsed.fetch(:blocks).fetch("merge").first
+
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::BranchInstruction, conditional_branch
+    assert_equal :branch, conditional_branch.kind
+    assert_equal "1", conditional_branch.condition
+    assert_equal ["yes", "no"], conditional_branch.targets
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::PhiInstruction, phi
+    assert_equal :phi, phi.kind
+    assert_equal "%value", phi.destination
+    assert_equal 32, phi.bits
+    assert_equal [["89", "yes"], ["78", "no"]], phi.incoming
   end
 
   def test_emits_constant_putchar_program

@@ -11,6 +11,17 @@ module PFC
         class Instruction
           attr_reader :kind, :text
 
+          def self.build(text)
+            instruction = new(text)
+            case instruction.kind
+            when :call then CallInstruction.new(text)
+            when :branch then BranchInstruction.new(text)
+            when :phi then PhiInstruction.new(text)
+            when :return then ReturnInstruction.new(text)
+            else instruction
+            end
+          end
+
           def initialize(text)
             @text = text.freeze
             @kind = classify(text)
@@ -61,6 +72,35 @@ module PFC
             text.split(...)
           end
 
+          def self.split_arguments(raw)
+            arguments = []
+            current = +""
+            depth = 0
+
+            raw.each_char do |char|
+              case char
+              when "(", "["
+                depth += 1
+                current << char
+              when ")", "]"
+                depth -= 1
+                current << char
+              when ","
+                if depth.zero?
+                  arguments << current.strip
+                  current.clear
+                else
+                  current << char
+                end
+              else
+                current << char
+              end
+            end
+
+            arguments << current.strip unless current.strip.empty?
+            arguments
+          end
+
           private
 
           def classify(text)
@@ -79,6 +119,69 @@ module PFC
             return :return if text.start_with?("ret ")
 
             :unknown
+          end
+        end
+
+        class CallInstruction < Instruction
+          attr_reader :arguments, :destination, :function_name, :return_type
+
+          def initialize(text)
+            super
+            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+            return unless match
+
+            @destination = match[1]
+            @return_type = match[2]
+            @function_name = match[3]
+            @arguments = Instruction.split_arguments(match[4]).freeze
+          end
+        end
+
+        class BranchInstruction < Instruction
+          attr_reader :condition, :targets
+
+          def initialize(text)
+            super
+            if (match = text.match(/\Abr\s+label\s+%([-A-Za-z$._0-9]+)\z/))
+              @condition = nil
+              @targets = [match[1]].freeze
+              return
+            end
+
+            match = text.match(/\Abr\s+i1\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+),\s+label\s+%([-A-Za-z$._0-9]+)\z/)
+            return unless match
+
+            @condition = match[1]
+            @targets = [match[2], match[3]].freeze
+          end
+        end
+
+        class PhiInstruction < Instruction
+          attr_reader :bits, :destination, :incoming
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32)\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @bits = match[2].to_i
+            @incoming = match[3].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/).map do |value, label|
+              [value, label]
+            end.freeze
+          end
+        end
+
+        class ReturnInstruction < Instruction
+          attr_reader :return_type, :value
+
+          def initialize(text)
+            super
+            match = text.match(/\Aret\s+(void|i(?:1|8|16|32))(?:\s+(.+))?\z/)
+            return unless match
+
+            @return_type = match[1]
+            @value = match[2]
           end
         end
 
@@ -206,7 +309,7 @@ module PFC
               order << current unless parsed.key?(current)
               parsed[current] ||= []
             else
-              parsed[current] << Instruction.new(stripped)
+              parsed[current] << Instruction.build(stripped)
             end
           end
 
