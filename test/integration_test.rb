@@ -135,4 +135,8 @@ class IntegrationTest < Minitest::Test
   def test_runs_llvm_global_string_puts_sample
     assert_equal "Hi!\n", compile_llvm_and_run("samples/string_puts.ll")
   end
+
+  def test_runs_llvm_printf_format_sample
+    assert_equal "n=-7 u=42 c=A s=ok %\n", compile_llvm_and_run("samples/printf_format.ll")
+  end
 end

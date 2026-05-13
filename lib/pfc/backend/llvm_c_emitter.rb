@@ -27,6 +27,7 @@ module PFC
         @pointers = {}
         @registers = {}
         @inline_call_index = 0
+        @printf_call_index = 0
         validate_tape_size!
         analyze_allocations
         analyze_registers
@@ -317,7 +318,7 @@ module PFC
           return emit_puts_call(match[1], match[2])
         end
 
-        if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+(?:\(ptr,\s+\.\.\.\)\s+)?@printf\(ptr(?:\s+\w+)*\s+(.+)\)\z/))
+        if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+(?:\(ptr,\s+\.\.\.\)\s+)?@printf\((.+)\)\z/))
           return emit_printf_call(match[1], match[2])
         end
 
@@ -570,7 +571,7 @@ module PFC
           return emit_puts_call(match[1], match[2], context:)
         end
 
-        if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+(?:\(ptr,\s+\.\.\.\)\s+)?@printf\(ptr(?:\s+\w+)*\s+(.+)\)\z/))
+        if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+(?:\(ptr,\s+\.\.\.\)\s+)?@printf\((.+)\)\z/))
           return emit_printf_call(match[1], match[2], context:)
         end
 
@@ -785,9 +786,14 @@ module PFC
       end
 
       def emit_printf_call(destination, raw_pointer, context: nil)
-        pointer = global_string_pointer(raw_pointer, context:)
-        bytes = null_terminated_bytes(pointer)
-        emit_output_bytes(bytes) + return_value_assignment(destination, bytes.length, context:)
+        arguments = split_call_arguments(raw_pointer)
+        pointer = global_string_pointer(pointer_argument(arguments.shift), context:)
+        format_bytes = null_terminated_bytes(pointer)
+        count_name = next_printf_count_name
+        lines = ["    int #{count_name} = 0;"]
+        lines.concat(emit_formatted_output(format_bytes, arguments, count_name, context:))
+        lines.concat(return_value_assignment(destination, count_name, context:))
+        lines
       end
 
       def emit_output_bytes(bytes)
@@ -800,7 +806,114 @@ module PFC
         return [] unless destination
 
         register_name = context ? inline_register(context, destination) : register(destination)
-        ["    #{register_name} = #{value}u;"]
+        expression = value.is_a?(Integer) ? "#{value}u" : "(unsigned int)(#{value})"
+        ["    #{register_name} = #{expression};"]
+      end
+
+      def emit_formatted_output(format_bytes, typed_arguments, count_name, context:)
+        lines = []
+        arguments = typed_arguments.dup
+        index = 0
+
+        while index < format_bytes.length
+          byte = format_bytes[index]
+          if byte != 37
+            lines << counted_output_line(byte, count_name)
+            index += 1
+            next
+          end
+
+          specifier = format_bytes[index + 1]
+          raise Frontend::LLVMSubset::ParseError, "unterminated printf format specifier" if specifier.nil?
+
+          if specifier == 37
+            lines << counted_output_line(37, count_name)
+          else
+            argument = arguments.shift
+            raise Frontend::LLVMSubset::ParseError, "missing printf argument for %#{specifier.chr}" if argument.nil?
+
+            lines.concat(emit_printf_specifier(specifier, argument, count_name, context:))
+          end
+          index += 2
+        end
+
+        unless arguments.empty?
+          raise Frontend::LLVMSubset::ParseError, "too many printf arguments"
+        end
+
+        lines
+      end
+
+      def emit_printf_specifier(specifier, argument, count_name, context:)
+        case specifier.chr
+        when "d", "i"
+          value = typed_integer_value(argument, context:)
+          ["    if (pf_output_i32_decimal((int)(#{value}), &#{count_name}) != 0) PF_ABORT();"]
+        when "u"
+          value = typed_integer_value(argument, context:)
+          ["    if (pf_output_u32_decimal((unsigned int)(#{value}), &#{count_name}) != 0) PF_ABORT();"]
+        when "c"
+          value = typed_integer_value(argument, context:)
+          [counted_output_line(value, count_name)]
+        when "s"
+          pointer = global_string_pointer(pointer_argument(argument), context:)
+          null_terminated_bytes(pointer).map { |byte| counted_output_line(byte, count_name) }
+        else
+          raise Frontend::LLVMSubset::ParseError, "unsupported printf format: %#{specifier.chr}"
+        end
+      end
+
+      def counted_output_line(value, count_name)
+        "    if (pf_output_counted_cell((unsigned char)(#{value}), &#{count_name}) != 0) PF_ABORT();"
+      end
+
+      def next_printf_count_name
+        name = "pf_printf_count_#{@printf_call_index}"
+        @printf_call_index += 1
+        name
+      end
+
+      def typed_integer_value(argument, context:)
+        match = argument.strip.match(/\Ai(?:1|8|16|32)\s+(.+)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported printf integer argument: #{argument}" unless match
+
+        context ? inline_value(match[1], context) : llvm_value(match[1])
+      end
+
+      def pointer_argument(argument)
+        match = argument.to_s.strip.match(/\Aptr(?:\s+\w+)*\s+(.+)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported printf pointer argument: #{argument}" unless match
+
+        match[1]
+      end
+
+      def split_call_arguments(raw_arguments)
+        arguments = []
+        current = +""
+        depth = 0
+
+        raw_arguments.each_char do |char|
+          case char
+          when "(", "["
+            depth += 1
+            current << char
+          when ")", "]"
+            depth -= 1
+            current << char
+          when ","
+            if depth.zero?
+              arguments << current.strip
+              current.clear
+            else
+              current << char
+            end
+          else
+            current << char
+          end
+        end
+
+        arguments << current.strip unless current.strip.empty?
+        arguments
       end
 
       def global_string_pointer(raw_pointer, context:)

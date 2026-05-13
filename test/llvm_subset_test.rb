@@ -294,10 +294,31 @@ class LLVMSubsetTest < Minitest::Test
 
     generated = PFC::Backend::LLVMCEmitter.new(source).emit
 
-    assert_includes generated, "pf_output_cell((unsigned char)(79))"
-    assert_includes generated, "pf_output_cell((unsigned char)(75))"
-    assert_includes generated, "pf_output_cell((unsigned char)(10))"
-    assert_includes generated, "pf_v_result = 3u;"
+    assert_includes generated, "pf_output_counted_cell((unsigned char)(79), &pf_printf_count_0)"
+    assert_includes generated, "pf_output_counted_cell((unsigned char)(75), &pf_printf_count_0)"
+    assert_includes generated, "pf_output_counted_cell((unsigned char)(10), &pf_printf_count_0)"
+    assert_includes generated, "pf_v_result = (unsigned int)(pf_printf_count_0);"
+  end
+
+  def test_emits_printf_for_static_variadic_arguments
+    source = <<~LLVM
+      @.fmt = private unnamed_addr constant [24 x i8] c"n=%d u=%u c=%c s=%s %%\\0A\\00", align 1
+      @.word = private unnamed_addr constant [3 x i8] c"ok\\00", align 1
+      declare i32 @printf(ptr, ...)
+
+      define i32 @main() {
+      entry:
+        %result = call i32 (ptr, ...) @printf(ptr @.fmt, i32 -7, i32 42, i32 65, ptr @.word)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "pf_output_i32_decimal((int)(-7), &pf_printf_count_0)"
+    assert_includes generated, "pf_output_u32_decimal((unsigned int)(42), &pf_printf_count_0)"
+    assert_includes generated, "pf_output_counted_cell((unsigned char)(65), &pf_printf_count_0)"
+    assert_includes generated, "pf_v_result = (unsigned int)(pf_printf_count_0);"
   end
 
   def test_reports_source_line_for_unsupported_llvm_instruction
