@@ -89,18 +89,18 @@ module PFC
 
       def analyze_allocations
         all_lines.each do |line|
-          if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\](?:,\s+align\s+\d+)?\z/))
+          if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:1|8|16|32|64)\](?:,\s+align\s+\d+)?\z/))
             allocate_pointer(match[1], match[2].to_i)
-          elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32)(?:,\s+align\s+\d+)?\z/))
+          elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32|64)(?:,\s+align\s+\d+)?\z/))
             allocate_pointer(match[1], 1)
           end
         end
 
         internal_functions.each_value do |function|
           function.fetch(:blocks).values.flatten.each do |line|
-            if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\](?:,\s+align\s+\d+)?\z/))
+            if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:1|8|16|32|64)\](?:,\s+align\s+\d+)?\z/))
               function.fetch(:allocations)[match[1]] = allocate_slots(match[2].to_i)
-            elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32)(?:,\s+align\s+\d+)?\z/))
+            elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32|64)(?:,\s+align\s+\d+)?\z/))
               function.fetch(:allocations)[match[1]] = allocate_slots(1)
             end
           end
@@ -156,13 +156,13 @@ module PFC
           "    }",
           "",
           "    enum { PF_LLVM_SLOT_COUNT = #{[slot_count, 1].max} };",
-          "    unsigned int llvm_slots[PF_LLVM_SLOT_COUNT] = {0};",
+          "    unsigned long long llvm_slots[PF_LLVM_SLOT_COUNT] = {0};",
           "    int pf_return_code = 0;",
           "    int pf_slot_index = 0;",
           "    int pf_ch = 0;"
         ]
         registers.each_value do |name|
-          lines << "    unsigned int #{name} = 0;"
+          lines << "    unsigned long long #{name} = 0;"
         end
         lines << "    (void)llvm_slots;"
         lines << "    (void)pf_slot_index;"
@@ -229,7 +229,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32|64)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           width = match[2].to_i
           base = pointer_expr(match[3])
           first_index = llvm_value(match[4])
@@ -238,7 +238,7 @@ module PFC
           return []
         end
 
-        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32|64),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
         pointers[match[1]] = "((#{pointer_expr(match[3])}) + (#{llvm_value(match[4])}))"
@@ -246,54 +246,54 @@ module PFC
       end
 
       def emit_store(line)
-        match = line.match(/\Astore\s+i(1|8|16|32)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
+        match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
         slot_lines(match[3]) + [
-          "    pf_set_u32(pf_sink, &llvm_slots[pf_slot_index], (unsigned int)(#{llvm_value(match[2])} & #{integer_mask(match[1].to_i)}u));"
+          "    llvm_slots[pf_slot_index] = (unsigned long long)(#{llvm_value(match[2])} & #{integer_mask_literal(match[1].to_i)});"
         ]
       end
 
       def emit_load(line)
-        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32),\s+(?:ptr|i(?:1|8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
         slot_lines(match[3]) + [
-          "    #{register(match[1])} = (unsigned int)(llvm_slots[pf_slot_index] & #{integer_mask(match[2].to_i)}u);"
+          "    #{register(match[1])} = #{unsigned_cast(match[2].to_i)}(llvm_slots[pf_slot_index] & #{integer_mask_literal(match[2].to_i)});"
         ]
       end
 
       def emit_binary(line)
-        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(1|8|16|32)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
 
         bits = match[3].to_i
         expression = binary_expression(match[2], bits, llvm_value(match[4]), llvm_value(match[5]))
-        ["    #{register(match[1])} = (unsigned int)((#{expression}) & #{integer_mask(bits)}u);"]
+        ["    #{register(match[1])} = #{unsigned_cast(bits)}((#{expression}) & #{integer_mask_literal(bits)});"]
       end
 
       def emit_select(line)
-        match = line.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32)\s+(.+?),\s+i(?:1|8|16|32)\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32|64)\s+(.+?),\s+i(?:1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported select: #{line}" unless match
 
         bits = match[3].to_i
         condition = llvm_value(match[2])
         true_value = llvm_value(match[4])
         false_value = llvm_value(match[5])
-        ["    #{register(match[1])} = (unsigned int)((#{condition}) != 0u ? (#{true_value}) : (#{false_value})) & #{integer_mask(bits)}u;"]
+        ["    #{register(match[1])} = #{unsigned_cast(bits)}(((#{condition}) != 0u ? (#{true_value}) : (#{false_value})) & #{integer_mask_literal(bits)});"]
       end
 
       def emit_cast(line)
-        match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32)\s+(.+?)\s+to\s+i(1|8|16|32)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
 
         value = llvm_value(match[4])
         bits = match[5].to_i
-        ["    #{register(match[1])} = (unsigned int)((#{value}) & #{integer_mask(bits)}u);"]
+        ["    #{register(match[1])} = #{unsigned_cast(bits)}((#{value}) & #{integer_mask_literal(bits)});"]
       end
 
       def emit_icmp(line)
-        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
 
         operator = icmp_operator(match[2])
@@ -331,7 +331,7 @@ module PFC
       end
 
       def emit_internal_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i32|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         destination = match[1]
@@ -351,7 +351,7 @@ module PFC
         return [] if raw.strip.empty?
 
         raw.split(",").map do |argument|
-          match = argument.strip.match(/\Ai(?:1|8|16|32)\s+(.+)\z/)
+          match = argument.strip.match(/\Ai(?:1|8|16|32|64)\s+(.+)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported call argument: #{argument}" unless match
 
           match[1]
@@ -383,7 +383,7 @@ module PFC
         function.fetch(:params).zip(arguments).each_with_index do |(param, argument), index|
           local = context.fetch(:values).fetch(param)
           value = caller_context ? inline_value(argument, caller_context) : llvm_value(argument)
-          lines << "    #{local} = (unsigned int)(#{value});"
+          lines << "    #{local} = (unsigned long long)(#{value});"
         end
 
         lines << "    goto #{inline_label(context, "entry")};"
@@ -433,17 +433,17 @@ module PFC
         lines = []
         function.fetch(:params).each do |param|
           name = context.fetch(:values).fetch(param)
-          lines << "    unsigned int #{name} = 0;"
+          lines << "    unsigned long long #{name} = 0;"
           declared << name
         end
         inline_register_names(function).each do |register_name|
           name = context.fetch(:values).fetch(register_name)
           next if declared.include?(name)
 
-          lines << "    unsigned int #{name} = 0;"
+          lines << "    unsigned long long #{name} = 0;"
           declared << name
         end
-        lines << "    unsigned int #{context.fetch(:return_destination)} = 0;" if context.fetch(:declare_return_destination)
+        lines << "    unsigned long long #{context.fetch(:return_destination)} = 0;" if context.fetch(:declare_return_destination)
         lines
       end
 
@@ -483,7 +483,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32|64)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           width = match[2].to_i
           base = inline_pointer_expr(context, match[3])
           first_index = inline_value(match[4], context)
@@ -492,7 +492,7 @@ module PFC
           return []
         end
 
-        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32|64),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
         context.fetch(:pointers)[match[1]] = "((#{inline_pointer_expr(context, match[3])}) + (#{inline_value(match[4], context)}))"
@@ -500,53 +500,53 @@ module PFC
       end
 
       def emit_inline_store(line, context)
-        match = line.match(/\Astore\s+i(1|8|16|32)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
+        match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
         inline_slot_lines(context, match[3]) + [
-          "    pf_set_u32(pf_sink, &llvm_slots[pf_slot_index], (unsigned int)(#{inline_value(match[2], context)} & #{integer_mask(match[1].to_i)}u));"
+          "    llvm_slots[pf_slot_index] = (unsigned long long)(#{inline_value(match[2], context)} & #{integer_mask_literal(match[1].to_i)});"
         ]
       end
 
       def emit_inline_load(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32),\s+(?:ptr|i(?:1|8|16|32)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
         inline_slot_lines(context, match[3]) + [
-          "    #{inline_register(context, match[1])} = (unsigned int)(llvm_slots[pf_slot_index] & #{integer_mask(match[2].to_i)}u);"
+          "    #{inline_register(context, match[1])} = #{unsigned_cast(match[2].to_i)}(llvm_slots[pf_slot_index] & #{integer_mask_literal(match[2].to_i)});"
         ]
       end
 
       def emit_inline_binary(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(1|8|16|32)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
 
         local = inline_register(context, match[1])
         expression = binary_expression(match[2], match[3].to_i, inline_value(match[4], context), inline_value(match[5], context))
-        ["    #{local} = (unsigned int)((#{expression}) & #{integer_mask(match[3].to_i)}u);"]
+        ["    #{local} = #{unsigned_cast(match[3].to_i)}((#{expression}) & #{integer_mask_literal(match[3].to_i)});"]
       end
 
       def emit_inline_select(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32)\s+(.+?),\s+i(?:1|8|16|32)\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32|64)\s+(.+?),\s+i(?:1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported select: #{line}" unless match
 
         local = inline_register(context, match[1])
         condition = inline_value(match[2], context)
         true_value = inline_value(match[4], context)
         false_value = inline_value(match[5], context)
-        ["    #{local} = (unsigned int)(((#{condition}) != 0u ? (#{true_value}) : (#{false_value})) & #{integer_mask(match[3].to_i)}u);"]
+        ["    #{local} = #{unsigned_cast(match[3].to_i)}(((#{condition}) != 0u ? (#{true_value}) : (#{false_value})) & #{integer_mask_literal(match[3].to_i)});"]
       end
 
       def emit_inline_cast(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32)\s+(.+?)\s+to\s+i(1|8|16|32)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
 
         local = inline_register(context, match[1])
-        ["    #{local} = (unsigned int)((#{inline_value(match[4], context)}) & #{integer_mask(match[5].to_i)}u);"]
+        ["    #{local} = #{unsigned_cast(match[5].to_i)}((#{inline_value(match[4], context)}) & #{integer_mask_literal(match[5].to_i)});"]
       end
 
       def emit_inline_icmp(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
 
         left = inline_value(match[4], context)
@@ -577,7 +577,7 @@ module PFC
 
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@putchar\(i32\s+(.+)\)\z/)
         unless match
-          match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i32|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+          match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported internal call: #{line}" unless match
 
           raise Frontend::LLVMSubset::ParseError, "void call cannot assign a result: #{line}" if match[1] && match[2] == "void"
@@ -597,16 +597,17 @@ module PFC
       end
 
       def emit_inline_switch(line, context, label)
-        match = line.match(/\Aswitch\s+i(1|8|16|32)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
+        match = line.match(/\Aswitch\s+i(1|8|16|32|64)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported switch: #{line}" unless match
 
         value = inline_value(match[2], context)
         default_label = match[3]
-        cases = match[4].scan(/i(?:1|8|16|32)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
+        bits = match[1].to_i
+        cases = match[4].scan(/i(?:1|8|16|32|64)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
-          lines << "    #{prefix} ((#{value}) == #{case_value}u) {"
+          lines << "    #{prefix} ((#{value}) == #{case_value}#{integer_suffix(bits)}) {"
           lines.concat(inline_phi_goto(context, label, case_label, indent: 2))
           lines << "    }"
         end
@@ -643,14 +644,14 @@ module PFC
           return ["    goto #{context.fetch(:return_label)};"]
         end
 
-        match = line.match(/\Aret\s+i32\s+(.+)\z/)
+        match = line.match(/\Aret\s+i(?:1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}" unless match
         if context.fetch(:function).fetch(:return_type) == "void"
           raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}"
         end
 
         [
-          "    #{context.fetch(:return_destination)} = (unsigned int)(#{inline_value(match[1], context)});",
+          "    #{context.fetch(:return_destination)} = (unsigned long long)(#{inline_value(match[1], context)});",
           "    goto #{context.fetch(:return_label)};"
         ]
       end
@@ -674,16 +675,17 @@ module PFC
       end
 
       def emit_switch(label, line)
-        match = line.match(/\Aswitch\s+i(1|8|16|32)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
+        match = line.match(/\Aswitch\s+i(1|8|16|32|64)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported switch: #{line}" unless match
 
         value = llvm_value(match[2])
         default_label = match[3]
-        cases = match[4].scan(/i(?:1|8|16|32)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
+        bits = match[1].to_i
+        cases = match[4].scan(/i(?:1|8|16|32|64)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
-          lines << "    #{prefix} ((#{value}) == #{case_value}u) {"
+          lines << "    #{prefix} ((#{value}) == #{case_value}#{integer_suffix(bits)}) {"
           lines.concat(phi_goto(label, case_label, indent: 2))
           lines << "    }"
         end
@@ -694,7 +696,7 @@ module PFC
       end
 
       def emit_return(line)
-        match = line.match(/\Aret\s+i32\s+(.+)\z/)
+        match = line.match(/\Aret\s+i(?:1|8|16|32|64)\s+(.+)\z/)
         return ["    goto pf_done;"] unless match
 
         [
@@ -717,14 +719,15 @@ module PFC
       end
 
       def phi_assignment(line, from_label, spaces)
-        match = line.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32)\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported phi: #{line}" unless match
 
         incoming = match[3].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/)
         value = incoming.find { |_value, label| label == from_label }&.first
         return nil if value.nil?
 
-        "#{spaces}#{register(match[1])} = (unsigned int)(#{llvm_value(value)});"
+        bits = match[2].to_i
+        "#{spaces}#{register(match[1])} = #{unsigned_cast(bits)}((#{llvm_value(value)}) & #{integer_mask_literal(bits)});"
       end
 
       def inline_phi_goto(context, from_label, to_label, indent: 1)
@@ -741,14 +744,15 @@ module PFC
       end
 
       def inline_phi_assignment(context, line, from_label, spaces)
-        match = line.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32)\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported phi: #{line}" unless match
 
         incoming = match[3].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/)
         value = incoming.find { |_value, label| label == from_label }&.first
         return nil if value.nil?
 
-        "#{spaces}#{inline_register(context, match[1])} = (unsigned int)(#{inline_value(value, context)});"
+        bits = match[2].to_i
+        "#{spaces}#{inline_register(context, match[1])} = #{unsigned_cast(bits)}((#{inline_value(value, context)}) & #{integer_mask_literal(bits)});"
       end
 
       def llvm_value(raw)
@@ -847,13 +851,17 @@ module PFC
       def emit_printf_specifier(specifier, argument, count_name, context:)
         case specifier.chr
         when "d", "i"
-          value = typed_integer_value(argument, context:)
-          ["    if (pf_output_i32_decimal((int)(#{value}), &#{count_name}) != 0) PF_ABORT();"]
+          bits, value = typed_integer_value(argument, context:)
+          helper = bits == 64 ? "pf_output_i64_decimal" : "pf_output_i32_decimal"
+          cast = signed_cast(bits)
+          ["    if (#{helper}((#{cast})(#{value}), &#{count_name}) != 0) PF_ABORT();"]
         when "u"
-          value = typed_integer_value(argument, context:)
-          ["    if (pf_output_u32_decimal((unsigned int)(#{value}), &#{count_name}) != 0) PF_ABORT();"]
+          bits, value = typed_integer_value(argument, context:)
+          helper = bits == 64 ? "pf_output_u64_decimal" : "pf_output_u32_decimal"
+          cast = unsigned_cast(bits).delete_prefix("(").delete_suffix(")")
+          ["    if (#{helper}((#{cast})(#{value}), &#{count_name}) != 0) PF_ABORT();"]
         when "c"
-          value = typed_integer_value(argument, context:)
+          _bits, value = typed_integer_value(argument, context:)
           [counted_output_line(value, count_name)]
         when "s"
           pointer = global_string_pointer(pointer_argument(argument), context:)
@@ -874,10 +882,10 @@ module PFC
       end
 
       def typed_integer_value(argument, context:)
-        match = argument.strip.match(/\Ai(?:1|8|16|32)\s+(.+)\z/)
+        match = argument.strip.match(/\Ai(1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported printf integer argument: #{argument}" unless match
 
-        context ? inline_value(match[1], context) : llvm_value(match[1])
+        [match[1].to_i, context ? inline_value(match[2], context) : llvm_value(match[2])]
       end
 
       def pointer_argument(argument)
@@ -1022,6 +1030,26 @@ module PFC
         (1 << bits) - 1
       end
 
+      def integer_mask_literal(bits)
+        "#{integer_mask(bits)}#{integer_suffix(bits)}"
+      end
+
+      def integer_suffix(bits)
+        bits == 64 ? "ull" : "u"
+      end
+
+      def unsigned_cast(bits)
+        bits == 64 ? "(unsigned long long)" : "(unsigned int)"
+      end
+
+      def signed_cast(bits)
+        bits == 64 ? "long long" : "int"
+      end
+
+      def sign_bit_literal(bits)
+        "#{1 << (bits - 1)}#{integer_suffix(bits)}"
+      end
+
       def slot_lines(pointer_name)
         [
           "    pf_slot_index = (int)(#{pointer_expr(pointer_name)});",
@@ -1056,14 +1084,12 @@ module PFC
         when "xor" then "(#{left}) ^ (#{right})"
         when "shl" then "(#{left}) << (#{right})"
         when "lshr" then "(#{left}) >> (#{right})"
-        when "ashr" then "(unsigned int)((#{signed_expression(left, bits)}) >> (#{right}))"
+        when "ashr" then "#{unsigned_cast(bits)}((#{signed_expression(left, bits)}) >> (#{right}))"
         end
       end
 
       def signed_expression(value, bits)
-        mask = integer_mask(bits)
-        sign_bit = 1 << (bits - 1)
-        "((int)(((#{value}) & #{sign_bit}u) ? ((#{value}) | ~#{mask}u) : ((#{value}) & #{mask}u)))"
+        "((#{signed_cast(bits)})(((#{value}) & #{sign_bit_literal(bits)}) ? ((#{value}) | ~#{integer_mask_literal(bits)}) : ((#{value}) & #{integer_mask_literal(bits)})))"
       end
 
       def icmp_operator(predicate)

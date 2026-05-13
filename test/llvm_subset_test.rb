@@ -278,6 +278,36 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "pf_v_cmp = ((pf_v_value) == (1)) ? 1u : 0u;"
   end
 
+  def test_supports_i64_memory_arithmetic_and_printf
+    source = <<~LLVM
+      @.fmt = private unnamed_addr constant [7 x i8] c"%u %d\\0A\\00", align 1
+      declare i32 @putchar(i32)
+      declare i32 @printf(ptr, ...)
+
+      define i32 @main() {
+      entry:
+        %slot = alloca i64, align 8
+        store i64 4294967301, ptr %slot, align 8
+        %wide = load i64, ptr %slot, align 8
+        %minus = sub i64 0, 5
+        %cmp = icmp eq i64 %wide, 4294967301
+        %out = select i1 %cmp, i32 89, i32 78
+        call i32 @putchar(i32 %out)
+        %printed = call i32 (ptr, ...) @printf(ptr @.fmt, i64 %wide, i64 %minus)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "unsigned long long llvm_slots[PF_LLVM_SLOT_COUNT] = {0};"
+    assert_includes generated, "llvm_slots[pf_slot_index] = (unsigned long long)(4294967301 & 18446744073709551615ull);"
+    assert_includes generated, "pf_v_wide = (unsigned long long)(llvm_slots[pf_slot_index] & 18446744073709551615ull);"
+    assert_includes generated, "pf_v_cmp = ((pf_v_wide) == (4294967301)) ? 1u : 0u;"
+    assert_includes generated, "pf_output_u64_decimal((unsigned long long)(pf_v_wide), &pf_printf_count_0)"
+    assert_includes generated, "pf_output_i64_decimal((long long)(pf_v_minus), &pf_printf_count_0)"
+  end
+
   def test_supports_void_internal_calls
     source = <<~LLVM
       define void @emit(i32 %ch) {

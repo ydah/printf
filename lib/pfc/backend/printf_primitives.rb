@@ -359,6 +359,39 @@ module PFC
               return pf_output_u32_decimal(magnitude, count);
           }
 
+          static inline int PF_MAYBE_UNUSED pf_output_u64_decimal(unsigned long long value, int *count) {
+              char digits[20];
+              int length = 0;
+              do {
+                  digits[length] = (char)('0' + (value % 10ull));
+                  value /= 10ull;
+                  length++;
+              } while (value != 0ull);
+
+              while (length > 0) {
+                  length--;
+                  if (pf_output_counted_cell((unsigned char)digits[length], count) != 0) {
+                      return 1;
+                  }
+              }
+
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_output_i64_decimal(long long value, int *count) {
+              unsigned long long magnitude;
+              if (value < 0) {
+                  if (pf_output_counted_cell((unsigned char)'-', count) != 0) {
+                      return 1;
+                  }
+                  magnitude = 0ull - (unsigned long long)value;
+              } else {
+                  magnitude = (unsigned long long)value;
+              }
+
+              return pf_output_u64_decimal(magnitude, count);
+          }
+
           static inline int PF_MAYBE_UNUSED pf_output_cell16(unsigned short cell) {
               if (putchar((int)(cell & 255u)) == EOF) {
                   perror("putchar");

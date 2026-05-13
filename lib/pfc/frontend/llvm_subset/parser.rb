@@ -127,7 +127,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
             return unless match
 
             @destination = match[1]
@@ -161,7 +161,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32)\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/)
             return unless match
 
             @destination = match[1]
@@ -177,7 +177,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Aret\s+(void|i(?:1|8|16|32))(?:\s+(.+))?\z/)
+            match = text.match(/\Aret\s+(void|i(?:1|8|16|32|64))(?:\s+(.+))?\z/)
             return unless match
 
             @return_type = match[1]
@@ -226,7 +226,7 @@ module PFC
 
           while index < lines.length
             header = lines[index].strip
-            match = header.match(/\Adefine\s+(?:[-\w]+\s+)*(i32|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)\s*\{\z/)
+            match = header.match(/\Adefine\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)\s*\{\z/)
             unless match
               index += 1
               next
@@ -320,7 +320,7 @@ module PFC
           return [] if raw.strip.empty?
 
           raw.split(",").map do |parameter|
-            match = parameter.strip.match(/\Ai(?:1|8|16|32)\s+(#{NAME})\z/)
+            match = parameter.strip.match(/\Ai(?:1|8|16|32|64)\s+(#{NAME})\z/)
             raise ParseError, "unsupported function parameter: #{parameter}" unless match
 
             match[1]
@@ -359,7 +359,7 @@ module PFC
 
         def extract_main_body
           lines = source.each_line.to_a
-          start = lines.index { |line| line.match?(/\A\s*define\s+(?:[-\w]+\s+)*(?:i32|void)\s+@main\s*\(/) }
+          start = lines.index { |line| line.match?(/\A\s*define\s+(?:[-\w]+\s+)*(?:i(?:1|8|16|32|64)|void)\s+@main\s*\(/) }
           raise ParseError, "missing define @main()" if start.nil?
 
           body = []
@@ -455,7 +455,7 @@ module PFC
         end
 
         def switch_labels(line)
-          match = line.match(/\Aswitch\s+i(?:1|8|16|32)\s+.+?,\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
+          match = line.match(/\Aswitch\s+i(?:1|8|16|32|64)\s+.+?,\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
           return [] unless match
 
           [match[1]] + match[2].scan(/label\s+%([-A-Za-z$._0-9]+)/).flatten
