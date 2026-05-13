@@ -13,11 +13,13 @@ module PFC
       def initialize(source, tape_size: DEFAULT_TAPE_SIZE)
         @source = source
         @tape_size = Integer(tape_size)
+        @internal_functions = parse_internal_functions(source)
         @blocks = parse_blocks(source)
         @slots = {}
         @slot_count = 0
         @pointers = {}
         @registers = {}
+        @inline_call_index = 0
         validate_tape_size!
         analyze_allocations
         analyze_registers
@@ -46,7 +48,7 @@ module PFC
 
       private
 
-      attr_reader :blocks, :block_order, :pointers, :registers, :slot_count, :source, :tape_size
+      attr_reader :blocks, :block_order, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -73,6 +75,53 @@ module PFC
         end
 
         parsed
+      end
+
+      def parse_internal_functions(source)
+        functions = {}
+        lines = source.each_line.to_a
+        index = 0
+
+        while index < lines.length
+          header = lines[index].strip
+          match = header.match(/\Adefine\s+(?:[-\w]+\s+)*i32\s+@([-A-Za-z$._0-9]+)\((.*?)\)\s*\{\z/)
+          unless match
+            index += 1
+            next
+          end
+
+          name = match[1]
+          body = []
+          index += 1
+          while index < lines.length && lines[index].strip != "}"
+            body << lines[index]
+            index += 1
+          end
+          functions[name] = {
+            params: parse_parameters(match[2]),
+            lines: normalized_function_lines(body.join)
+          } unless name == "main"
+          index += 1
+        end
+
+        functions
+      end
+
+      def parse_parameters(raw)
+        return [] if raw.strip.empty?
+
+        raw.split(",").map do |parameter|
+          match = parameter.strip.match(/\Ai(?:1|8|16|32)\s+(#{NAME})\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported function parameter: #{parameter}" unless match
+
+          match[1]
+        end
+      end
+
+      def normalized_function_lines(body)
+        normalized_lines(body).reject do |line|
+          line.empty? || line.match?(/\A[-A-Za-z$._0-9]+:\z/)
+        end
       end
 
       def normalized_lines(body)
@@ -107,7 +156,7 @@ module PFC
 
       def extract_main_body(source)
         lines = source.each_line.to_a
-        start = lines.index { |line| line.match?(/\A\s*define\s+(?:[-\w]+\s+)*i32\s+@main\s*\(/) }
+        start = lines.index { |line| line.match?(/\A\s*define\s+(?:[-\w]+\s+)*(?:i32|void)\s+@main\s*\(/) }
         raise Frontend::LLVMSubset::ParseError, "missing define i32 @main()" if start.nil?
 
         body = []
@@ -122,7 +171,7 @@ module PFC
 
       def analyze_allocations
         all_lines.each do |line|
-          if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i8\](?:,\s+align\s+\d+)?\z/))
+          if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:8|16|32)\](?:,\s+align\s+\d+)?\z/))
             allocate_pointer(match[1], match[2].to_i)
           elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(8|16|32)(?:,\s+align\s+\d+)?\z/))
             allocate_pointer(match[1], 1)
@@ -195,7 +244,7 @@ module PFC
       end
 
       def emit_block(label, lines)
-        output = ["#{c_label(label)}:"]
+        output = ["#{c_label(label)}:", "    (void)0;"]
         body_lines(label, lines).each do |line|
           output.concat(emit_statement(label, line))
         end
@@ -225,7 +274,7 @@ module PFC
       end
 
       def emit_gep(line)
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i8\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:8|16|32)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           width = match[2].to_i
           base = pointer_expr(match[3])
           first_index = llvm_value(match[4])
@@ -311,11 +360,122 @@ module PFC
         end
 
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@putchar\(i32\s+(.+)\)\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
+        return emit_internal_call(line) unless match
 
         output = ["    if (pf_output_cell((unsigned char)(#{llvm_value(match[2])})) != 0) PF_ABORT();"]
         output << "    #{register(match[1])} = 0u;" if match[1]
         output
+      end
+
+      def emit_internal_call(line)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
+
+        destination = match[1]
+        function = internal_functions.fetch(match[2]) do
+          raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}"
+        end
+        inline_function_call(destination, function, parse_call_arguments(match[3]))
+      end
+
+      def parse_call_arguments(raw)
+        return [] if raw.strip.empty?
+
+        raw.split(",").map do |argument|
+          match = argument.strip.match(/\Ai(?:1|8|16|32)\s+(.+)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported call argument: #{argument}" unless match
+
+          match[1]
+        end
+      end
+
+      def inline_function_call(destination, function, arguments)
+        unless arguments.length == function.fetch(:params).length
+          raise Frontend::LLVMSubset::ParseError, "wrong argument count for internal call"
+        end
+
+        prefix = "pf_call_#{@inline_call_index}"
+        @inline_call_index += 1
+        locals = {}
+        locals[:return_destination] = destination ? register(destination) : "#{prefix}_ignored_return"
+        lines = []
+        lines << "    unsigned int #{locals[:return_destination]} = 0;" unless destination
+        function.fetch(:params).zip(arguments).each_with_index do |(param, argument), index|
+          local = "#{prefix}_arg#{index}"
+          locals[param] = local
+          lines << "    unsigned int #{local} = (unsigned int)(#{llvm_value(argument)});"
+        end
+
+        function.fetch(:lines).each do |body_line|
+          emitted = emit_inline_statement(body_line, locals, prefix)
+          lines.concat(emitted)
+          break if emitted.any? { |emitted_line| emitted_line.include?("/* pfc inline return */") }
+        end
+
+        if destination && !locals.key?(destination)
+          raise Frontend::LLVMSubset::ParseError, "internal function did not return a value"
+        end
+        lines
+      end
+
+      def emit_inline_statement(line, locals, prefix)
+        return emit_inline_binary(line, locals, prefix) if line.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
+        return emit_inline_select(line, locals, prefix) if line.match?(/\A#{NAME}\s*=\s*select\b/)
+        return emit_inline_cast(line, locals, prefix) if line.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc)\b/)
+        return emit_inline_icmp(line, locals, prefix) if line.match?(/\A#{NAME}\s*=\s*icmp\b/)
+        return emit_inline_return(line, locals) if line.start_with?("ret ")
+
+        raise Frontend::LLVMSubset::ParseError, "unsupported internal function instruction: #{line}"
+      end
+
+      def emit_inline_binary(line, locals, prefix)
+        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(8|16|32)\s+(.+?),\s+(.+)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
+
+        local = inline_local(match[1], locals, prefix)
+        expression = binary_expression(match[2], match[3].to_i, inline_value(match[4], locals), inline_value(match[5], locals))
+        ["    unsigned int #{local} = (unsigned int)((#{expression}) & #{integer_mask(match[3].to_i)}u);"]
+      end
+
+      def emit_inline_select(line, locals, prefix)
+        match = line.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32)\s+(.+?),\s+i(?:1|8|16|32)\s+(.+)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported select: #{line}" unless match
+
+        local = inline_local(match[1], locals, prefix)
+        condition = inline_value(match[2], locals)
+        true_value = inline_value(match[4], locals)
+        false_value = inline_value(match[5], locals)
+        ["    unsigned int #{local} = (unsigned int)(((#{condition}) != 0u ? (#{true_value}) : (#{false_value})) & #{integer_mask(match[3].to_i)}u);"]
+      end
+
+      def emit_inline_cast(line, locals, prefix)
+        match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32)\s+(.+?)\s+to\s+i(1|8|16|32)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
+
+        local = inline_local(match[1], locals, prefix)
+        ["    unsigned int #{local} = (unsigned int)((#{inline_value(match[4], locals)}) & #{integer_mask(match[5].to_i)}u);"]
+      end
+
+      def emit_inline_icmp(line, locals, prefix)
+        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(8|16|32)\s+(.+?),\s+(.+)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
+
+        left = inline_value(match[4], locals)
+        right = inline_value(match[5], locals)
+        if match[2].start_with?("s")
+          bits = match[3].to_i
+          left = signed_expression(left, bits)
+          right = signed_expression(right, bits)
+        end
+        local = inline_local(match[1], locals, prefix)
+        ["    unsigned int #{local} = ((#{left}) #{icmp_operator(match[2])} (#{right})) ? 1u : 0u;"]
+      end
+
+      def emit_inline_return(line, locals)
+        match = line.match(/\Aret\s+i32\s+(.+)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}" unless match
+
+        ["    #{locals.fetch(:return_destination)} = (unsigned int)(#{inline_value(match[1], locals)}); /* pfc inline return */"]
       end
 
       def emit_branch(label, line)
@@ -394,6 +554,23 @@ module PFC
         tokens = raw.strip.split(/\s+/)
         token = tokens.last
         return token if token.match?(/\A-?\d+\z/)
+        return register(token) if token.match?(/\A#{NAME}\z/)
+
+        raise Frontend::LLVMSubset::ParseError, "unsupported value: #{raw}"
+      end
+
+      def inline_local(name, locals, prefix)
+        locals.fetch(name) do
+          local = "#{prefix}_#{name.delete_prefix('%').gsub(/[^A-Za-z0-9_]/, '_')}"
+          locals[name] = local
+          local
+        end
+      end
+
+      def inline_value(raw, locals)
+        token = raw.strip.split(/\s+/).last
+        return token if token.match?(/\A-?\d+\z/)
+        return locals[token] if locals.key?(token)
         return register(token) if token.match?(/\A#{NAME}\z/)
 
         raise Frontend::LLVMSubset::ParseError, "unsupported value: #{raw}"

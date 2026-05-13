@@ -142,7 +142,9 @@ module PFC
         raise ArgumentError, "unsupported backend: #{options[:backend]}"
       end
 
-      raise ArgumentError, "only --cell-bits=8 or --cell-bits=16 is supported" unless [8, 16].include?(options[:cell_bits])
+      unless [8, 16, 32].include?(options[:cell_bits])
+        raise ArgumentError, "only --cell-bits=8, --cell-bits=16, or --cell-bits=32 is supported"
+      end
     end
 
     def require_input_path!
@@ -230,7 +232,7 @@ module PFC
           --backend=printf-c-scheduler|printf-threaded
           --no-opt
           --tape-size=30000
-          --cell-bits=8|16
+          --cell-bits=8|16|32
           --strict-printf
           --debug
       HELP

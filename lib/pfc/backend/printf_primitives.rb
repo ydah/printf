@@ -12,6 +12,11 @@ module PFC
           #define PF_MAYBE_UNUSED
           #endif
 
+          typedef struct {
+              unsigned short lo;
+              unsigned short hi;
+          } PFCell32;
+
           static inline void PF_MAYBE_UNUSED pf_set_cell(FILE *pf_sink, unsigned char *cell, int value) {
               int pad = value % 256;
               if (pad < 0) {
@@ -147,6 +152,82 @@ module PFC
               return 0;
           }
 
+          static inline unsigned int PF_MAYBE_UNUSED pf_cell32_value(const PFCell32 *cell) {
+              return ((unsigned int)cell->hi << 16) | (unsigned int)cell->lo;
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_set_cell32(FILE *pf_sink, PFCell32 *cell, unsigned int value) {
+              pf_set_u16(pf_sink, &cell->lo, (unsigned short)(value & 65535u));
+              pf_set_u16(pf_sink, &cell->hi, (unsigned short)(value >> 16));
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_add_cell32(FILE *pf_sink, PFCell32 *cell, int delta) {
+              pf_set_cell32(pf_sink, cell, pf_cell32_value(cell) + (unsigned int)delta);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_clear_cell32(FILE *pf_sink, PFCell32 *cell) {
+              pf_set_cell32(pf_sink, cell, 0);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_inc_cell32(FILE *pf_sink, PFCell32 *cell) {
+              if (cell->lo == 65535u) {
+                  pf_set_u16(pf_sink, &cell->lo, 0);
+                  pf_inc_cell16(pf_sink, &cell->hi);
+                  return;
+              }
+
+              pf_inc_cell16(pf_sink, &cell->lo);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_dec_cell32(FILE *pf_sink, PFCell32 *cell) {
+              if (cell->lo == 0) {
+                  pf_set_u16(pf_sink, &cell->lo, 65535u);
+                  pf_dec_cell16(pf_sink, &cell->hi);
+                  return;
+              }
+
+              pf_dec_cell16(pf_sink, &cell->lo);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_add_cell32_strict(FILE *pf_sink, PFCell32 *cell, int delta) {
+              unsigned int steps = (unsigned int)delta;
+              if (steps <= 2147483648u) {
+                  while (steps > 0) {
+                      pf_inc_cell32(pf_sink, cell);
+                      steps--;
+                  }
+                  return;
+              }
+
+              steps = 0u - steps;
+              while (steps > 0) {
+                  pf_dec_cell32(pf_sink, cell);
+                  steps--;
+              }
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_transfer_cell32(FILE *pf_sink, PFCell32 *tape, unsigned short dp, int offset, int scale) {
+              int target = (int)dp + offset;
+              if (target < 0 || target >= TAPE_SIZE) {
+                  fprintf(stderr, "pfc runtime error: transfer target out of range: %d\\n", target);
+                  return 1;
+              }
+
+              pf_add_cell32(pf_sink, &tape[target], (int)(pf_cell32_value(&tape[dp]) * (unsigned int)scale));
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_transfer_cell32_strict(FILE *pf_sink, PFCell32 *tape, unsigned short dp, int offset, int scale) {
+              int target = (int)dp + offset;
+              if (target < 0 || target >= TAPE_SIZE) {
+                  fprintf(stderr, "pfc runtime error: transfer target out of range: %d\\n", target);
+                  return 1;
+              }
+
+              pf_add_cell32_strict(pf_sink, &tape[target], (int)(pf_cell32_value(&tape[dp]) * (unsigned int)scale));
+              return 0;
+          }
+
           static inline void PF_MAYBE_UNUSED pf_set_dp(FILE *pf_sink, unsigned short *dp, unsigned short value) {
               pf_set_u16(pf_sink, dp, value);
           }
@@ -221,6 +302,14 @@ module PFC
               pf_set_u16(pf_sink, cell, (unsigned short)ch);
           }
 
+          static inline void PF_MAYBE_UNUSED pf_read_cell32(FILE *pf_sink, PFCell32 *cell) {
+              int ch = getchar();
+              if (ch == EOF) {
+                  ch = 0;
+              }
+              pf_set_cell32(pf_sink, cell, (unsigned int)ch);
+          }
+
           static inline int PF_MAYBE_UNUSED pf_output_cell(unsigned char cell) {
               if (putchar((int)cell) == EOF) {
                   perror("putchar");
@@ -231,6 +320,14 @@ module PFC
 
           static inline int PF_MAYBE_UNUSED pf_output_cell16(unsigned short cell) {
               if (putchar((int)(cell & 255u)) == EOF) {
+                  perror("putchar");
+                  return 1;
+              }
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_output_cell32(PFCell32 cell) {
+              if (putchar((int)(pf_cell32_value(&cell) & 255u)) == EOF) {
                   perror("putchar");
                   return 1;
               }

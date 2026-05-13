@@ -80,4 +80,12 @@ class CEmitterTest < Minitest::Test
     assert_includes source, "pf_add_cell16(pf_sink, &tape[dp], 1);"
     assert_includes source, "pf_output_cell16(tape[dp])"
   end
+
+  def test_emits_32_bit_cell_backend
+    source = PFC::Backend::CEmitter.new(cell_bits: 32).emit(PFC::Frontend::Brainfuck.parse("+."))
+
+    assert_includes source, "PFCell32 tape[TAPE_SIZE]"
+    assert_includes source, "pf_add_cell32(pf_sink, &tape[dp], 1);"
+    assert_includes source, "pf_output_cell32(tape[dp])"
+  end
 end

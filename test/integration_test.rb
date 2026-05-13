@@ -61,6 +61,14 @@ class IntegrationTest < Minitest::Test
     assert_equal ",".b, compile_and_run("#{"+" * 300}.", backend: :threaded, cell_bits: 16)
   end
 
+  def test_runs_32_bit_cell_program
+    assert_equal ",".b, compile_and_run("#{"+" * 300}.", cell_bits: 32)
+  end
+
+  def test_threaded_backend_runs_32_bit_cell_program
+    assert_equal ",".b, compile_and_run("#{"+" * 300}.", backend: :threaded, cell_bits: 32)
+  end
+
   def test_runs_llvm_constant_putchar_sample
     assert_equal "B", compile_llvm_and_run("samples/putchar.ll")
   end
@@ -98,5 +106,17 @@ class IntegrationTest < Minitest::Test
 
   def test_runs_llvm_i32_memory_sample
     assert_equal ",", compile_llvm_and_run("samples/i32_memory.ll")
+  end
+
+  def test_runs_llvm_internal_call_sample
+    assert_equal "B", compile_llvm_and_run("samples/internal_call.ll")
+  end
+
+  def test_runs_llvm_void_main_sample
+    assert_equal "A", compile_llvm_and_run("samples/void_main.ll")
+  end
+
+  def test_runs_llvm_i16_array_sample
+    assert_equal "AB", compile_llvm_and_run("samples/i16_array.ll")
   end
 end

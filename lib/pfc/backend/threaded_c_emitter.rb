@@ -52,9 +52,9 @@ module PFC
       end
 
       def validate_cell_bits!
-        return if [8, 16].include?(cell_bits)
+        return if [8, 16, 32].include?(cell_bits)
 
-        raise ArgumentError, "cell bits must be 8 or 16"
+        raise ArgumentError, "cell bits must be 8, 16, or 32"
       end
 
       def validate_program_length!(flat_program)
@@ -185,14 +185,14 @@ module PFC
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
           "        case PF_OP_JZ:",
-          "            if (tape[dp] == 0) {",
+          "            if (#{cell_value_expr} == 0) {",
           "                pf_jump_ip(pf_sink, &ip, (unsigned short)instruction.operand);",
           "            } else {",
           "                pf_advance_ip(pf_sink, &ip);",
           "            }",
           "            break;",
           "        case PF_OP_JNZ:",
-          "            if (tape[dp] != 0) {",
+          "            if (#{cell_value_expr} != 0) {",
           "                pf_jump_ip(pf_sink, &ip, (unsigned short)instruction.operand);",
           "            } else {",
           "                pf_advance_ip(pf_sink, &ip);",
@@ -224,16 +224,24 @@ module PFC
       end
 
       def transfer_cell_helper
+        return "pf_transfer_cell32_strict" if cell_bits == 32 && strict_printf?
+        return "pf_transfer_cell32" if cell_bits == 32
         return "pf_transfer_cell16_strict" if cell_bits == 16 && strict_printf?
         return "pf_transfer_cell16" if cell_bits == 16
         strict_printf? ? "pf_transfer_cell_strict" : "pf_transfer_cell"
       end
 
       def cell_type
-        cell_bits == 16 ? "unsigned short" : "unsigned char"
+        case cell_bits
+        when 16 then "unsigned short"
+        when 32 then "PFCell32"
+        else "unsigned char"
+        end
       end
 
       def add_helper
+        return "pf_add_cell32_strict" if cell_bits == 32 && strict_printf?
+        return "pf_add_cell32" if cell_bits == 32
         return "pf_add_cell16_strict" if cell_bits == 16 && strict_printf?
         return "pf_add_cell16" if cell_bits == 16
         return "pf_add_cell_strict" if strict_printf?
@@ -242,15 +250,22 @@ module PFC
       end
 
       def clear_helper
+        return "pf_clear_cell32" if cell_bits == 32
         cell_bits == 16 ? "pf_clear_cell16" : "pf_clear_cell"
       end
 
       def read_helper
+        return "pf_read_cell32" if cell_bits == 32
         cell_bits == 16 ? "pf_read_cell16" : "pf_read_cell"
       end
 
       def output_helper
+        return "pf_output_cell32" if cell_bits == 32
         cell_bits == 16 ? "pf_output_cell16" : "pf_output_cell"
+      end
+
+      def cell_value_expr
+        cell_bits == 32 ? "pf_cell32_value(&tape[dp])" : "tape[dp]"
       end
     end
   end
