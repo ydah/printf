@@ -3,6 +3,28 @@
 require_relative "test_helper"
 
 class LLVMSubsetTest < Minitest::Test
+  def test_parser_exposes_main_and_internal_function_blocks
+    source = <<~LLVM
+      define i32 @id(i32 %x) {
+      entry:
+        ret i32 %x
+      }
+
+      define i32 @main() {
+      entry:
+        %value = call i32 @id(i32 7)
+        ret i32 %value
+      }
+    LLVM
+
+    parsed = PFC::Frontend::LLVMSubset::Parser.parse(source)
+
+    assert_equal ["entry"], parsed.fetch(:block_order)
+    assert_equal ["%value = call i32 @id(i32 7)", "ret i32 %value"], parsed.fetch(:blocks).fetch("entry")
+    assert_equal ["id"], parsed.fetch(:internal_functions).keys
+    assert_equal ["ret i32 %x"], parsed.fetch(:internal_functions).fetch("id").fetch(:blocks).fetch("entry")
+  end
+
   def test_emits_constant_putchar_program
     source = PFC::Backend::LLVMCEmitter.new(File.read(File.expand_path("../samples/putchar.ll", __dir__))).emit
 
