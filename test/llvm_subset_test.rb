@@ -25,6 +25,56 @@ class LLVMSubsetTest < Minitest::Test
     assert_equal ["ret i32 %x"], parsed.fetch(:internal_functions).fetch("id").fetch(:blocks).fetch("entry")
   end
 
+  def test_parser_rejects_undefined_branch_label
+    source = <<~LLVM
+      define i32 @main() {
+      entry:
+        br label %missing
+      }
+    LLVM
+
+    error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Frontend::LLVMSubset::Parser.parse(source)
+    end
+
+    assert_equal "line 3: undefined label %missing in main block %entry", error.message
+  end
+
+  def test_parser_rejects_unreachable_block
+    source = <<~LLVM
+      define i32 @main() {
+      entry:
+        ret i32 0
+      dead:
+        ret i32 1
+      }
+    LLVM
+
+    error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Frontend::LLVMSubset::Parser.parse(source)
+    end
+
+    assert_equal "line 4: unreachable block %dead in main", error.message
+  end
+
+  def test_parser_rejects_unknown_phi_incoming_label
+    source = <<~LLVM
+      define i32 @main() {
+      entry:
+        br label %merge
+      merge:
+        %value = phi i32 [ 1, %missing ]
+        ret i32 %value
+      }
+    LLVM
+
+    error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Frontend::LLVMSubset::Parser.parse(source)
+    end
+
+    assert_equal "line 5: undefined label %missing in main block %merge", error.message
+  end
+
   def test_emits_constant_putchar_program
     source = PFC::Backend::LLVMCEmitter.new(File.read(File.expand_path("../samples/putchar.ll", __dir__))).emit
 

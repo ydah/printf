@@ -18,10 +18,16 @@ module PFC
 
         def parse
           block_order, blocks = parse_main_blocks
+          internal_functions = parse_internal_functions
+          validate_function!("main", block_order, blocks)
+          internal_functions.each_value do |function|
+            validate_function!("@#{function.fetch(:name)}", function.fetch(:block_order), function.fetch(:blocks))
+          end
+
           {
             block_order:,
             blocks:,
-            internal_functions: parse_internal_functions,
+            internal_functions:,
             source:,
             source_line_numbers:
           }
@@ -157,6 +163,90 @@ module PFC
 
             output[normalized] ||= line_number
           end
+        end
+
+        def validate_function!(function_name, order, blocks)
+          validate_referenced_labels!(function_name, blocks)
+          validate_reachable_blocks!(function_name, order, blocks)
+        end
+
+        def validate_referenced_labels!(function_name, blocks)
+          valid_labels = blocks.keys
+          blocks.each do |label, lines|
+            lines.each do |line|
+              referenced_labels(line).each do |target|
+                next if valid_labels.include?(target)
+
+                raise parse_error("undefined label %#{target} in #{function_name} block %#{label}", line)
+              end
+            end
+          end
+        end
+
+        def validate_reachable_blocks!(function_name, order, blocks)
+          reachable = reachable_labels(blocks)
+          order.each do |label|
+            next if reachable.include?(label)
+
+            raise parse_error("unreachable block %#{label} in #{function_name}", "#{label}:")
+          end
+        end
+
+        def reachable_labels(blocks)
+          reachable = []
+          pending = ["entry"]
+
+          until pending.empty?
+            label = pending.shift
+            next if reachable.include?(label)
+            next unless blocks.key?(label)
+
+            reachable << label
+            outgoing_labels(blocks.fetch(label)).each do |target|
+              pending << target unless reachable.include?(target)
+            end
+          end
+
+          reachable
+        end
+
+        def outgoing_labels(lines)
+          terminator = lines.reverse.find { |line| line.start_with?("br ") || line.start_with?("switch ") || line.start_with?("ret ") }
+          return [] if terminator.nil? || terminator.start_with?("ret ")
+
+          branch_labels(terminator) + switch_labels(terminator)
+        end
+
+        def referenced_labels(line)
+          return phi_labels(line) if line.match?(/\A#{NAME}\s*=\s*phi\b/)
+          return branch_labels(line) if line.start_with?("br ")
+          return switch_labels(line) if line.start_with?("switch ")
+
+          []
+        end
+
+        def phi_labels(line)
+          line.scan(/\[\s*.+?\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/).flatten
+        end
+
+        def branch_labels(line)
+          return [Regexp.last_match(1)] if line.match(/\Abr\s+label\s+%([-A-Za-z$._0-9]+)\z/)
+
+          match = line.match(/\Abr\s+i1\s+.+?,\s+label\s+%([-A-Za-z$._0-9]+),\s+label\s+%([-A-Za-z$._0-9]+)\z/)
+          match ? [match[1], match[2]] : []
+        end
+
+        def switch_labels(line)
+          match = line.match(/\Aswitch\s+i(?:1|8|16|32)\s+.+?,\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
+          return [] unless match
+
+          [match[1]] + match[2].scan(/label\s+%([-A-Za-z$._0-9]+)/).flatten
+        end
+
+        def parse_error(message, line)
+          line_number = source_line_numbers.fetch(line, nil)
+          prefix = line_number ? "line #{line_number}: " : ""
+          ParseError.new("#{prefix}#{message}")
         end
       end
     end
