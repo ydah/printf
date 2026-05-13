@@ -79,6 +79,26 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes PFC::Backend::LLVMCEmitter.new(source).dump_ir, "LLVMSubsetCFG(blocks: entry, yes, no, merge"
   end
 
+  def test_dumps_detailed_cfg_for_dynamic_programs
+    source = File.read(File.expand_path("../samples/dynamic_branch.ll", __dir__))
+    dump = PFC::Backend::LLVMCEmitter.new(source).dump_cfg
+
+    assert_includes dump, "LLVMSubsetCFG\nmain:\n"
+    assert_includes dump, "  block entry:"
+    assert_includes dump, "    inst: %ch = call i32 @getchar()"
+    assert_includes dump, "  block merge:"
+    assert_includes dump, "    phi: %out = phi i32 [ 89, %yes ], [ 78, %no ]"
+  end
+
+  def test_dumps_internal_function_cfg
+    source = File.read(File.expand_path("../samples/internal_cfg.ll", __dir__))
+    dump = PFC::Backend::LLVMCEmitter.new(source).dump_cfg
+
+    assert_includes dump, "functions:"
+    assert_includes dump, "  @choose(%x) -> i32"
+    assert_includes dump, "    block entry:"
+  end
+
   def test_inlines_internal_cfg_functions
     source = File.read(File.expand_path("../samples/internal_cfg.ll", __dir__))
     generated = PFC::Backend::LLVMCEmitter.new(source).emit

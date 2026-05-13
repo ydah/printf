@@ -34,6 +34,30 @@ class CLITest < Minitest::Test
     end
   end
 
+  def test_dump_cfg_rejects_brainfuck_input
+    Dir.mktmpdir("pfc-cli-test") do |dir|
+      path = File.join(dir, "main.bf")
+      File.write(path, "+.")
+      _out, err = capture_io do
+        assert_equal 1, PFC::CLI.new(["dump-cfg", path]).run
+      end
+
+      assert_includes err, "dump-cfg only supports LLVM inputs"
+    end
+  end
+
+  def test_dump_cfg_prints_llvm_blocks
+    with_llvm_source do |path|
+      out, err = capture_io do
+        assert_equal 0, PFC::CLI.new(["dump-cfg", path]).run
+      end
+
+      assert_empty err
+      assert_includes out, "LLVMSubsetCFG\nmain:\n"
+      assert_includes out, "  block entry:"
+    end
+  end
+
   private
 
   def with_llvm_source

@@ -35,6 +35,8 @@ module PFC
         run_command
       when "dump-ir"
         dump_ir_command
+      when "dump-cfg"
+        dump_cfg_command
       when "dump-c"
         dump_c_command
       when "-h", "--help", "help"
@@ -105,6 +107,16 @@ module PFC
       end
 
       puts compile_ir(File.read(source_path), options, source_path:).inspect
+      0
+    end
+
+    def dump_cfg_command
+      options = parse_options
+      source_path = require_input_path!
+      validate_source_options!(source_path, options)
+      raise ArgumentError, "dump-cfg only supports LLVM inputs" unless llvm_source?(source_path)
+
+      puts Backend::LLVMCEmitter.new(File.read(source_path), tape_size: options[:tape_size]).dump_cfg
       0
     end
 
@@ -244,6 +256,7 @@ module PFC
           pfc build INPUT -o OUTPUT
           pfc run INPUT
           pfc dump-ir INPUT
+          pfc dump-cfg INPUT
           pfc dump-c INPUT
 
         Options:

@@ -46,6 +46,28 @@ module PFC
         "LLVMSubsetCFG(blocks: #{block_order.join(', ')}, slots: #{slot_count}, registers: #{registers.keys.sort.join(', ')})"
       end
 
+      def dump_cfg
+        lines = [
+          "LLVMSubsetCFG",
+          "main:",
+          "  slots: #{slot_count}",
+          "  registers: #{registers.keys.sort.join(', ')}"
+        ]
+        lines.concat(dump_blocks(block_order, blocks, indent: "  "))
+
+        unless internal_functions.empty?
+          lines << "functions:"
+          internal_functions.keys.sort.each do |name|
+            function = internal_functions.fetch(name)
+            lines << "  @#{name}(#{function.fetch(:params).join(', ')}) -> #{function.fetch(:return_type)}"
+            lines << "    slots: #{function.fetch(:allocations).length}"
+            lines.concat(dump_blocks(function.fetch(:block_order), function.fetch(:blocks), indent: "    "))
+          end
+        end
+
+        "#{lines.join("\n")}\n"
+      end
+
       private
 
       attr_reader :blocks, :block_order, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
@@ -222,6 +244,17 @@ module PFC
         slot = slot_count
         @slot_count += width
         slot
+      end
+
+      def dump_blocks(order, block_map, indent:)
+        order.flat_map do |label|
+          lines = ["#{indent}block #{label}:"]
+          block_map.fetch(label).each do |line|
+            prefix = phi?(line) ? "phi" : "inst"
+            lines << "#{indent}  #{prefix}: #{line}"
+          end
+          lines
+        end
       end
 
       def main_prelude

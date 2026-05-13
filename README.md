@@ -21,6 +21,7 @@ bin/pfc run samples/hello.bf --backend=printf-threaded
 bin/pfc run samples/hello.bf --cell-bits=16
 bin/pfc dump-ir samples/hello.bf
 bin/pfc dump-c samples/hello.bf
+bin/pfc dump-cfg samples/dynamic_branch.ll
 bin/pfc run samples/putchar.ll
 printf A | bin/pfc run samples/dynamic_branch.ll
 bin/pfc run samples/ops_select.ll
@@ -38,6 +39,7 @@ Supported commands:
 - `build INPUT -o OUTPUT`
 - `run INPUT`
 - `dump-ir INPUT`
+- `dump-cfg INPUT`
 - `dump-c INPUT`
 
 `.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports scalar and fixed-array `alloca`/`load`/`store` for `i1`/`i8`/`i16`/`i32`, constant or dynamic `getelementptr`, `add`/`sub`/`mul`/division/remainder, bitwise and shift operations, `icmp`, `select`, `switch`, `br`, simple `phi`, `ret`, `void @main`, nested internal `i32` and `void` calls with local CFG and memory, and `putchar`/`getchar`.
