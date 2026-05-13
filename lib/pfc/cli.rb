@@ -53,6 +53,7 @@ module PFC
     def compile_command
       options = parse_options
       source_path = require_input_path!
+      validate_source_options!(source_path, options)
       c_source = compile_source(File.read(source_path), options, source_path:)
 
       if options[:output]
@@ -67,6 +68,7 @@ module PFC
     def build_command
       options = parse_options
       source_path = require_input_path!
+      validate_source_options!(source_path, options)
       output = options[:output] || default_executable_path(source_path)
 
       Dir.mktmpdir("pfc") do |dir|
@@ -79,6 +81,7 @@ module PFC
     def run_command
       options = parse_options
       source_path = require_input_path!
+      validate_source_options!(source_path, options)
 
       Dir.mktmpdir("pfc") do |dir|
         c_path = File.join(dir, "generated.c")
@@ -95,6 +98,7 @@ module PFC
     def dump_ir_command
       options = parse_options
       source_path = require_input_path!
+      validate_source_options!(source_path, options)
       if llvm_source?(source_path)
         puts Backend::LLVMCEmitter.new(File.read(source_path), tape_size: options[:tape_size]).dump_ir
         return 0
@@ -107,6 +111,7 @@ module PFC
     def dump_c_command
       options = parse_options
       source_path = require_input_path!
+      validate_source_options!(source_path, options)
       puts compile_source(File.read(source_path), options, source_path:)
       0
     end
@@ -145,6 +150,19 @@ module PFC
       unless [8, 16, 32].include?(options[:cell_bits])
         raise ArgumentError, "only --cell-bits=8, --cell-bits=16, or --cell-bits=32 is supported"
       end
+    end
+
+    def validate_source_options!(source_path, options)
+      return unless llvm_source?(source_path)
+
+      unsupported = []
+      unsupported << "--backend=#{options[:backend]}" unless options[:backend] == DEFAULT_BACKEND
+      unsupported << "--cell-bits=#{options[:cell_bits]}" unless options[:cell_bits] == 8
+      unsupported << "--strict-printf" if options[:strict_printf]
+      unsupported << "--no-opt" unless options[:optimize]
+      return if unsupported.empty?
+
+      raise ArgumentError, "LLVM input does not support #{unsupported.join(', ')}"
     end
 
     def require_input_path!

@@ -1,0 +1,51 @@
+# frozen_string_literal: true
+
+require_relative "test_helper"
+
+class CLITest < Minitest::Test
+  def test_rejects_backend_option_for_llvm_input
+    with_llvm_source do |path|
+      _out, err = capture_io do
+        assert_equal 1, PFC::CLI.new(["dump-c", "--backend=printf-threaded", path]).run
+      end
+
+      assert_includes err, "LLVM input does not support --backend=printf-threaded"
+    end
+  end
+
+  def test_rejects_cell_options_for_llvm_input
+    with_llvm_source do |path|
+      _out, err = capture_io do
+        assert_equal 1, PFC::CLI.new(["dump-c", "--cell-bits=16", "--strict-printf", "--no-opt", path]).run
+      end
+
+      assert_includes err, "LLVM input does not support --cell-bits=16, --strict-printf, --no-opt"
+    end
+  end
+
+  def test_allows_tape_size_for_llvm_input
+    with_llvm_source do |path|
+      out, err = capture_io do
+        assert_equal 0, PFC::CLI.new(["dump-c", "--tape-size=16", path]).run
+      end
+
+      assert_empty err
+      assert_includes out, "#define TAPE_SIZE 16"
+    end
+  end
+
+  private
+
+  def with_llvm_source
+    Dir.mktmpdir("pfc-cli-test") do |dir|
+      path = File.join(dir, "main.ll")
+      File.write(path, <<~LLVM)
+        define i32 @main() {
+        entry:
+          ret i32 0
+        }
+      LLVM
+      yield path
+    end
+  end
+end
