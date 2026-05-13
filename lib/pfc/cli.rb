@@ -142,7 +142,7 @@ module PFC
         raise ArgumentError, "unsupported backend: #{options[:backend]}"
       end
 
-      raise ArgumentError, "only --cell-bits=8 is supported" unless options[:cell_bits] == 8
+      raise ArgumentError, "only --cell-bits=8 or --cell-bits=16 is supported" unless [8, 16].include?(options[:cell_bits])
     end
 
     def require_input_path!
@@ -166,13 +166,15 @@ module PFC
       if options[:backend] == "printf-threaded"
         return Backend::ThreadedCEmitter.new(
           tape_size: options[:tape_size],
-          strict_printf: options[:strict_printf]
+          strict_printf: options[:strict_printf],
+          cell_bits: options[:cell_bits]
         )
       end
 
       Backend::CEmitter.new(
         tape_size: options[:tape_size],
-        strict_printf: options[:strict_printf]
+        strict_printf: options[:strict_printf],
+        cell_bits: options[:cell_bits]
       )
     end
 
@@ -184,7 +186,7 @@ module PFC
     end
 
     def parse_program(source, source_path)
-      return Frontend::LLVMSubset.parse(source) if llvm_source?(source_path)
+      raise Frontend::LLVMSubset::ParseError, "LLVM inputs are compiled through the LLVM C emitter" if llvm_source?(source_path)
 
       Frontend::Brainfuck.parse(source)
     end
@@ -218,17 +220,17 @@ module PFC
     def help
       <<~HELP
         Usage:
-          pfc compile INPUT.bf -o OUTPUT.c
-          pfc build INPUT.bf -o OUTPUT
-          pfc run INPUT.bf
-          pfc dump-ir INPUT.bf
-          pfc dump-c INPUT.bf
+          pfc compile INPUT -o OUTPUT.c
+          pfc build INPUT -o OUTPUT
+          pfc run INPUT
+          pfc dump-ir INPUT
+          pfc dump-c INPUT
 
         Options:
           --backend=printf-c-scheduler|printf-threaded
           --no-opt
           --tape-size=30000
-          --cell-bits=8
+          --cell-bits=8|16
           --strict-printf
           --debug
       HELP

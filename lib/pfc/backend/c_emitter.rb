@@ -8,10 +8,12 @@ module PFC
     class CEmitter
       DEFAULT_TAPE_SIZE = 30_000
 
-      def initialize(tape_size: DEFAULT_TAPE_SIZE, strict_printf: false)
+      def initialize(tape_size: DEFAULT_TAPE_SIZE, strict_printf: false, cell_bits: 8)
         @tape_size = Integer(tape_size)
         @strict_printf = strict_printf
+        @cell_bits = Integer(cell_bits)
         validate_tape_size!
+        validate_cell_bits!
       end
 
       def emit(program)
@@ -27,7 +29,7 @@ module PFC
         lines << "        return 1;"
         lines << "    }"
         lines << ""
-        lines << "    unsigned char tape[TAPE_SIZE] = {0};"
+        lines << "    #{cell_type} tape[TAPE_SIZE] = {0};"
         lines << "    unsigned short dp = 0;"
         lines << ""
         lines << "    #define PF_ABORT() do { fclose(pf_sink); return 1; } while (0)"
@@ -45,7 +47,7 @@ module PFC
 
       private
 
-      attr_reader :tape_size
+      attr_reader :cell_bits, :tape_size
 
       def strict_printf?
         @strict_printf
@@ -55,6 +57,12 @@ module PFC
         return if tape_size.between?(1, 65_535)
 
         raise ArgumentError, "tape size must be between 1 and 65535"
+      end
+
+      def validate_cell_bits!
+        return if [8, 16].include?(cell_bits)
+
+        raise ArgumentError, "cell bits must be 8 or 16"
       end
 
       def emit_instructions(instructions, indent:)
@@ -70,11 +78,11 @@ module PFC
         when IR::MovePtr
           emit_move_ptr(instruction, spaces)
         when IR::OutputCell
-          ["#{spaces}if (pf_output_cell(tape[dp]) != 0) PF_ABORT();"]
+          ["#{spaces}if (#{output_helper}(tape[dp]) != 0) PF_ABORT();"]
         when IR::InputCell
-          ["#{spaces}pf_read_cell(pf_sink, &tape[dp]);"]
+          ["#{spaces}#{read_helper}(pf_sink, &tape[dp]);"]
         when IR::ClearCell
-          ["#{spaces}pf_clear_cell(pf_sink, &tape[dp]);"]
+          ["#{spaces}#{clear_helper}(pf_sink, &tape[dp]);"]
         when IR::TransferCell
           emit_transfer_cell(instruction, spaces)
         when IR::Loop
@@ -93,10 +101,10 @@ module PFC
       end
 
       def emit_add_cell(instruction, spaces)
-        return ["#{spaces}pf_add_cell(pf_sink, &tape[dp], #{instruction.delta});"] unless strict_printf?
+        return ["#{spaces}#{add_helper}(pf_sink, &tape[dp], #{instruction.delta});"] unless strict_printf?
 
         strict_cell_steps(instruction.delta).map do |step|
-          helper = step.positive? ? "pf_inc_cell" : "pf_dec_cell"
+          helper = step.positive? ? inc_helper : dec_helper
           "#{spaces}#{helper}(pf_sink, &tape[dp]);"
         end
       end
@@ -107,23 +115,61 @@ module PFC
       end
 
       def emit_transfer_cell(instruction, spaces)
-        helper = strict_printf? ? "pf_transfer_cell_strict" : "pf_transfer_cell"
+        helper = transfer_helper
         lines = instruction.transfers.map do |offset, scale|
           "#{spaces}if (#{helper}(pf_sink, tape, dp, #{offset}, #{scale}) != 0) PF_ABORT();"
         end
-        lines << "#{spaces}pf_clear_cell(pf_sink, &tape[dp]);"
+        lines << "#{spaces}#{clear_helper}(pf_sink, &tape[dp]);"
         lines
       end
 
       def strict_cell_steps(delta)
-        normalized = delta % 256
+        modulus = 1 << cell_bits
+        half = modulus / 2
+        normalized = delta % modulus
         return [] if normalized.zero?
 
-        if normalized <= 128
+        if normalized <= half
           Array.new(normalized, 1)
         else
-          Array.new(256 - normalized, -1)
+          Array.new(modulus - normalized, -1)
         end
+      end
+
+      def cell_type
+        cell_bits == 16 ? "unsigned short" : "unsigned char"
+      end
+
+      def add_helper
+        cell_bits == 16 ? "pf_add_cell16" : "pf_add_cell"
+      end
+
+      def inc_helper
+        cell_bits == 16 ? "pf_inc_cell16" : "pf_inc_cell"
+      end
+
+      def dec_helper
+        cell_bits == 16 ? "pf_dec_cell16" : "pf_dec_cell"
+      end
+
+      def clear_helper
+        cell_bits == 16 ? "pf_clear_cell16" : "pf_clear_cell"
+      end
+
+      def read_helper
+        cell_bits == 16 ? "pf_read_cell16" : "pf_read_cell"
+      end
+
+      def output_helper
+        cell_bits == 16 ? "pf_output_cell16" : "pf_output_cell"
+      end
+
+      def transfer_helper
+        return "pf_transfer_cell16_strict" if cell_bits == 16 && strict_printf?
+        return "pf_transfer_cell16" if cell_bits == 16
+        return "pf_transfer_cell_strict" if strict_printf?
+
+        "pf_transfer_cell"
       end
     end
   end

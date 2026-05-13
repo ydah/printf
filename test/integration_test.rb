@@ -35,6 +35,10 @@ class IntegrationTest < Minitest::Test
     assert_equal "Hello World!\n", compile_and_run(source, strict_printf: true)
   end
 
+  def test_runs_16_bit_cell_program
+    assert_equal ",".b, compile_and_run("#{"+" * 300}.", cell_bits: 16)
+  end
+
   def test_threaded_backend_runs_hello_world
     source = File.read(File.expand_path("../samples/hello.bf", __dir__))
 
@@ -53,18 +57,16 @@ class IntegrationTest < Minitest::Test
     assert_equal "Hello World!\n", compile_and_run(source, backend: :threaded, strict_printf: true)
   end
 
-  def test_runs_llvm_constant_putchar_sample
-    ir = PFC::Frontend::LLVMSubset.parse(File.read(File.expand_path("../samples/putchar.ll", __dir__)))
-    ir = PFC::Optimizer.optimize(ir)
+  def test_threaded_backend_runs_16_bit_cell_program
+    assert_equal ",".b, compile_and_run("#{"+" * 300}.", backend: :threaded, cell_bits: 16)
+  end
 
-    assert_equal "B", compile_ir_and_run(ir)
+  def test_runs_llvm_constant_putchar_sample
+    assert_equal "B", compile_llvm_and_run("samples/putchar.ll")
   end
 
   def test_runs_llvm_getchar_add_sample
-    ir = PFC::Frontend::LLVMSubset.parse(File.read(File.expand_path("../samples/getchar_add.ll", __dir__)))
-    ir = PFC::Optimizer.optimize(ir)
-
-    assert_equal "B", compile_ir_and_run(ir, input: "A")
+    assert_equal "B", compile_llvm_and_run("samples/getchar_add.ll", input: "A")
   end
 
   def test_runs_llvm_dynamic_branch_sample
@@ -78,5 +80,23 @@ class IntegrationTest < Minitest::Test
 
   def test_runs_llvm_gep_array_sample
     assert_equal "AB", compile_llvm_and_run("samples/gep_array.ll")
+  end
+
+  def test_runs_llvm_ops_select_sample
+    assert_equal "B", compile_llvm_and_run("samples/ops_select.ll")
+  end
+
+  def test_runs_llvm_switch_sample
+    assert_equal "X", compile_llvm_and_run("samples/switch.ll", input: "A")
+    assert_equal "Y", compile_llvm_and_run("samples/switch.ll", input: "B")
+    assert_equal "Z", compile_llvm_and_run("samples/switch.ll", input: "C")
+  end
+
+  def test_runs_llvm_dynamic_gep_sample
+    assert_equal "B", compile_llvm_and_run("samples/dynamic_gep.ll", input: "1")
+  end
+
+  def test_runs_llvm_i32_memory_sample
+    assert_equal ",", compile_llvm_and_run("samples/i32_memory.ll")
   end
 end

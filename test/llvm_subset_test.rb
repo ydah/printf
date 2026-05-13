@@ -3,33 +3,37 @@
 require_relative "test_helper"
 
 class LLVMSubsetTest < Minitest::Test
-  def test_parses_constant_putchar_program
-    program = PFC::Frontend::LLVMSubset.parse(File.read(File.expand_path("../samples/putchar.ll", __dir__)))
+  def test_emits_constant_putchar_program
+    source = PFC::Backend::LLVMCEmitter.new(File.read(File.expand_path("../samples/putchar.ll", __dir__))).emit
 
-    assert_instance_of PFC::IR::Program, program
-    assert program.instructions.any? { |instruction| instruction.is_a?(PFC::IR::OutputCell) }
+    assert_includes source, "pf_output_cell"
+    assert_includes source, "pf_set_u32"
   end
 
-  def test_rejects_dynamic_conditional_branch
+  def test_emits_dynamic_conditional_branch
     source = <<~LLVM
       declare i32 @getchar()
+      declare i32 @putchar(i32)
       define i32 @main() {
       entry:
         %ch = call i32 @getchar()
         br i1 %ch, label %yes, label %no
       yes:
+        call i32 @putchar(i32 89)
         ret i32 0
       no:
+        call i32 @putchar(i32 78)
         ret i32 0
       }
     LLVM
 
-    assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
-      PFC::Frontend::LLVMSubset.parse(source)
-    end
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "if ((pf_v_ch) != 0u)"
+    assert_includes generated, "goto pf_block_yes;"
   end
 
-  def test_follows_constant_conditional_branch
+  def test_emits_constant_conditional_branch
     source = <<~LLVM
       declare i32 @putchar(i32)
       define i32 @main() {
@@ -45,9 +49,10 @@ class LLVMSubsetTest < Minitest::Test
       }
     LLVM
 
-    program = PFC::Frontend::LLVMSubset.parse(source)
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
 
-    assert_equal "Program(ClearCell, AddCell(89), OutputCell)", program.inspect
+    assert_includes generated, "pf_v_cmp = ((1) == (1)) ? 1u : 0u;"
+    assert_includes generated, "goto pf_block_yes;"
   end
 
   def test_accepts_common_clang_spelling
@@ -63,9 +68,9 @@ class LLVMSubsetTest < Minitest::Test
       }
     LLVM
 
-    program = PFC::Frontend::LLVMSubset.parse(source)
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
 
-    assert program.instructions.any? { |instruction| instruction.is_a?(PFC::IR::OutputCell) }
+    assert_includes generated, "pf_output_cell"
   end
 
   def test_dumps_cfg_for_dynamic_programs

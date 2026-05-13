@@ -11,10 +11,12 @@ module PFC
 
       FlatInstruction = Struct.new(:opcode, :operand, :operand2, keyword_init: true)
 
-      def initialize(tape_size: DEFAULT_TAPE_SIZE, strict_printf: false)
+      def initialize(tape_size: DEFAULT_TAPE_SIZE, strict_printf: false, cell_bits: 8)
         @tape_size = Integer(tape_size)
         @strict_printf = strict_printf
+        @cell_bits = Integer(cell_bits)
         validate_tape_size!
+        validate_cell_bits!
       end
 
       def emit(program)
@@ -37,7 +39,7 @@ module PFC
 
       private
 
-      attr_reader :tape_size
+      attr_reader :cell_bits, :tape_size
 
       def strict_printf?
         @strict_printf
@@ -47,6 +49,12 @@ module PFC
         return if tape_size.between?(1, 65_535)
 
         raise ArgumentError, "tape size must be between 1 and 65535"
+      end
+
+      def validate_cell_bits!
+        return if [8, 16].include?(cell_bits)
+
+        raise ArgumentError, "cell bits must be 8 or 16"
       end
 
       def validate_program_length!(flat_program)
@@ -140,7 +148,7 @@ module PFC
           "        return 1;",
           "    }",
           "",
-          "    unsigned char tape[TAPE_SIZE] = {0};",
+          "    #{cell_type} tape[TAPE_SIZE] = {0};",
           "    unsigned short dp = 0;",
           "    unsigned short ip = 0;",
           "    unsigned char opcode = 0;",
@@ -161,15 +169,15 @@ module PFC
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
           "        case PF_OP_OUTPUT:",
-          "            if (pf_output_cell(tape[dp]) != 0) PF_ABORT();",
+          "            if (#{output_helper}(tape[dp]) != 0) PF_ABORT();",
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
           "        case PF_OP_INPUT:",
-          "            pf_read_cell(pf_sink, &tape[dp]);",
+          "            #{read_helper}(pf_sink, &tape[dp]);",
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
           "        case PF_OP_CLEAR:",
-          "            pf_clear_cell(pf_sink, &tape[dp]);",
+          "            #{clear_helper}(pf_sink, &tape[dp]);",
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
           "        case PF_OP_TRANSFER:",
@@ -207,7 +215,7 @@ module PFC
       end
 
       def add_cell_dispatch_line
-        helper = strict_printf? ? "pf_add_cell_strict" : "pf_add_cell"
+        helper = add_helper
         "            #{helper}(pf_sink, &tape[dp], instruction.operand);"
       end
 
@@ -216,7 +224,33 @@ module PFC
       end
 
       def transfer_cell_helper
+        return "pf_transfer_cell16_strict" if cell_bits == 16 && strict_printf?
+        return "pf_transfer_cell16" if cell_bits == 16
         strict_printf? ? "pf_transfer_cell_strict" : "pf_transfer_cell"
+      end
+
+      def cell_type
+        cell_bits == 16 ? "unsigned short" : "unsigned char"
+      end
+
+      def add_helper
+        return "pf_add_cell16_strict" if cell_bits == 16 && strict_printf?
+        return "pf_add_cell16" if cell_bits == 16
+        return "pf_add_cell_strict" if strict_printf?
+
+        "pf_add_cell"
+      end
+
+      def clear_helper
+        cell_bits == 16 ? "pf_clear_cell16" : "pf_clear_cell"
+      end
+
+      def read_helper
+        cell_bits == 16 ? "pf_read_cell16" : "pf_read_cell"
+      end
+
+      def output_helper
+        cell_bits == 16 ? "pf_output_cell16" : "pf_output_cell"
       end
     end
   end

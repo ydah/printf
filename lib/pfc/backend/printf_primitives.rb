@@ -20,6 +20,11 @@ module PFC
               fprintf(pf_sink, "%1$.*2$d%3$hhn", 0, pad, (signed char *)cell);
           }
 
+          static inline void PF_MAYBE_UNUSED pf_set_u32(FILE *pf_sink, unsigned int *dst, unsigned int value) {
+              int pad = (int)(value & 2147483647u);
+              fprintf(pf_sink, "%1$.*2$d%3$n", 0, pad, (int *)dst);
+          }
+
           static inline void PF_MAYBE_UNUSED pf_add_cell(FILE *pf_sink, unsigned char *cell, int delta) {
               pf_set_cell(pf_sink, cell, (int)*cell + delta);
           }
@@ -81,6 +86,65 @@ module PFC
 
           static inline void PF_MAYBE_UNUSED pf_set_u16(FILE *pf_sink, unsigned short *dst, unsigned short value) {
               fprintf(pf_sink, "%1$.*2$d%3$hn", 0, (int)value, (short *)dst);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_add_cell16(FILE *pf_sink, unsigned short *cell, int delta) {
+              pf_set_u16(pf_sink, cell, (unsigned short)((int)*cell + delta));
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_inc_cell16(FILE *pf_sink, unsigned short *cell) {
+              fprintf(pf_sink, "%1$.*2$d %3$hn", 0, (int)*cell, (short *)cell);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_dec_cell16(FILE *pf_sink, unsigned short *cell) {
+              fprintf(pf_sink, "%1$.*2$d%3$65535d%4$hn", 0, (int)*cell, 0, (short *)cell);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_clear_cell16(FILE *pf_sink, unsigned short *cell) {
+              pf_set_u16(pf_sink, cell, 0);
+          }
+
+          static inline void PF_MAYBE_UNUSED pf_add_cell16_strict(FILE *pf_sink, unsigned short *cell, int delta) {
+              int steps = delta % 65536;
+              if (steps < 0) {
+                  steps += 65536;
+              }
+
+              if (steps <= 32768) {
+                  while (steps > 0) {
+                      pf_inc_cell16(pf_sink, cell);
+                      steps--;
+                  }
+                  return;
+              }
+
+              steps = 65536 - steps;
+              while (steps > 0) {
+                  pf_dec_cell16(pf_sink, cell);
+                  steps--;
+              }
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_transfer_cell16(FILE *pf_sink, unsigned short *tape, unsigned short dp, int offset, int scale) {
+              int target = (int)dp + offset;
+              if (target < 0 || target >= TAPE_SIZE) {
+                  fprintf(stderr, "pfc runtime error: transfer target out of range: %d\\n", target);
+                  return 1;
+              }
+
+              pf_add_cell16(pf_sink, &tape[target], (int)tape[dp] * scale);
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_transfer_cell16_strict(FILE *pf_sink, unsigned short *tape, unsigned short dp, int offset, int scale) {
+              int target = (int)dp + offset;
+              if (target < 0 || target >= TAPE_SIZE) {
+                  fprintf(stderr, "pfc runtime error: transfer target out of range: %d\\n", target);
+                  return 1;
+              }
+
+              pf_add_cell16_strict(pf_sink, &tape[target], (int)tape[dp] * scale);
+              return 0;
           }
 
           static inline void PF_MAYBE_UNUSED pf_set_dp(FILE *pf_sink, unsigned short *dp, unsigned short value) {
@@ -149,8 +213,24 @@ module PFC
               pf_set_cell(pf_sink, cell, ch);
           }
 
+          static inline void PF_MAYBE_UNUSED pf_read_cell16(FILE *pf_sink, unsigned short *cell) {
+              int ch = getchar();
+              if (ch == EOF) {
+                  ch = 0;
+              }
+              pf_set_u16(pf_sink, cell, (unsigned short)ch);
+          }
+
           static inline int PF_MAYBE_UNUSED pf_output_cell(unsigned char cell) {
               if (putchar((int)cell) == EOF) {
+                  perror("putchar");
+                  return 1;
+              }
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_output_cell16(unsigned short cell) {
+              if (putchar((int)(cell & 255u)) == EOF) {
                   perror("putchar");
                   return 1;
               }

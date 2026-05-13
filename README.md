@@ -18,10 +18,13 @@ Or let the CLI build and run it:
 bin/pfc run samples/hello.bf
 bin/pfc run samples/hello.bf --strict-printf
 bin/pfc run samples/hello.bf --backend=printf-threaded
+bin/pfc run samples/hello.bf --cell-bits=16
 bin/pfc dump-ir samples/hello.bf
 bin/pfc dump-c samples/hello.bf
 bin/pfc run samples/putchar.ll
 printf A | bin/pfc run samples/dynamic_branch.ll
+bin/pfc run samples/ops_select.ll
+printf 1 | bin/pfc run samples/dynamic_gep.ll
 ```
 
 Supported commands:
@@ -32,7 +35,7 @@ Supported commands:
 - `dump-ir INPUT`
 - `dump-c INPUT`
 
-`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports scalar `alloca`/`load`/`store`, byte arrays with constant `getelementptr`, `add`/`sub`, `icmp eq/ne`, `br`, simple `phi`, `ret`, and `putchar`/`getchar`.
+`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports scalar `alloca`/`load`/`store`, byte arrays with constant or dynamic `getelementptr`, `add`/`sub`/`mul`/division/remainder, bitwise and shift operations, `icmp`, `select`, `switch`, `br`, simple `phi`, `ret`, and `putchar`/`getchar`.
 
 The generated program still uses C control flow as the scheduler. It does not claim a single-call `printf` execution model, which would require implementation-dependent or undefined behavior outside this project's safety scope.
 
@@ -43,6 +46,7 @@ Supported options:
 - `--no-opt`
 - `--tape-size=30000`
 - `--cell-bits=8`
+- `--cell-bits=16`
 - `--strict-printf`
 - `--debug`
 

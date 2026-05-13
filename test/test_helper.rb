@@ -8,21 +8,21 @@ require "tmpdir"
 require_relative "../lib/pfc"
 
 module PFCTestHelper
-  def compile_and_run(program, input: "", optimize: true, strict_printf: false, backend: :scheduler)
+  def compile_and_run(program, input: "", optimize: true, strict_printf: false, backend: :scheduler, cell_bits: 8)
     ir = PFC::Frontend::Brainfuck.parse(program)
     ir = PFC::Optimizer.optimize(ir) if optimize
-    compile_ir_and_run(ir, input:, strict_printf:, backend:)
+    compile_ir_and_run(ir, input:, strict_printf:, backend:, cell_bits:)
   end
 
-  def compile_ir_and_run(ir, input: "", strict_printf: false, backend: :scheduler)
+  def compile_ir_and_run(ir, input: "", strict_printf: false, backend: :scheduler, cell_bits: 8)
     Dir.mktmpdir("pfc-test") do |dir|
       c_path = File.join(dir, "test.c")
       exe_path = File.join(dir, "test")
       emitter = case backend
                 when :scheduler
-                  PFC::Backend::CEmitter.new(strict_printf: strict_printf)
+                  PFC::Backend::CEmitter.new(strict_printf: strict_printf, cell_bits:)
                 when :threaded
-                  PFC::Backend::ThreadedCEmitter.new(strict_printf:)
+                  PFC::Backend::ThreadedCEmitter.new(strict_printf:, cell_bits:)
                 else
                   raise ArgumentError, "unknown backend: #{backend}"
                 end
