@@ -27,6 +27,21 @@ class LLVMSubsetTest < Minitest::Test
     assert_equal ["ret i32 %x"], parsed.fetch(:internal_functions).fetch("id").fetch(:blocks).fetch("entry")
   end
 
+  def test_parser_decodes_global_string_constants
+    source = <<~LLVM
+      @.msg = private unnamed_addr constant [4 x i8] c"A\\0AB\\00", align 1
+
+      define i32 @main() {
+      entry:
+        ret i32 0
+      }
+    LLVM
+
+    parsed = PFC::Frontend::LLVMSubset::Parser.parse(source)
+
+    assert_equal [65, 10, 66, 0], parsed.fetch(:global_strings).fetch("@.msg")
+  end
+
   def test_parser_rejects_undefined_branch_label
     source = <<~LLVM
       define i32 @main() {
@@ -243,6 +258,46 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "goto pf_call_0_block_entry;"
     assert_includes generated, "goto pf_call_0_return;"
     refute_includes generated, "pf_call_0_ignored_return"
+  end
+
+  def test_emits_puts_for_global_string
+    source = <<~LLVM
+      @.msg = private unnamed_addr constant [4 x i8] c"Hi!\\00", align 1
+      declare i32 @puts(ptr)
+
+      define i32 @main() {
+      entry:
+        %result = call i32 @puts(ptr @.msg)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "pf_output_cell((unsigned char)(72))"
+    assert_includes generated, "pf_output_cell((unsigned char)(10))"
+    assert_includes generated, "pf_v_result = 4u;"
+  end
+
+  def test_emits_printf_for_global_string_gep
+    source = <<~LLVM
+      @.msg = private unnamed_addr constant [4 x i8] c"OK\\0A\\00", align 1
+      declare i32 @printf(ptr, ...)
+
+      define i32 @main() {
+      entry:
+        %ptr = getelementptr inbounds [4 x i8], ptr @.msg, i64 0, i64 0
+        %result = call i32 (ptr, ...) @printf(ptr %ptr)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "pf_output_cell((unsigned char)(79))"
+    assert_includes generated, "pf_output_cell((unsigned char)(75))"
+    assert_includes generated, "pf_output_cell((unsigned char)(10))"
+    assert_includes generated, "pf_v_result = 3u;"
   end
 
   def test_reports_source_line_for_unsupported_llvm_instruction

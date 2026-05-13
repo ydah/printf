@@ -131,4 +131,8 @@ class IntegrationTest < Minitest::Test
   def test_runs_llvm_i16_array_sample
     assert_equal "AB", compile_llvm_and_run("samples/i16_array.ll")
   end
+
+  def test_runs_llvm_global_string_puts_sample
+    assert_equal "Hi!\n", compile_llvm_and_run("samples/string_puts.ll")
+  end
 end

@@ -101,6 +101,7 @@ module PFC
           {
             block_order:,
             blocks:,
+            global_strings: parse_global_strings,
             internal_functions:,
             source:,
             source_line_numbers:
@@ -152,6 +153,44 @@ module PFC
           end
 
           functions
+        end
+
+        def parse_global_strings
+          source.each_line.each_with_object({}) do |line, strings|
+            stripped = line.sub(/;.*/, "").strip
+            match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\bconstant\s+\[(\d+)\s+x\s+i8\]\s+c"((?:[^"\\]|\\.)*)"(?:,\s+align\s+\d+)?\z/)
+            next unless match
+
+            bytes = decode_llvm_string(match[3])
+            if bytes.length > match[2].to_i
+              raise parse_error("global string #{match[1]} exceeds declared width", stripped)
+            end
+
+            strings[match[1]] = bytes
+          end
+        end
+
+        def decode_llvm_string(raw)
+          bytes = []
+          index = 0
+
+          while index < raw.length
+            if raw[index] == "\\"
+              escape = raw[(index + 1), 2]
+              if escape&.match?(/\A[0-9A-Fa-f]{2}\z/)
+                bytes << escape.to_i(16)
+                index += 3
+              else
+                bytes << raw[(index + 1)].ord
+                index += 2
+              end
+            else
+              bytes << raw[index].ord
+              index += 1
+            end
+          end
+
+          bytes
         end
 
         def parse_function_blocks(body)

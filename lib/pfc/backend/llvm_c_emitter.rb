@@ -10,11 +10,14 @@ module PFC
     class LLVMCEmitter
       DEFAULT_TAPE_SIZE = CEmitter::DEFAULT_TAPE_SIZE
       NAME = /%[-A-Za-z$._0-9]+/
+      GLOBAL_NAME = /@[-A-Za-z$._0-9]+/
+      GlobalStringPointer = Struct.new(:name, :offset, keyword_init: true)
 
       def initialize(source, tape_size: DEFAULT_TAPE_SIZE)
         parsed = Frontend::LLVMSubset::Parser.parse(source)
         @source = parsed.fetch(:source)
         @tape_size = Integer(tape_size)
+        @global_strings = parsed.fetch(:global_strings)
         @internal_functions = parsed.fetch(:internal_functions)
         @blocks = parsed.fetch(:blocks)
         @block_order = parsed.fetch(:block_order)
@@ -57,6 +60,7 @@ module PFC
           "  slots: #{slot_count}",
           "  registers: #{registers.keys.sort.join(', ')}"
         ]
+        lines << "  globals: #{global_strings.keys.sort.join(', ')}" unless global_strings.empty?
         lines.concat(dump_blocks(block_order, blocks, indent: "  "))
 
         unless internal_functions.empty?
@@ -74,7 +78,7 @@ module PFC
 
       private
 
-      attr_reader :blocks, :block_order, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
+      attr_reader :blocks, :block_order, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -216,6 +220,14 @@ module PFC
       end
 
       def emit_gep(line)
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i8\],\s+ptr\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/))
+          pointers[match[1]] = GlobalStringPointer.new(
+            name: match[3],
+            offset: (match[4].to_i * match[2].to_i) + match[5].to_i
+          )
+          return []
+        end
+
         if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           width = match[2].to_i
           base = pointer_expr(match[3])
@@ -299,6 +311,14 @@ module PFC
           output = ["    pf_ch = getchar();"]
           output << "    #{register(match[1])} = pf_ch == EOF ? 0u : (unsigned int)(unsigned char)pf_ch;" if match[1]
           return output
+        end
+
+        if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@puts\(ptr(?:\s+\w+)*\s+(.+)\)\z/))
+          return emit_puts_call(match[1], match[2])
+        end
+
+        if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+(?:\(ptr,\s+\.\.\.\)\s+)?@printf\(ptr(?:\s+\w+)*\s+(.+)\)\z/))
+          return emit_printf_call(match[1], match[2])
         end
 
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@putchar\(i32\s+(.+)\)\z/)
@@ -454,6 +474,14 @@ module PFC
       end
 
       def emit_inline_gep(line, context)
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i8\],\s+ptr\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/))
+          context.fetch(:pointers)[match[1]] = GlobalStringPointer.new(
+            name: match[3],
+            offset: (match[4].to_i * match[2].to_i) + match[5].to_i
+          )
+          return []
+        end
+
         if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           width = match[2].to_i
           base = inline_pointer_expr(context, match[3])
@@ -536,6 +564,14 @@ module PFC
           output = ["    pf_ch = getchar();"]
           output << "    #{inline_register(context, match[1])} = pf_ch == EOF ? 0u : (unsigned int)(unsigned char)pf_ch;" if match[1]
           return output
+        end
+
+        if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@puts\(ptr(?:\s+\w+)*\s+(.+)\)\z/))
+          return emit_puts_call(match[1], match[2], context:)
+        end
+
+        if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+(?:\(ptr,\s+\.\.\.\)\s+)?@printf\(ptr(?:\s+\w+)*\s+(.+)\)\z/))
+          return emit_printf_call(match[1], match[2], context:)
         end
 
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@putchar\(i32\s+(.+)\)\z/)
@@ -742,6 +778,69 @@ module PFC
         end
       end
 
+      def emit_puts_call(destination, raw_pointer, context: nil)
+        pointer = global_string_pointer(raw_pointer, context:)
+        bytes = null_terminated_bytes(pointer) + [10]
+        emit_output_bytes(bytes) + return_value_assignment(destination, bytes.length, context:)
+      end
+
+      def emit_printf_call(destination, raw_pointer, context: nil)
+        pointer = global_string_pointer(raw_pointer, context:)
+        bytes = null_terminated_bytes(pointer)
+        emit_output_bytes(bytes) + return_value_assignment(destination, bytes.length, context:)
+      end
+
+      def emit_output_bytes(bytes)
+        bytes.map do |byte|
+          "    if (pf_output_cell((unsigned char)(#{byte})) != 0) PF_ABORT();"
+        end
+      end
+
+      def return_value_assignment(destination, value, context:)
+        return [] unless destination
+
+        register_name = context ? inline_register(context, destination) : register(destination)
+        ["    #{register_name} = #{value}u;"]
+      end
+
+      def global_string_pointer(raw_pointer, context:)
+        direct = global_string_pointer_literal(raw_pointer)
+        return direct if direct
+
+        token = raw_pointer.strip.split(/\s+/).last
+        pointer = if context && context.fetch(:pointers).key?(token)
+                    context.fetch(:pointers).fetch(token)
+                  elsif pointers.key?(token)
+                    pointers.fetch(token)
+                  end
+        return pointer if pointer.is_a?(GlobalStringPointer)
+
+        raise Frontend::LLVMSubset::ParseError, "unsupported string pointer: #{raw_pointer}"
+      end
+
+      def global_string_pointer_literal(raw_pointer)
+        if (match = raw_pointer.match(/getelementptr(?:\s+inbounds)?\s*\(\[(\d+)\s+x\s+i8\],\s+ptr\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\)/))
+          return GlobalStringPointer.new(
+            name: match[2],
+            offset: (match[3].to_i * match[1].to_i) + match[4].to_i
+          )
+        end
+
+        match = raw_pointer.match(/(?:\A|\s)(#{GLOBAL_NAME})\z/)
+        return nil unless match
+
+        GlobalStringPointer.new(name: match[1], offset: 0)
+      end
+
+      def null_terminated_bytes(pointer)
+        bytes = global_strings.fetch(pointer.name) do
+          raise Frontend::LLVMSubset::ParseError, "unknown global string: #{pointer.name}"
+        end
+        selected = bytes.drop(pointer.offset)
+        terminator = selected.index(0)
+        terminator ? selected.take(terminator) : selected
+      end
+
       def with_statement_context(line)
         yield
       rescue Frontend::LLVMSubset::ParseError => e
@@ -765,13 +864,23 @@ module PFC
       end
 
       def inline_pointer_expr(context, name)
-        context.fetch(:pointers).fetch(name) do
+        pointer = context.fetch(:pointers).fetch(name) do
           raise Frontend::LLVMSubset::ParseError, "unknown internal pointer: #{name}"
         end
+        if pointer.is_a?(GlobalStringPointer)
+          raise Frontend::LLVMSubset::ParseError, "global string pointer is only supported for puts/printf: #{name}"
+        end
+
+        pointer
       end
 
       def pointer_expr(name)
-        pointers.fetch(name) { raise Frontend::LLVMSubset::ParseError, "unknown pointer: #{name}" }
+        pointer = pointers.fetch(name) { raise Frontend::LLVMSubset::ParseError, "unknown pointer: #{name}" }
+        if pointer.is_a?(GlobalStringPointer)
+          raise Frontend::LLVMSubset::ParseError, "global string pointer is only supported for puts/printf: #{name}"
+        end
+
+        pointer
       end
 
       def register(name)
