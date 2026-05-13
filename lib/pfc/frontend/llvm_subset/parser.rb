@@ -8,6 +8,80 @@ module PFC
       class Parser
         NAME = /%[-A-Za-z$._0-9]+/
 
+        class Instruction
+          attr_reader :kind, :text
+
+          def initialize(text)
+            @text = text.freeze
+            @kind = classify(text)
+          end
+
+          def ==(other)
+            other_text = other.is_a?(Instruction) ? other.text : other
+            text == other_text
+          end
+
+          def to_s
+            text
+          end
+
+          def to_str
+            text
+          end
+
+          def inspect
+            text.inspect
+          end
+
+          def match(...)
+            text.match(...)
+          end
+
+          def match?(...)
+            text.match?(...)
+          end
+
+          def include?(...)
+            text.include?(...)
+          end
+
+          def start_with?(...)
+            text.start_with?(...)
+          end
+
+          def [](...)
+            text.[](...)
+          end
+
+          def scan(...)
+            text.scan(...)
+          end
+
+          def split(...)
+            text.split(...)
+          end
+
+          private
+
+          def classify(text)
+            return :phi if text.match?(/\A#{NAME}\s*=\s*phi\b/)
+            return :gep if text.include?("getelementptr")
+            return :alloca if text.match?(/\A#{NAME}\s*=\s*alloca\b/)
+            return :store if text.start_with?("store ")
+            return :load if text.include?(" load ")
+            return :binary if text.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
+            return :select if text.match?(/\A#{NAME}\s*=\s*select\b/)
+            return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc)\b/)
+            return :icmp if text.match?(/\A#{NAME}\s*=\s*icmp\b/)
+            return :call if text.include?("call ")
+            return :switch if text.start_with?("switch ")
+            return :branch if text.start_with?("br ")
+            return :return if text.start_with?("ret ")
+
+            :unknown
+          end
+        end
+
         def self.parse(source)
           new(source).parse
         end
@@ -93,7 +167,7 @@ module PFC
               order << current unless parsed.key?(current)
               parsed[current] ||= []
             else
-              parsed[current] << stripped
+              parsed[current] << Instruction.new(stripped)
             end
           end
 
@@ -230,7 +304,9 @@ module PFC
         end
 
         def branch_labels(line)
-          return [Regexp.last_match(1)] if line.match(/\Abr\s+label\s+%([-A-Za-z$._0-9]+)\z/)
+          if (match = line.match(/\Abr\s+label\s+%([-A-Za-z$._0-9]+)\z/))
+            return [match[1]]
+          end
 
           match = line.match(/\Abr\s+i1\s+.+?,\s+label\s+%([-A-Za-z$._0-9]+),\s+label\s+%([-A-Za-z$._0-9]+)\z/)
           match ? [match[1], match[2]] : []
@@ -244,7 +320,7 @@ module PFC
         end
 
         def parse_error(message, line)
-          line_number = source_line_numbers.fetch(line, nil)
+          line_number = source_line_numbers.fetch(line.to_s, nil)
           prefix = line_number ? "line #{line_number}: " : ""
           ParseError.new("#{prefix}#{message}")
         end

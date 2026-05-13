@@ -21,6 +21,8 @@ class LLVMSubsetTest < Minitest::Test
 
     assert_equal ["entry"], parsed.fetch(:block_order)
     assert_equal ["%value = call i32 @id(i32 7)", "ret i32 %value"], parsed.fetch(:blocks).fetch("entry")
+    assert_equal :call, parsed.fetch(:blocks).fetch("entry").first.kind
+    assert_equal :return, parsed.fetch(:blocks).fetch("entry").last.kind
     assert_equal ["id"], parsed.fetch(:internal_functions).keys
     assert_equal ["ret i32 %x"], parsed.fetch(:internal_functions).fetch("id").fetch(:blocks).fetch("entry")
   end

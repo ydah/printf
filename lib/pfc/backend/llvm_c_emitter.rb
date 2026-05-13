@@ -133,8 +133,9 @@ module PFC
       def dump_blocks(order, block_map, indent:)
         order.flat_map do |label|
           lines = ["#{indent}block #{label}:"]
-          block_map.fetch(label).each do |line|
-            prefix = phi?(line) ? "phi" : "inst"
+          block_map.fetch(label).each do |instruction|
+            prefix = instruction_kind(instruction) == :phi ? "phi" : "inst"
+            line = instruction_text(instruction)
             lines << "#{indent}  #{prefix}: #{line}"
           end
           lines
@@ -752,7 +753,15 @@ module PFC
       end
 
       def source_line_number(line)
-        @source_line_numbers.fetch(line, nil)
+        @source_line_numbers.fetch(instruction_text(line), nil)
+      end
+
+      def instruction_text(instruction)
+        instruction.respond_to?(:text) ? instruction.text : instruction.to_s
+      end
+
+      def instruction_kind(instruction)
+        instruction.respond_to?(:kind) ? instruction.kind : nil
       end
 
       def inline_pointer_expr(context, name)
