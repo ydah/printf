@@ -236,12 +236,12 @@ module PFC
               pf_set_cell(pf_sink, opcode, value);
           }
 
-          static inline void PF_MAYBE_UNUSED pf_advance_ip(FILE *pf_sink, unsigned short *ip) {
-              pf_set_u16(pf_sink, ip, (unsigned short)(*ip + 1));
+          static inline void PF_MAYBE_UNUSED pf_advance_ip(FILE *pf_sink, unsigned int *ip) {
+              pf_set_u32(pf_sink, ip, *ip + 1u);
           }
 
-          static inline void PF_MAYBE_UNUSED pf_jump_ip(FILE *pf_sink, unsigned short *ip, unsigned short target) {
-              pf_set_u16(pf_sink, ip, target);
+          static inline void PF_MAYBE_UNUSED pf_jump_ip(FILE *pf_sink, unsigned int *ip, unsigned int target) {
+              pf_set_u32(pf_sink, ip, target);
           }
 
           static inline void PF_MAYBE_UNUSED pf_inc_dp(FILE *pf_sink, unsigned short *dp) {

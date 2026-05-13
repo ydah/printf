@@ -80,6 +80,22 @@ module PFC
       end
     end
 
+    class SetCell
+      attr_reader :value
+
+      def initialize(value)
+        @value = Integer(value)
+      end
+
+      def ==(other)
+        other.is_a?(SetCell) && value == other.value
+      end
+
+      def inspect
+        "SetCell(#{value})"
+      end
+    end
+
     class TransferCell
       attr_reader :transfers
 

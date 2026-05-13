@@ -23,9 +23,9 @@ module PFC
         lines << PrintfPrimitives.source(tape_size: tape_size).rstrip
         lines << ""
         lines << "int main(void) {"
-        lines << "    FILE *pf_sink = fopen(\"/dev/null\", \"w\");"
+        lines << "    FILE *pf_sink = tmpfile();"
         lines << "    if (pf_sink == NULL) {"
-        lines << "        perror(\"fopen\");"
+        lines << "        perror(\"tmpfile\");"
         lines << "        return 1;"
         lines << "    }"
         lines << ""
@@ -83,6 +83,8 @@ module PFC
           ["#{spaces}#{read_helper}(pf_sink, &tape[dp]);"]
         when IR::ClearCell
           ["#{spaces}#{clear_helper}(pf_sink, &tape[dp]);"]
+        when IR::SetCell
+          emit_set_cell(instruction, spaces)
         when IR::TransferCell
           emit_transfer_cell(instruction, spaces)
         when IR::Loop
@@ -112,6 +114,15 @@ module PFC
       def emit_move_ptr(instruction, spaces)
         helper = strict_printf? ? "pf_move_ptr_strict" : "pf_move_ptr"
         ["#{spaces}if (#{helper}(pf_sink, &dp, #{instruction.delta}) != 0) PF_ABORT();"]
+      end
+
+      def emit_set_cell(instruction, spaces)
+        return ["#{spaces}#{set_helper}(pf_sink, &tape[dp], #{instruction.value});"] unless strict_printf?
+
+        ["#{spaces}#{clear_helper}(pf_sink, &tape[dp]);"] + strict_cell_steps(instruction.value).map do |step|
+          helper = step.positive? ? inc_helper : dec_helper
+          "#{spaces}#{helper}(pf_sink, &tape[dp]);"
+        end
       end
 
       def emit_transfer_cell(instruction, spaces)
@@ -147,6 +158,11 @@ module PFC
       def add_helper
         return "pf_add_cell32" if cell_bits == 32
         cell_bits == 16 ? "pf_add_cell16" : "pf_add_cell"
+      end
+
+      def set_helper
+        return "pf_set_cell32" if cell_bits == 32
+        cell_bits == 16 ? "pf_set_u16" : "pf_set_cell"
       end
 
       def inc_helper

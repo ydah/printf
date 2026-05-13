@@ -44,7 +44,7 @@ class CEmitterTest < Minitest::Test
     source = PFC::Backend::ThreadedCEmitter.new.emit(PFC::Frontend::Brainfuck.parse("+[.-]"))
 
     assert_includes source, "static const PFInstruction pf_program[]"
-    assert_includes source, "unsigned short ip = 0;"
+    assert_includes source, "unsigned int ip = 0;"
     assert_includes source, "unsigned char opcode = 0;"
     assert_includes source, "pf_set_opcode(pf_sink, &opcode, instruction.opcode);"
     assert_includes source, "PF_OP_JZ"
@@ -87,5 +87,30 @@ class CEmitterTest < Minitest::Test
     assert_includes source, "PFCell32 tape[TAPE_SIZE]"
     assert_includes source, "pf_add_cell32(pf_sink, &tape[dp], 1);"
     assert_includes source, "pf_output_cell32(tape[dp])"
+  end
+
+  def test_generated_programs_use_portable_sink
+    source = PFC::Backend::CEmitter.new.emit(PFC::Frontend::Brainfuck.parse("+"))
+
+    assert_includes source, "FILE *pf_sink = tmpfile();"
+    refute_includes source, "/dev/null"
+  end
+
+  def test_emits_set_cell_instruction
+    source = PFC::Backend::CEmitter.new.emit(PFC::IR::Program.new([
+      PFC::IR::SetCell.new(65)
+    ]))
+
+    assert_includes source, "pf_set_cell(pf_sink, &tape[dp], 65);"
+  end
+
+  def test_threaded_emitter_uses_wide_ip_and_set_opcode
+    source = PFC::Backend::ThreadedCEmitter.new.emit(PFC::IR::Program.new([
+      PFC::IR::SetCell.new(65)
+    ]))
+
+    assert_includes source, "PF_OP_SET"
+    assert_includes source, "unsigned int ip = 0;"
+    assert_includes source, "pf_jump_ip(pf_sink, &ip, (unsigned int)instruction.operand);"
   end
 end

@@ -74,6 +74,10 @@ module PFC
           merge_add_cell(output, previous, instruction)
         when IR::MovePtr
           merge_move_ptr(output, previous, instruction)
+        when IR::ClearCell
+          merge_clear_cell(output, previous)
+        when IR::SetCell
+          merge_set_cell(output, previous, instruction)
         else
           output << instruction
         end
@@ -81,6 +85,18 @@ module PFC
     end
 
     def merge_add_cell(output, previous, instruction)
+      if previous.is_a?(IR::SetCell)
+        output.pop
+        append_set_cell(output, previous.value + instruction.delta)
+        return
+      end
+
+      if previous.is_a?(IR::ClearCell)
+        output.pop
+        append_set_cell(output, instruction.delta)
+        return
+      end
+
       if previous.is_a?(IR::AddCell)
         output.pop
         delta = previous.delta + instruction.delta
@@ -100,6 +116,30 @@ module PFC
       end
 
       output << instruction unless instruction.delta.zero?
+    end
+
+    def merge_clear_cell(output, previous)
+      output.pop if cell_update_without_external_effect?(previous)
+      output << IR::ClearCell.new
+    end
+
+    def merge_set_cell(output, previous, instruction)
+      output.pop if cell_update_without_external_effect?(previous)
+      append_set_cell(output, instruction.value)
+    end
+
+    def append_set_cell(output, value)
+      if value.zero?
+        output << IR::ClearCell.new
+      else
+        output << IR::SetCell.new(value)
+      end
+    end
+
+    def cell_update_without_external_effect?(instruction)
+      instruction.is_a?(IR::AddCell) ||
+        instruction.is_a?(IR::ClearCell) ||
+        instruction.is_a?(IR::SetCell)
     end
   end
 end

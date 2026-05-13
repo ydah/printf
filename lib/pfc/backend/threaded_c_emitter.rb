@@ -7,7 +7,7 @@ module PFC
   module Backend
     class ThreadedCEmitter
       DEFAULT_TAPE_SIZE = 30_000
-      MAX_PROGRAM_LENGTH = 65_535
+      MAX_PROGRAM_LENGTH = 2_147_483_647
 
       FlatInstruction = Struct.new(:opcode, :operand, :operand2, keyword_init: true)
 
@@ -83,6 +83,8 @@ module PFC
             output << FlatInstruction.new(opcode: "PF_OP_INPUT", operand: 0, operand2: 0)
           when IR::ClearCell
             output << FlatInstruction.new(opcode: "PF_OP_CLEAR", operand: 0, operand2: 0)
+          when IR::SetCell
+            output << FlatInstruction.new(opcode: "PF_OP_SET", operand: instruction.value, operand2: 0)
           when IR::TransferCell
             flatten_transfer(instruction, output)
           when IR::Loop
@@ -116,6 +118,7 @@ module PFC
           "    PF_OP_OUTPUT,",
           "    PF_OP_INPUT,",
           "    PF_OP_CLEAR,",
+          "    PF_OP_SET,",
           "    PF_OP_TRANSFER,",
           "    PF_OP_JZ,",
           "    PF_OP_JNZ,",
@@ -142,17 +145,17 @@ module PFC
       def main_function
         [
           "int main(void) {",
-          "    FILE *pf_sink = fopen(\"/dev/null\", \"w\");",
+          "    FILE *pf_sink = tmpfile();",
           "    if (pf_sink == NULL) {",
-          "        perror(\"fopen\");",
+          "        perror(\"tmpfile\");",
           "        return 1;",
           "    }",
           "",
           "    #{cell_type} tape[TAPE_SIZE] = {0};",
           "    unsigned short dp = 0;",
-          "    unsigned short ip = 0;",
+          "    unsigned int ip = 0;",
           "    unsigned char opcode = 0;",
-          "    const unsigned short program_len = (unsigned short)(sizeof(pf_program) / sizeof(pf_program[0]));",
+          "    const unsigned int program_len = (unsigned int)(sizeof(pf_program) / sizeof(pf_program[0]));",
           "",
           "    #define PF_ABORT() do { fclose(pf_sink); return 1; } while (0)",
           "    while (ip < program_len) {",
@@ -180,20 +183,25 @@ module PFC
           "            #{clear_helper}(pf_sink, &tape[dp]);",
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
+          "        case PF_OP_SET:",
+          "            #{clear_helper}(pf_sink, &tape[dp]);",
+          set_cell_dispatch_line,
+          "            pf_advance_ip(pf_sink, &ip);",
+          "            break;",
           "        case PF_OP_TRANSFER:",
           "            if (#{transfer_cell_helper}(pf_sink, tape, dp, instruction.operand, instruction.operand2) != 0) PF_ABORT();",
           "            pf_advance_ip(pf_sink, &ip);",
           "            break;",
           "        case PF_OP_JZ:",
           "            if (#{cell_value_expr} == 0) {",
-          "                pf_jump_ip(pf_sink, &ip, (unsigned short)instruction.operand);",
+          "                pf_jump_ip(pf_sink, &ip, (unsigned int)instruction.operand);",
           "            } else {",
           "                pf_advance_ip(pf_sink, &ip);",
           "            }",
           "            break;",
           "        case PF_OP_JNZ:",
           "            if (#{cell_value_expr} != 0) {",
-          "                pf_jump_ip(pf_sink, &ip, (unsigned short)instruction.operand);",
+          "                pf_jump_ip(pf_sink, &ip, (unsigned int)instruction.operand);",
           "            } else {",
           "                pf_advance_ip(pf_sink, &ip);",
           "            }",
@@ -215,6 +223,11 @@ module PFC
       end
 
       def add_cell_dispatch_line
+        helper = add_helper
+        "            #{helper}(pf_sink, &tape[dp], instruction.operand);"
+      end
+
+      def set_cell_dispatch_line
         helper = add_helper
         "            #{helper}(pf_sink, &tape[dp], instruction.operand);"
       end
