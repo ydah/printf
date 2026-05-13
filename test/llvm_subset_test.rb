@@ -233,7 +233,7 @@ class LLVMSubsetTest < Minitest::Test
     generated = PFC::Backend::LLVMCEmitter.new(source).emit
 
     assert_includes generated, "goto pf_call_0_block_entry;"
-    assert_includes generated, "pf_call_0_out = (unsigned int)(89);"
+    assert_match(/pf_call_0_out = pf_phi_tmp_\d+;/, generated)
     assert_includes generated, "goto pf_call_0_return;"
   end
 
@@ -327,6 +327,31 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "? ((-1) | ~255u)"
     assert_includes generated, "& 18446744073709551615ull"
     assert_includes generated, "pf_v_cmp = ((pf_v_wide) == (18446744073709551615)) ? 1u : 0u;"
+  end
+
+  def test_emits_phi_assignments_through_temporaries
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        br label %loop
+      loop:
+        %a = phi i32 [ 65, %entry ], [ %b, %loop ]
+        %b = phi i32 [ 66, %entry ], [ %a, %loop ]
+        br i1 1, label %exit, label %loop
+      exit:
+        call i32 @putchar(i32 %a)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_match(
+      /unsigned long long pf_phi_tmp_\d+ = \(unsigned int\)\(\(pf_v_b\) & 4294967295u\);\n\s+unsigned long long pf_phi_tmp_\d+ = \(unsigned int\)\(\(pf_v_a\) & 4294967295u\);\n\s+pf_v_a = pf_phi_tmp_\d+;\n\s+pf_v_b = pf_phi_tmp_\d+;/,
+      generated
+    )
   end
 
   def test_supports_void_internal_calls

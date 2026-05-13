@@ -28,6 +28,7 @@ module PFC
         @registers = {}
         @inline_call_index = 0
         @printf_call_index = 0
+        @phi_temp_index = 0
         validate_tape_size!
         analyze_allocations
         analyze_registers
@@ -710,9 +711,10 @@ module PFC
 
       def phi_goto(from_label, to_label, indent: 1)
         spaces = "    " * indent
-        lines = phi_lines(to_label).filter_map do |line|
-          phi_assignment(line, from_label, spaces)
+        assignments = phi_lines(to_label).filter_map do |line|
+          phi_assignment(line, from_label)
         end
+        lines = simultaneous_phi_assignment_lines(assignments, spaces)
         lines << "#{spaces}goto #{c_label(to_label)};"
         lines
       end
@@ -721,7 +723,7 @@ module PFC
         blocks.fetch(label).select { |line| phi?(line) }
       end
 
-      def phi_assignment(line, from_label, spaces)
+      def phi_assignment(line, from_label)
         match = line.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported phi: #{line}" unless match
 
@@ -730,14 +732,18 @@ module PFC
         return nil if value.nil?
 
         bits = match[2].to_i
-        "#{spaces}#{register(match[1])} = #{unsigned_cast(bits)}((#{llvm_value(value)}) & #{integer_mask_literal(bits)});"
+        {
+          expression: "#{unsigned_cast(bits)}((#{llvm_value(value)}) & #{integer_mask_literal(bits)})",
+          target: register(match[1])
+        }
       end
 
       def inline_phi_goto(context, from_label, to_label, indent: 1)
         spaces = "    " * indent
-        lines = inline_phi_lines(context, to_label).filter_map do |line|
-          inline_phi_assignment(context, line, from_label, spaces)
+        assignments = inline_phi_lines(context, to_label).filter_map do |line|
+          inline_phi_assignment(context, line, from_label)
         end
+        lines = simultaneous_phi_assignment_lines(assignments, spaces)
         lines << "#{spaces}goto #{inline_label(context, to_label)};"
         lines
       end
@@ -746,7 +752,7 @@ module PFC
         context.fetch(:function).fetch(:blocks).fetch(label).select { |line| phi?(line) }
       end
 
-      def inline_phi_assignment(context, line, from_label, spaces)
+      def inline_phi_assignment(context, line, from_label)
         match = line.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported phi: #{line}" unless match
 
@@ -755,7 +761,29 @@ module PFC
         return nil if value.nil?
 
         bits = match[2].to_i
-        "#{spaces}#{inline_register(context, match[1])} = #{unsigned_cast(bits)}((#{inline_value(value, context)}) & #{integer_mask_literal(bits)});"
+        {
+          expression: "#{unsigned_cast(bits)}((#{inline_value(value, context)}) & #{integer_mask_literal(bits)})",
+          target: inline_register(context, match[1])
+        }
+      end
+
+      def simultaneous_phi_assignment_lines(assignments, spaces)
+        return [] if assignments.empty?
+
+        temp_names = assignments.map { next_phi_temp_name }
+        temp_lines = assignments.zip(temp_names).map do |assignment, temp_name|
+          "#{spaces}unsigned long long #{temp_name} = #{assignment.fetch(:expression)};"
+        end
+        assignment_lines = assignments.zip(temp_names).map do |assignment, temp_name|
+          "#{spaces}#{assignment.fetch(:target)} = #{temp_name};"
+        end
+        temp_lines + assignment_lines
+      end
+
+      def next_phi_temp_name
+        name = "pf_phi_tmp_#{@phi_temp_index}"
+        @phi_temp_index += 1
+        name
       end
 
       def llvm_value(raw)
