@@ -78,4 +78,34 @@ class LLVMSubsetTest < Minitest::Test
 
     assert_includes PFC::Backend::LLVMCEmitter.new(source).dump_ir, "LLVMSubsetCFG(blocks: entry, yes, no, merge"
   end
+
+  def test_inlines_internal_cfg_functions
+    source = File.read(File.expand_path("../samples/internal_cfg.ll", __dir__))
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "goto pf_call_0_block_entry;"
+    assert_includes generated, "pf_call_0_out = (unsigned int)(89);"
+    assert_includes generated, "goto pf_call_0_return;"
+  end
+
+  def test_rejects_recursive_internal_calls
+    source = <<~LLVM
+      define i32 @loop() {
+      entry:
+        %value = call i32 @loop()
+        ret i32 %value
+      }
+
+      define i32 @main() {
+      entry:
+        %value = call i32 @loop()
+        ret i32 %value
+      }
+    LLVM
+
+    error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(source).emit
+    end
+    assert_equal "recursive internal call is unsupported: @loop", error.message
+  end
 end

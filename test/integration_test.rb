@@ -112,6 +112,18 @@ class IntegrationTest < Minitest::Test
     assert_equal "B", compile_llvm_and_run("samples/internal_call.ll")
   end
 
+  def test_runs_llvm_internal_cfg_sample
+    assert_equal "YN", compile_llvm_and_run("samples/internal_cfg.ll")
+  end
+
+  def test_runs_llvm_internal_memory_sample
+    assert_equal "B", compile_llvm_and_run("samples/internal_memory.ll")
+  end
+
+  def test_runs_llvm_internal_nested_call_sample
+    assert_equal "B", compile_llvm_and_run("samples/internal_nested_call.ll")
+  end
+
   def test_runs_llvm_void_main_sample
     assert_equal "A", compile_llvm_and_run("samples/void_main.ll")
   end
