@@ -326,6 +326,16 @@ module PFC
               return 0;
           }
 
+          static inline int PF_MAYBE_UNUSED pf_output_counted_padding(int width, int *count) {
+              while (width > 0) {
+                  if (pf_output_counted_cell((unsigned char)' ', count) != 0) {
+                      return 1;
+                  }
+                  width--;
+              }
+              return 0;
+          }
+
           static inline int PF_MAYBE_UNUSED pf_output_u32_decimal(unsigned int value, int *count) {
               char digits[10];
               int length = 0;
@@ -427,6 +437,104 @@ module PFC
                   }
               }
 
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_output_u64_formatted(unsigned long long value, unsigned int base, const char *digits, int width, int precision, int left_adjust, int zero_pad, int *count) {
+              unsigned long long original = value;
+              char output[64];
+              int length = 0;
+              int precision_padding;
+              int content_width;
+              int padding;
+
+              do {
+                  output[length] = digits[value % base];
+                  value /= base;
+                  length++;
+              } while (value != 0ull);
+
+              if (precision == 0 && original == 0ull) {
+                  length = 0;
+              }
+
+              precision_padding = precision > length ? precision - length : 0;
+              content_width = length + precision_padding;
+              padding = width > content_width ? width - content_width : 0;
+              if (zero_pad && !left_adjust && precision < 0) {
+                  precision_padding += padding;
+                  padding = 0;
+              }
+
+              if (!left_adjust && pf_output_counted_padding(padding, count) != 0) {
+                  return 1;
+              }
+              while (precision_padding > 0) {
+                  if (pf_output_counted_cell((unsigned char)'0', count) != 0) {
+                      return 1;
+                  }
+                  precision_padding--;
+              }
+              while (length > 0) {
+                  length--;
+                  if (pf_output_counted_cell((unsigned char)output[length], count) != 0) {
+                      return 1;
+                  }
+              }
+              if (left_adjust && pf_output_counted_padding(padding, count) != 0) {
+                  return 1;
+              }
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_output_i64_formatted(long long value, unsigned int base, const char *digits, int width, int precision, int left_adjust, int zero_pad, int *count) {
+              int negative = value < 0;
+              unsigned long long magnitude = negative ? 0ull - (unsigned long long)value : (unsigned long long)value;
+              char output[64];
+              int length = 0;
+              int precision_padding;
+              int content_width;
+              int padding;
+
+              do {
+                  output[length] = digits[magnitude % base];
+                  magnitude /= base;
+                  length++;
+              } while (magnitude != 0ull);
+
+              if (precision == 0 && !negative && value == 0) {
+                  length = 0;
+              }
+
+              precision_padding = precision > length ? precision - length : 0;
+              content_width = length + precision_padding + negative;
+              padding = width > content_width ? width - content_width : 0;
+              if (zero_pad && !left_adjust && precision < 0) {
+                  precision_padding += padding;
+                  padding = 0;
+              }
+
+              if (!left_adjust && pf_output_counted_padding(padding, count) != 0) {
+                  return 1;
+              }
+              if (negative && pf_output_counted_cell((unsigned char)'-', count) != 0) {
+                  return 1;
+              }
+              while (precision_padding > 0) {
+                  if (pf_output_counted_cell((unsigned char)'0', count) != 0) {
+                      return 1;
+                  }
+                  precision_padding--;
+              }
+              while (length > 0) {
+                  length--;
+                  if (pf_output_counted_cell((unsigned char)output[length], count) != 0) {
+                      return 1;
+                  }
+              }
+              if (left_adjust && pf_output_counted_padding(padding, count) != 0) {
+                  return 1;
+              }
               return 0;
           }
 
