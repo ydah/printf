@@ -288,9 +288,13 @@ module PFC
           memory:
             - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64
             - byte-addressed numeric globals, with global writable and constant read-only
+            - read-only global string byte memory for load/getelementptr/ptrtoint
             - constant and dynamic getelementptr for integer element sizes
+            - volatile load/store accepted as backend-equivalent memory access
             - llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory
+            - llvm.lifetime.start/end accepted as no-op intrinsics
           values:
+            - true/false/undef/poison/zeroinitializer scalar constants
             - add/sub/mul, signed/unsigned division and remainder
             - bitwise and/or/xor, shl/lshr/ashr
             - zext/sext/trunc
@@ -300,7 +304,12 @@ module PFC
             - integer and pointer select
           control:
             - br, switch, phi, ret
+            - unreachable as runtime abort
+            - tail/musttail/notail accepted as no-op call markers
             - void @main and nested non-recursive internal calls with integer and pointer arguments
+          tolerance:
+            - common value attributes accepted as no-ops
+            - trailing LLVM metadata attachments accepted as no-ops
           libc:
             - putchar, getchar, puts
             - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags
@@ -312,10 +321,14 @@ module PFC
         memory: [
           "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64",
           "byte-addressed numeric globals with global writable and constant read-only semantics",
+          "read-only global string byte memory for load/getelementptr/ptrtoint",
           "constant and dynamic getelementptr for integer element sizes",
-          "llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory"
+          "volatile load/store accepted as backend-equivalent memory access",
+          "llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory",
+          "llvm.lifetime.start/end accepted as no-op intrinsics"
         ],
         values: [
+          "true/false/undef/poison/zeroinitializer scalar constants",
           "add/sub/mul, signed/unsigned division and remainder",
           "bitwise and/or/xor, shl/lshr/ashr",
           "zext/sext/trunc",
@@ -326,7 +339,13 @@ module PFC
         ],
         control: [
           "br, switch, phi, ret",
+          "unreachable as runtime abort",
+          "tail/musttail/notail accepted as no-op call markers",
           "void @main and nested non-recursive internal calls with integer and pointer arguments"
+        ],
+        tolerance: [
+          "common value attributes accepted as no-ops",
+          "trailing LLVM metadata attachments accepted as no-ops"
         ],
         libc: [
           "putchar, getchar, puts",

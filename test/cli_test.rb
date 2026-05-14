@@ -77,7 +77,9 @@ class CLITest < Minitest::Test
 
     assert_empty err
     capabilities = JSON.parse(out)
+    assert_includes capabilities.fetch("memory").join("\n"), "global string byte memory"
     assert_includes capabilities.fetch("values").join("\n"), "bitcast ptr-to-ptr"
+    assert_includes capabilities.fetch("tolerance").join("\n"), "metadata"
     assert_includes capabilities.fetch("libc").join("\n"), "%p"
   end
 
