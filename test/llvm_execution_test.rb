@@ -32,6 +32,30 @@ class LLVMExecutionTest < Minitest::Test
     assert_equal "B", compile_llvm_source_and_run(source)
   end
 
+  def test_runs_memory_intrinsic_program
+    source = <<~LLVM
+      declare void @llvm.memset.p0.i64(ptr writeonly, i8, i64, i1 immarg)
+      declare void @llvm.memcpy.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg)
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %src = alloca [4 x i8], align 1
+        %dst = alloca [4 x i8], align 1
+        call void @llvm.memset.p0.i64(ptr %src, i8 65, i64 4, i1 false)
+        %second = getelementptr inbounds [4 x i8], ptr %src, i64 0, i64 1
+        store i8 66, ptr %second, align 1
+        call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 4, i1 false)
+        %copied = getelementptr inbounds [4 x i8], ptr %dst, i64 0, i64 1
+        %ch = load i8, ptr %copied, align 1
+        call i32 @putchar(i32 %ch)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
   def test_runs_signed_extension_program
     source = <<~LLVM
       declare i32 @putchar(i32)

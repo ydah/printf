@@ -307,6 +307,37 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "pf_v_ch = (unsigned int)(pf_llvm_load(llvm_memory, pf_slot_index, 1) & 255u);"
   end
 
+  def test_emits_memory_intrinsic_loops
+    source = <<~LLVM
+      declare void @llvm.memset.p0.i64(ptr writeonly, i8, i64, i1 immarg)
+      declare void @llvm.memcpy.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg)
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %src = alloca [4 x i8], align 1
+        %dst = alloca [4 x i8], align 1
+        call void @llvm.memset.p0.i64(ptr %src, i8 65, i64 4, i1 false)
+        %second = getelementptr inbounds [4 x i8], ptr %src, i64 0, i64 1
+        store i8 66, ptr %second, align 1
+        call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 4, i1 false)
+        %copied = getelementptr inbounds [4 x i8], ptr %dst, i64 0, i64 1
+        %ch = load i8, ptr %copied, align 1
+        call i32 @putchar(i32 %ch)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "long long pf_mem_0_dst = (long long)(0);"
+    assert_includes generated, "unsigned char pf_mem_0_value = (unsigned char)(65);"
+    assert_includes generated, "llvm_memory[pf_mem_0_dst + pf_mem_0_offset] = pf_mem_0_value;"
+    assert_includes generated, "long long pf_mem_1_dst = (long long)(4);"
+    assert_includes generated, "long long pf_mem_1_src = (long long)(0);"
+    assert_includes generated, "llvm_memory[pf_mem_1_dst + pf_mem_1_offset] = llvm_memory[pf_mem_1_src + pf_mem_1_offset];"
+  end
+
   def test_supports_i64_memory_arithmetic_and_printf
     source = <<~LLVM
       @.fmt = private unnamed_addr constant [11 x i8] c"%llu %lld\\0A\\00", align 1

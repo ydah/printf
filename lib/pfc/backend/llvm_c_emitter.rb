@@ -34,6 +34,7 @@ module PFC
         @pointers = {}
         @registers = {}
         @inline_call_index = 0
+        @memory_intrinsic_index = 0
         @printf_call_index = 0
         @phi_temp_index = 0
         validate_tape_size!
@@ -346,7 +347,9 @@ module PFC
       end
 
       def emit_call(line)
-        validate_call_signature!(parsed_call(line), line)
+        call = parsed_call(line)
+        validate_call_signature!(call, line)
+        return emit_memory_intrinsic_call(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
           output = ["    pf_ch = getchar();"]
@@ -600,7 +603,9 @@ module PFC
       end
 
       def emit_inline_call(line, context)
-        validate_call_signature!(parsed_call(line), line)
+        call = parsed_call(line)
+        validate_call_signature!(call, line)
+        return emit_memory_intrinsic_call(call, context:) if llvm_memory_intrinsic?(call.fetch(:function_name))
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
           output = ["    pf_ch = getchar();"]
@@ -1056,6 +1061,8 @@ module PFC
       end
 
       def validate_call_signature!(call, line)
+        return validate_memory_intrinsic_signature!(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
+
         signature = function_signature(call.fetch(:function_name))
         unless signature
           raise Frontend::LLVMSubset::ParseError, "unknown function: @#{call.fetch(:function_name)}"
@@ -1090,6 +1097,117 @@ module PFC
 
       def function_signature(name)
         function_signatures[name] || BUILTIN_FUNCTION_SIGNATURES[name]
+      end
+
+      def llvm_memory_intrinsic?(name)
+        llvm_memset_intrinsic?(name) || llvm_memcpy_intrinsic?(name)
+      end
+
+      def llvm_memset_intrinsic?(name)
+        name.start_with?("llvm.memset.")
+      end
+
+      def llvm_memcpy_intrinsic?(name)
+        name.start_with?("llvm.memcpy.")
+      end
+
+      def validate_memory_intrinsic_signature!(call)
+        name = call.fetch(:function_name)
+        unless call.fetch(:return_type) == "void"
+          raise Frontend::LLVMSubset::ParseError, "call return type mismatch for @#{name}: expected void, got #{call.fetch(:return_type)}"
+        end
+        if call.fetch(:destination)
+          raise Frontend::LLVMSubset::ParseError, "void call cannot assign a result: @#{name}"
+        end
+
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        if llvm_memset_intrinsic?(name)
+          validate_memory_intrinsic_arguments!(name, arguments, ["ptr", "i8", %w[i32 i64], "i1"])
+          return
+        end
+
+        validate_memory_intrinsic_arguments!(name, arguments, ["ptr", "ptr", %w[i32 i64], "i1"])
+      end
+
+      def validate_memory_intrinsic_arguments!(name, arguments, expected_types)
+        if arguments.length != expected_types.length
+          raise Frontend::LLVMSubset::ParseError, "wrong argument count for @#{name}: expected #{expected_types.length}, got #{arguments.length}"
+        end
+
+        expected_types.each_with_index do |expected, index|
+          actual = arguments.fetch(index).fetch(:type)
+          next if Array(expected).include?(actual)
+
+          expected_description = Array(expected).join(" or ")
+          raise Frontend::LLVMSubset::ParseError, "call argument #{index + 1} type mismatch for @#{name}: expected #{expected_description}, got #{actual}"
+        end
+      end
+
+      def emit_memory_intrinsic_call(call, context: nil)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        if llvm_memset_intrinsic?(call.fetch(:function_name))
+          return emit_memset_intrinsic(arguments, context:)
+        end
+
+        emit_memcpy_intrinsic(arguments, context:)
+      end
+
+      def emit_memset_intrinsic(arguments, context:)
+        prefix = next_memory_intrinsic_prefix
+        destination = pointer_value(arguments.fetch(0).fetch(:value), context:)
+        byte_value = scalar_value(arguments.fetch(1).fetch(:value), context:)
+        length = scalar_value(arguments.fetch(2).fetch(:value), context:)
+        [
+          "    {",
+          "        long long #{prefix}_dst = (long long)(#{destination});",
+          "        long long #{prefix}_len = (long long)(#{length});",
+          "        long long #{prefix}_offset = 0;",
+          "        unsigned char #{prefix}_value = (unsigned char)(#{byte_value});",
+          "        if (#{prefix}_dst < 0 || #{prefix}_len < 0 || #{prefix}_dst + #{prefix}_len > PF_LLVM_MEMORY_SIZE) {",
+          "            fprintf(stderr, \"pfc runtime error: LLVM memory intrinsic out of range\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        for (#{prefix}_offset = 0; #{prefix}_offset < #{prefix}_len; #{prefix}_offset++) {",
+          "            llvm_memory[#{prefix}_dst + #{prefix}_offset] = #{prefix}_value;",
+          "        }",
+          "    }"
+        ]
+      end
+
+      def emit_memcpy_intrinsic(arguments, context:)
+        prefix = next_memory_intrinsic_prefix
+        destination = pointer_value(arguments.fetch(0).fetch(:value), context:)
+        source = pointer_value(arguments.fetch(1).fetch(:value), context:)
+        length = scalar_value(arguments.fetch(2).fetch(:value), context:)
+        [
+          "    {",
+          "        long long #{prefix}_dst = (long long)(#{destination});",
+          "        long long #{prefix}_src = (long long)(#{source});",
+          "        long long #{prefix}_len = (long long)(#{length});",
+          "        long long #{prefix}_offset = 0;",
+          "        if (#{prefix}_dst < 0 || #{prefix}_src < 0 || #{prefix}_len < 0 || #{prefix}_dst + #{prefix}_len > PF_LLVM_MEMORY_SIZE || #{prefix}_src + #{prefix}_len > PF_LLVM_MEMORY_SIZE) {",
+          "            fprintf(stderr, \"pfc runtime error: LLVM memory intrinsic out of range\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        for (#{prefix}_offset = 0; #{prefix}_offset < #{prefix}_len; #{prefix}_offset++) {",
+          "            llvm_memory[#{prefix}_dst + #{prefix}_offset] = llvm_memory[#{prefix}_src + #{prefix}_offset];",
+          "        }",
+          "    }"
+        ]
+      end
+
+      def next_memory_intrinsic_prefix
+        name = "pf_mem_#{@memory_intrinsic_index}"
+        @memory_intrinsic_index += 1
+        name
+      end
+
+      def pointer_value(raw, context:)
+        context ? inline_pointer_expr(context, raw) : pointer_expr(raw)
+      end
+
+      def scalar_value(raw, context:)
+        context ? inline_value(raw, context) : llvm_value(raw)
       end
 
       def validate_builtin_declarations!

@@ -390,13 +390,14 @@ module PFC
             end
 
             type_pattern = allow_pointer ? /i(?:1|8|16|32|64)|ptr/ : /i(?:1|8|16|32|64)/
-            match = stripped.match(/\A(#{type_pattern})(?:\s+(#{NAME}))?\z/)
+            match = stripped.match(/\A(#{type_pattern})(?:\s+(.+))?\z/)
             raise ParseError, "unsupported function parameter: #{parameter}" unless match
-            if require_names && match[2].nil?
+            name = match[2]&.match(/#{NAME}/)&.[](0)
+            if require_names && name.nil?
               raise ParseError, "unsupported function parameter: #{parameter}"
             end
 
-            { type: match[1], name: match[2] }
+            { type: match[1], name: }
           end
         end
 
