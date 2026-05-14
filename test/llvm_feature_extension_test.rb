@@ -19,4 +19,39 @@ class LLVMFeatureExtensionTest < Minitest::Test
 
     assert_equal "n=-0007 x=001a s=   ab c=  A\n", compile_llvm_source_and_run(source)
   end
+
+  def test_mutable_global_integer_memory_can_be_updated
+    source = <<~LLVM
+      @.cell = global i8 65
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        store i8 66, ptr @.cell
+        %value = load i8, ptr @.cell
+        call i32 @putchar(i32 %value)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_constant_global_integer_memory_rejects_store
+    source = <<~LLVM
+      @.cell = constant i8 65
+
+      define i32 @main() {
+      entry:
+        store i8 66, ptr @.cell
+        ret i32 0
+      }
+    LLVM
+
+    error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(source).emit
+    end
+    assert_includes error.message, "cannot write to constant global: @.cell"
+  end
 end

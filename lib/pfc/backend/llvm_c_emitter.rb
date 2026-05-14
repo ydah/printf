@@ -13,8 +13,8 @@ module PFC
       GLOBAL_NAME = /@[-A-Za-z$._0-9]+/
       POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
       GlobalStringPointer = Struct.new(:name, :offset, keyword_init: true)
-      GlobalMemoryPointer = Struct.new(:offset, keyword_init: true)
-      MemoryAddress = Struct.new(:limit, :memory, :offset, keyword_init: true)
+      GlobalMemoryPointer = Struct.new(:name, :offset, keyword_init: true)
+      MemoryAddress = Struct.new(:limit, :memory, :name, :offset, :readonly, keyword_init: true)
       BUILTIN_FUNCTION_SIGNATURES = {
         "getchar" => { return_type: "i32", parameter_types: [], varargs: false },
         "printf" => { return_type: "i32", parameter_types: ["ptr"], varargs: true },
@@ -28,6 +28,7 @@ module PFC
         @tape_size = Integer(tape_size)
         @function_signatures = parsed.fetch(:function_signatures)
         @global_numeric_data = parsed.fetch(:global_numeric_data)
+        @global_numeric_mutability = parsed.fetch(:global_numeric_mutability)
         @global_strings = parsed.fetch(:global_strings)
         @internal_functions = parsed.fetch(:internal_functions)
         @blocks = parsed.fetch(:blocks)
@@ -98,7 +99,7 @@ module PFC
 
       private
 
-      attr_reader :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
+      attr_reader :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -119,7 +120,7 @@ module PFC
 
       def analyze_global_numeric_pointers
         global_numeric_offsets.each do |name, offset|
-          pointers[name] = GlobalMemoryPointer.new(offset:)
+          pointers[name] = GlobalMemoryPointer.new(name:, offset:)
         end
       end
 
@@ -354,6 +355,7 @@ module PFC
         end
         width = byte_width(bits)
         address = memory_address(pointer)
+        ensure_writable_address!(address)
         slot_lines(address, width) + [
           "    pf_llvm_store(#{address.memory}, pf_slot_index, (unsigned long long)(#{llvm_value(value)} & #{integer_mask_literal(bits)}), #{width});"
         ]
@@ -690,6 +692,7 @@ module PFC
         end
         width = byte_width(bits)
         address = memory_address(pointer, context:)
+        ensure_writable_address!(address)
         inline_slot_lines(address, width) + [
           "    pf_llvm_store(#{address.memory}, pf_slot_index, (unsigned long long)(#{inline_value(value, context)} & #{integer_mask_literal(bits)}), #{width});"
         ]
@@ -1492,6 +1495,7 @@ module PFC
       def emit_memset_intrinsic(arguments, context:)
         prefix = next_memory_intrinsic_prefix
         destination = memory_address(arguments.fetch(0).fetch(:value), context:)
+        ensure_writable_address!(destination)
         byte_value = scalar_value(arguments.fetch(1).fetch(:value), context:)
         length = scalar_value(arguments.fetch(2).fetch(:value), context:)
         [
@@ -1514,6 +1518,7 @@ module PFC
       def emit_memcpy_intrinsic(arguments, context:)
         prefix = next_memory_intrinsic_prefix
         destination = memory_address(arguments.fetch(0).fetch(:value), context:)
+        ensure_writable_address!(destination)
         source = memory_address(arguments.fetch(1).fetch(:value), context:)
         length = scalar_value(arguments.fetch(2).fetch(:value), context:)
         [
@@ -1536,6 +1541,7 @@ module PFC
       def emit_memmove_intrinsic(arguments, context:)
         prefix = next_memory_intrinsic_prefix
         destination = memory_address(arguments.fetch(0).fetch(:value), context:)
+        ensure_writable_address!(destination)
         source = memory_address(arguments.fetch(1).fetch(:value), context:)
         length = scalar_value(arguments.fetch(2).fetch(:value), context:)
         lines = [
@@ -1681,11 +1687,13 @@ module PFC
           return MemoryAddress.new(
             limit: "PF_LLVM_GLOBAL_MEMORY_SIZE",
             memory: "llvm_global_memory",
+            name: pointer.name,
+            readonly: !global_numeric_mutability.fetch(pointer.name, false),
             offset: pointer.offset
           )
         end
 
-        MemoryAddress.new(limit: "PF_LLVM_MEMORY_SIZE", memory: "llvm_memory", offset: pointer)
+        MemoryAddress.new(limit: "PF_LLVM_MEMORY_SIZE", memory: "llvm_memory", offset: pointer, readonly: false)
       end
 
       def resolve_pointer(name, context:)
@@ -1699,10 +1707,16 @@ module PFC
 
       def pointer_from_address(address, offset)
         if address.memory == "llvm_global_memory"
-          GlobalMemoryPointer.new(offset:)
+          GlobalMemoryPointer.new(name: address.name, offset:)
         else
           offset
         end
+      end
+
+      def ensure_writable_address!(address)
+        return unless address.readonly
+
+        raise Frontend::LLVMSubset::ParseError, "cannot write to constant global: #{address.name}"
       end
 
       def register(name)

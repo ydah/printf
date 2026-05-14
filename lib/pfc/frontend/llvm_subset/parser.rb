@@ -332,6 +332,7 @@ module PFC
             blocks:,
             function_signatures: parse_function_signatures,
             global_numeric_data: parse_global_numeric_data,
+            global_numeric_mutability: parse_global_numeric_mutability,
             global_strings: parse_global_strings,
             internal_functions:,
             source:,
@@ -412,6 +413,19 @@ module PFC
               globals[match[1]] = integer_bytes(match[3], match[2].to_i)
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\]\s+(zeroinitializer|\[(.*)\])(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = global_integer_array_bytes(match, stripped)
+            end
+          end
+        end
+
+        def parse_global_numeric_mutability
+          source.each_line.each_with_object({}) do |line, globals|
+            stripped = line.sub(/;.*/, "").strip
+            next if stripped.empty?
+
+            if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+i(?:1|8|16|32|64)\s+(?:-?\d+|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = match[2] == "global"
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+\[\d+\s+x\s+i(?:1|8|16|32|64)\]\s+(?:zeroinitializer|\[.*\])(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = match[2] == "global"
             end
           end
         end
