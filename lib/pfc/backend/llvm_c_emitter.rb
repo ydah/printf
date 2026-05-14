@@ -287,6 +287,29 @@ module PFC
       end
 
       def emit_gep(line)
+        if line.respond_to?(:destination) && line.respond_to?(:base_pointer) && line.respond_to?(:element_bits) && line.element_bits
+          if global_strings.key?(line.base_pointer) && line.array_count && line.element_bits == 8 && line.indices.all? { |index| index.match?(/\A-?\d+\z/) }
+            pointers[line.destination] = GlobalStringPointer.new(
+              name: line.base_pointer,
+              offset: (line.indices.fetch(0).to_i * line.array_count) + line.indices.fetch(1).to_i
+            )
+            return []
+          end
+
+          base_address = memory_address(line.base_pointer)
+          if line.array_count
+            element_width = byte_width(line.element_bits)
+            aggregate_width = line.array_count * element_width
+            first_index = llvm_value(line.indices.fetch(0))
+            second_index = llvm_value(line.indices.fetch(1))
+            offset = "((#{base_address.offset}) + ((#{first_index}) * #{aggregate_width}) + ((#{second_index}) * #{element_width}))"
+          else
+            offset = "((#{base_address.offset}) + ((#{llvm_value(line.indices.fetch(0))}) * #{byte_width(line.element_bits)}))"
+          end
+          pointers[line.destination] = pointer_from_address(base_address, offset)
+          return []
+        end
+
         if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i8\],\s+ptr\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
           pointers[match[1]] = GlobalStringPointer.new(
             name: match[3],
@@ -317,36 +340,64 @@ module PFC
       end
 
       def emit_store(line)
-        match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
+        if line.respond_to?(:bits) && line.respond_to?(:value) && line.respond_to?(:pointer) && line.bits
+          bits = line.bits
+          value = line.value
+          pointer = line.pointer
+        else
+          match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
-        bits = match[1].to_i
+          bits = match[1].to_i
+          value = match[2]
+          pointer = match[3]
+        end
         width = byte_width(bits)
-        address = memory_address(match[3])
+        address = memory_address(pointer)
         slot_lines(address, width) + [
-          "    pf_llvm_store(#{address.memory}, pf_slot_index, (unsigned long long)(#{llvm_value(match[2])} & #{integer_mask_literal(bits)}), #{width});"
+          "    pf_llvm_store(#{address.memory}, pf_slot_index, (unsigned long long)(#{llvm_value(value)} & #{integer_mask_literal(bits)}), #{width});"
         ]
       end
 
       def emit_load(line)
-        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
+        if line.respond_to?(:destination) && line.respond_to?(:bits) && line.respond_to?(:pointer) && line.bits
+          destination = line.destination
+          bits = line.bits
+          pointer = line.pointer
+        else
+          match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
-        bits = match[2].to_i
+          destination = match[1]
+          bits = match[2].to_i
+          pointer = match[3]
+        end
         width = byte_width(bits)
-        address = memory_address(match[3])
+        address = memory_address(pointer)
         slot_lines(address, width) + [
-          "    #{register(match[1])} = #{unsigned_cast(bits)}(pf_llvm_load(#{address.memory}, pf_slot_index, #{width}) & #{integer_mask_literal(bits)});"
+          "    #{register(destination)} = #{unsigned_cast(bits)}(pf_llvm_load(#{address.memory}, pf_slot_index, #{width}) & #{integer_mask_literal(bits)});"
         ]
       end
 
       def emit_binary(line)
-        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
+        if line.respond_to?(:destination) && line.respond_to?(:operator) && line.respond_to?(:bits) && line.bits
+          destination = line.destination
+          operator = line.operator
+          bits = line.bits
+          left = line.left
+          right = line.right
+        else
+          match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
 
-        bits = match[3].to_i
-        expression = binary_expression(match[2], bits, llvm_value(match[4]), llvm_value(match[5]))
-        ["    #{register(match[1])} = #{unsigned_cast(bits)}((#{expression}) & #{integer_mask_literal(bits)});"]
+          destination = match[1]
+          operator = match[2]
+          bits = match[3].to_i
+          left = match[4]
+          right = match[5]
+        end
+        expression = binary_expression(operator, bits, llvm_value(left), llvm_value(right))
+        ["    #{register(destination)} = #{unsigned_cast(bits)}((#{expression}) & #{integer_mask_literal(bits)});"]
       end
 
       def emit_select(line)
@@ -361,29 +412,48 @@ module PFC
       end
 
       def emit_cast(line)
-        match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
+        if line.respond_to?(:destination) && line.respond_to?(:operator) && line.respond_to?(:from_bits) && line.from_bits
+          destination = line.destination
+          operator = line.operator
+          from_bits = line.from_bits
+          value = line.value
+          to_bits = line.to_bits
+        else
+          match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
 
-        operator = match[2]
-        from_bits = match[3].to_i
-        value = llvm_value(match[4])
-        to_bits = match[5].to_i
-        ["    #{register(match[1])} = #{cast_expression(operator, from_bits, to_bits, value)};"]
+          destination = match[1]
+          operator = match[2]
+          from_bits = match[3].to_i
+          value = match[4]
+          to_bits = match[5].to_i
+        end
+        ["    #{register(destination)} = #{cast_expression(operator, from_bits, to_bits, llvm_value(value))};"]
       end
 
       def emit_icmp(line)
-        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
+        if line.respond_to?(:destination) && line.respond_to?(:predicate) && line.respond_to?(:bits) && line.bits
+          destination = line.destination
+          predicate = line.predicate
+          bits = line.bits
+          left = llvm_value(line.left)
+          right = llvm_value(line.right)
+        else
+          match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
 
-        operator = icmp_operator(match[2])
-        left = llvm_value(match[4])
-        right = llvm_value(match[5])
-        if match[2].start_with?("s")
+          destination = match[1]
+          predicate = match[2]
           bits = match[3].to_i
+          left = llvm_value(match[4])
+          right = llvm_value(match[5])
+        end
+        operator = icmp_operator(predicate)
+        if predicate.start_with?("s")
           left = signed_expression(left, bits)
           right = signed_expression(right, bits)
         end
-        ["    #{register(match[1])} = ((#{left}) #{operator} (#{right})) ? 1u : 0u;"]
+        ["    #{register(destination)} = ((#{left}) #{operator} (#{right})) ? 1u : 0u;"]
       end
 
       def emit_call(line)
@@ -553,6 +623,29 @@ module PFC
       end
 
       def emit_inline_gep(line, context)
+        if line.respond_to?(:destination) && line.respond_to?(:base_pointer) && line.respond_to?(:element_bits) && line.element_bits
+          if global_strings.key?(line.base_pointer) && line.array_count && line.element_bits == 8 && line.indices.all? { |index| index.match?(/\A-?\d+\z/) }
+            context.fetch(:pointers)[line.destination] = GlobalStringPointer.new(
+              name: line.base_pointer,
+              offset: (line.indices.fetch(0).to_i * line.array_count) + line.indices.fetch(1).to_i
+            )
+            return []
+          end
+
+          base_address = memory_address(line.base_pointer, context:)
+          if line.array_count
+            element_width = byte_width(line.element_bits)
+            aggregate_width = line.array_count * element_width
+            first_index = inline_value(line.indices.fetch(0), context)
+            second_index = inline_value(line.indices.fetch(1), context)
+            offset = "((#{base_address.offset}) + ((#{first_index}) * #{aggregate_width}) + ((#{second_index}) * #{element_width}))"
+          else
+            offset = "((#{base_address.offset}) + ((#{inline_value(line.indices.fetch(0), context)}) * #{byte_width(line.element_bits)}))"
+          end
+          context.fetch(:pointers)[line.destination] = pointer_from_address(base_address, offset)
+          return []
+        end
+
         if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i8\],\s+ptr\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
           context.fetch(:pointers)[match[1]] = GlobalStringPointer.new(
             name: match[3],
@@ -583,36 +676,65 @@ module PFC
       end
 
       def emit_inline_store(line, context)
-        match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
+        if line.respond_to?(:bits) && line.respond_to?(:value) && line.respond_to?(:pointer) && line.bits
+          bits = line.bits
+          value = line.value
+          pointer = line.pointer
+        else
+          match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
-        bits = match[1].to_i
+          bits = match[1].to_i
+          value = match[2]
+          pointer = match[3]
+        end
         width = byte_width(bits)
-        address = memory_address(match[3], context:)
+        address = memory_address(pointer, context:)
         inline_slot_lines(address, width) + [
-          "    pf_llvm_store(#{address.memory}, pf_slot_index, (unsigned long long)(#{inline_value(match[2], context)} & #{integer_mask_literal(bits)}), #{width});"
+          "    pf_llvm_store(#{address.memory}, pf_slot_index, (unsigned long long)(#{inline_value(value, context)} & #{integer_mask_literal(bits)}), #{width});"
         ]
       end
 
       def emit_inline_load(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
+        if line.respond_to?(:destination) && line.respond_to?(:bits) && line.respond_to?(:pointer) && line.bits
+          destination = line.destination
+          bits = line.bits
+          pointer = line.pointer
+        else
+          match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
-        bits = match[2].to_i
+          destination = match[1]
+          bits = match[2].to_i
+          pointer = match[3]
+        end
         width = byte_width(bits)
-        address = memory_address(match[3], context:)
+        address = memory_address(pointer, context:)
         inline_slot_lines(address, width) + [
-          "    #{inline_register(context, match[1])} = #{unsigned_cast(bits)}(pf_llvm_load(#{address.memory}, pf_slot_index, #{width}) & #{integer_mask_literal(bits)});"
+          "    #{inline_register(context, destination)} = #{unsigned_cast(bits)}(pf_llvm_load(#{address.memory}, pf_slot_index, #{width}) & #{integer_mask_literal(bits)});"
         ]
       end
 
       def emit_inline_binary(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
+        if line.respond_to?(:destination) && line.respond_to?(:operator) && line.respond_to?(:bits) && line.bits
+          destination = line.destination
+          operator = line.operator
+          bits = line.bits
+          left = line.left
+          right = line.right
+        else
+          match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
 
-        local = inline_register(context, match[1])
-        expression = binary_expression(match[2], match[3].to_i, inline_value(match[4], context), inline_value(match[5], context))
-        ["    #{local} = #{unsigned_cast(match[3].to_i)}((#{expression}) & #{integer_mask_literal(match[3].to_i)});"]
+          destination = match[1]
+          operator = match[2]
+          bits = match[3].to_i
+          left = match[4]
+          right = match[5]
+        end
+        local = inline_register(context, destination)
+        expression = binary_expression(operator, bits, inline_value(left, context), inline_value(right, context))
+        ["    #{local} = #{unsigned_cast(bits)}((#{expression}) & #{integer_mask_literal(bits)});"]
       end
 
       def emit_inline_select(line, context)
@@ -627,27 +749,49 @@ module PFC
       end
 
       def emit_inline_cast(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
+        if line.respond_to?(:destination) && line.respond_to?(:operator) && line.respond_to?(:from_bits) && line.from_bits
+          destination = line.destination
+          operator = line.operator
+          from_bits = line.from_bits
+          value = line.value
+          to_bits = line.to_bits
+        else
+          match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
 
-        local = inline_register(context, match[1])
-        value = inline_value(match[4], context)
-        ["    #{local} = #{cast_expression(match[2], match[3].to_i, match[5].to_i, value)};"]
+          destination = match[1]
+          operator = match[2]
+          from_bits = match[3].to_i
+          value = match[4]
+          to_bits = match[5].to_i
+        end
+        local = inline_register(context, destination)
+        ["    #{local} = #{cast_expression(operator, from_bits, to_bits, inline_value(value, context))};"]
       end
 
       def emit_inline_icmp(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
+        if line.respond_to?(:destination) && line.respond_to?(:predicate) && line.respond_to?(:bits) && line.bits
+          destination = line.destination
+          predicate = line.predicate
+          bits = line.bits
+          left = inline_value(line.left, context)
+          right = inline_value(line.right, context)
+        else
+          match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
 
-        left = inline_value(match[4], context)
-        right = inline_value(match[5], context)
-        if match[2].start_with?("s")
+          destination = match[1]
+          predicate = match[2]
           bits = match[3].to_i
+          left = inline_value(match[4], context)
+          right = inline_value(match[5], context)
+        end
+        if predicate.start_with?("s")
           left = signed_expression(left, bits)
           right = signed_expression(right, bits)
         end
-        local = inline_register(context, match[1])
-        ["    #{local} = ((#{left}) #{icmp_operator(match[2])} (#{right})) ? 1u : 0u;"]
+        local = inline_register(context, destination)
+        ["    #{local} = ((#{left}) #{icmp_operator(predicate)} (#{right})) ? 1u : 0u;"]
       end
 
       def emit_inline_call(line, context)
@@ -691,13 +835,20 @@ module PFC
       end
 
       def emit_inline_switch(line, context, label)
-        match = line.match(/\Aswitch\s+i(1|8|16|32|64)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported switch: #{line}" unless match
+        if line.respond_to?(:bits) && line.respond_to?(:value) && line.respond_to?(:default_label) && line.bits
+          bits = line.bits
+          value = inline_value(line.value, context)
+          default_label = line.default_label
+          cases = line.cases
+        else
+          match = line.match(/\Aswitch\s+i(1|8|16|32|64)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported switch: #{line}" unless match
 
-        value = inline_value(match[2], context)
-        default_label = match[3]
-        bits = match[1].to_i
-        cases = match[4].scan(/i(?:1|8|16|32|64)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
+          bits = match[1].to_i
+          value = inline_value(match[2], context)
+          default_label = match[3]
+          cases = match[4].scan(/i(?:1|8|16|32|64)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
+        end
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
@@ -769,13 +920,20 @@ module PFC
       end
 
       def emit_switch(label, line)
-        match = line.match(/\Aswitch\s+i(1|8|16|32|64)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported switch: #{line}" unless match
+        if line.respond_to?(:bits) && line.respond_to?(:value) && line.respond_to?(:default_label) && line.bits
+          bits = line.bits
+          value = llvm_value(line.value)
+          default_label = line.default_label
+          cases = line.cases
+        else
+          match = line.match(/\Aswitch\s+i(1|8|16|32|64)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported switch: #{line}" unless match
 
-        value = llvm_value(match[2])
-        default_label = match[3]
-        bits = match[1].to_i
-        cases = match[4].scan(/i(?:1|8|16|32|64)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
+          value = llvm_value(match[2])
+          default_label = match[3]
+          bits = match[1].to_i
+          cases = match[4].scan(/i(?:1|8|16|32|64)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
+        end
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
