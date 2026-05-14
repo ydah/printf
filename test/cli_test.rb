@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "json"
 require_relative "test_helper"
 
 class CLITest < Minitest::Test
@@ -67,6 +68,17 @@ class CLITest < Minitest::Test
     assert_includes out, "LLVM subset capabilities:"
     assert_includes out, "ptrtoint"
     assert_includes out, "static printf"
+  end
+
+  def test_llvm_capabilities_json_lists_supported_subset
+    out, err = capture_io do
+      assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--json"]).run
+    end
+
+    assert_empty err
+    capabilities = JSON.parse(out)
+    assert_includes capabilities.fetch("values").join("\n"), "bitcast ptr-to-ptr"
+    assert_includes capabilities.fetch("libc").join("\n"), "%p"
   end
 
   private

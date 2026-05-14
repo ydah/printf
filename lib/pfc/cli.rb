@@ -2,6 +2,7 @@
 
 require "English"
 require "fileutils"
+require "json"
 require "optparse"
 require "tmpdir"
 
@@ -131,9 +132,11 @@ module PFC
     end
 
     def llvm_capabilities_command
+      json = @argv.first == "--json"
+      @argv.shift if json
       raise ArgumentError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
 
-      puts llvm_capabilities
+      puts(json ? JSON.pretty_generate(llvm_capabilities_data) : llvm_capabilities)
       0
     end
 
@@ -267,7 +270,7 @@ module PFC
           pfc dump-ir INPUT
           pfc dump-cfg INPUT
           pfc dump-c INPUT
-          pfc llvm-capabilities
+          pfc llvm-capabilities [--json]
 
         Options:
           --backend=printf-c-scheduler|printf-threaded
@@ -291,15 +294,45 @@ module PFC
             - add/sub/mul, signed/unsigned division and remainder
             - bitwise and/or/xor, shl/lshr/ashr
             - zext/sext/trunc
-            - ptrtoint and local-offset inttoptr
-            - icmp and select
+            - ptrtoint and tagged inttoptr for local/global/string pointer values
+            - bitcast ptr-to-ptr
+            - integer and pointer icmp, including null pointer equality
+            - integer and pointer select
           control:
             - br, switch, phi, ret
-            - void @main and nested non-recursive internal calls
+            - void @main and nested non-recursive internal calls with integer and pointer arguments
           libc:
             - putchar, getchar, puts
-            - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%%, l/ll integer length modifiers, static width, 0/- flags, and static precision
+            - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags
       TEXT
+    end
+
+    def llvm_capabilities_data
+      {
+        memory: [
+          "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64",
+          "byte-addressed numeric globals with global writable and constant read-only semantics",
+          "constant and dynamic getelementptr for integer element sizes",
+          "llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory"
+        ],
+        values: [
+          "add/sub/mul, signed/unsigned division and remainder",
+          "bitwise and/or/xor, shl/lshr/ashr",
+          "zext/sext/trunc",
+          "ptrtoint and tagged inttoptr for local/global/string pointer values",
+          "bitcast ptr-to-ptr",
+          "integer and pointer icmp, including null pointer equality",
+          "integer and pointer select"
+        ],
+        control: [
+          "br, switch, phi, ret",
+          "void @main and nested non-recursive internal calls with integer and pointer arguments"
+        ],
+        libc: [
+          "putchar, getchar, puts",
+          "static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags"
+        ]
+      }
     end
   end
 end
