@@ -58,6 +58,17 @@ class CLITest < Minitest::Test
     end
   end
 
+  def test_llvm_capabilities_lists_supported_subset
+    out, err = capture_io do
+      assert_equal 0, PFC::CLI.new(["llvm-capabilities"]).run
+    end
+
+    assert_empty err
+    assert_includes out, "LLVM subset capabilities:"
+    assert_includes out, "ptrtoint"
+    assert_includes out, "static printf"
+  end
+
   private
 
   def with_llvm_source

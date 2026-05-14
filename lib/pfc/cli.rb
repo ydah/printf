@@ -39,6 +39,8 @@ module PFC
         dump_cfg_command
       when "dump-c"
         dump_c_command
+      when "llvm-capabilities"
+        llvm_capabilities_command
       when "-h", "--help", "help"
         puts help
         0
@@ -125,6 +127,13 @@ module PFC
       source_path = require_input_path!
       validate_source_options!(source_path, options)
       puts compile_source(File.read(source_path), options, source_path:)
+      0
+    end
+
+    def llvm_capabilities_command
+      raise ArgumentError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
+
+      puts llvm_capabilities
       0
     end
 
@@ -258,6 +267,7 @@ module PFC
           pfc dump-ir INPUT
           pfc dump-cfg INPUT
           pfc dump-c INPUT
+          pfc llvm-capabilities
 
         Options:
           --backend=printf-c-scheduler|printf-threaded
@@ -267,6 +277,29 @@ module PFC
           --strict-printf
           --debug
       HELP
+    end
+
+    def llvm_capabilities
+      <<~TEXT
+        LLVM subset capabilities:
+          memory:
+            - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64
+            - byte-addressed numeric globals, with global writable and constant read-only
+            - constant and dynamic getelementptr for integer element sizes
+            - llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory
+          values:
+            - add/sub/mul, signed/unsigned division and remainder
+            - bitwise and/or/xor, shl/lshr/ashr
+            - zext/sext/trunc
+            - ptrtoint and local-offset inttoptr
+            - icmp and select
+          control:
+            - br, switch, phi, ret
+            - void @main and nested non-recursive internal calls
+          libc:
+            - putchar, getchar, puts
+            - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%%, l/ll integer length modifiers, static width, 0/- flags, and static precision
+      TEXT
     end
   end
 end

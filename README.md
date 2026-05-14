@@ -22,6 +22,7 @@ bin/pfc run samples/hello.bf --cell-bits=16
 bin/pfc dump-ir samples/hello.bf
 bin/pfc dump-c samples/hello.bf
 bin/pfc dump-cfg samples/dynamic_branch.ll
+bin/pfc llvm-capabilities
 bin/pfc run samples/putchar.ll
 printf A | bin/pfc run samples/dynamic_branch.ll
 bin/pfc run samples/ops_select.ll
@@ -44,8 +45,9 @@ Supported commands:
 - `dump-ir INPUT`
 - `dump-cfg INPUT`
 - `dump-c INPUT`
+- `llvm-capabilities`
 
-`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports byte-addressed local memory for scalar and fixed-array `alloca`/`load`/`store` over `i1`/`i8`/`i16`/`i32`/`i64`, byte-addressed global integer scalars and fixed integer arrays, constant or dynamic `getelementptr` with integer element sizes, local/global `llvm.memset.*`, `llvm.memcpy.*`, and `llvm.memmove.*` intrinsics, `add`/`sub`/`mul`/division/remainder, bitwise and shift operations with common `nuw`/`nsw`/`exact` flags accepted as subset no-ops, `icmp`, `select`, `switch`, `br`, simple `phi`, `ret`, `void @main`, nested internal integer and `void` calls with local CFG and memory, global `i8` string constants for direct `puts` and static `printf` calls with decimal `%d`/`%i`/`%u`, long decimal `%ld`/`%li`/`%lu`/`%lld`/`%lli`/`%llu`, radix `%x`/`%X`/`%o` and long radix variants, `%c`/`%s`/`%%`, and `putchar`/`getchar`.
+`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports byte-addressed local memory for scalar and fixed-array `alloca`/`load`/`store` over `i1`/`i8`/`i16`/`i32`/`i64`, byte-addressed global integer scalars and fixed integer arrays with `global` writable and `constant` read-only semantics, constant or dynamic `getelementptr` with integer element sizes, local/global `llvm.memset.*`, `llvm.memcpy.*`, and `llvm.memmove.*` intrinsics, `add`/`sub`/`mul`/division/remainder, bitwise and shift operations with common `nuw`/`nsw`/`exact` flags accepted as subset no-ops, `zext`/`sext`/`trunc`, `ptrtoint` and local-offset `inttoptr`, `icmp`, `select`, `switch`, `br`, simple `phi`, `ret`, `void @main`, nested internal integer and `void` calls with local CFG and memory, global `i8` string constants for direct `puts` and static `printf` calls with decimal `%d`/`%i`/`%u`, long decimal `%ld`/`%li`/`%lu`/`%lld`/`%lli`/`%llu`, radix `%x`/`%X`/`%o` and long radix variants, static width, `0`/`-` flags, static precision, `%c`/`%s`/`%%`, and `putchar`/`getchar`.
 
 The generated program still uses C control flow as the scheduler. It does not claim a single-call `printf` execution model, which would require implementation-dependent or undefined behavior outside this project's safety scope.
 
