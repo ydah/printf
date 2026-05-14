@@ -41,10 +41,14 @@ module PFCTestHelper
   end
 
   def compile_llvm_and_run(path, input: "")
+    source = File.read(File.expand_path("../#{path}", __dir__))
+    compile_llvm_source_and_run(source, input:)
+  end
+
+  def compile_llvm_source_and_run(source, input: "")
     Dir.mktmpdir("pfc-llvm-test") do |dir|
       c_path = File.join(dir, "test.c")
       exe_path = File.join(dir, "test")
-      source = File.read(File.expand_path("../#{path}", __dir__))
       File.write(c_path, PFC::Backend::LLVMCEmitter.new(source).emit)
 
       compile_out, compile_status = Open3.capture2e(
