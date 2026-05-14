@@ -290,6 +290,8 @@ module PFC
             - byte-addressed numeric globals, with global writable and constant read-only
             - read-only global string byte memory for load/getelementptr/ptrtoint
             - constant and dynamic getelementptr for integer element sizes
+            - named struct alloca and struct field getelementptr
+            - constant-count alloca, with dynamic-count alloca reserving tape-size capacity
             - volatile load/store accepted as backend-equivalent memory access
             - llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory
             - llvm.lifetime.start/end accepted as no-op intrinsics
@@ -302,6 +304,7 @@ module PFC
             - bitcast ptr-to-ptr
             - integer and pointer icmp, including null pointer equality
             - integer and pointer select
+            - pointer phi
           control:
             - br, switch, phi, ret
             - unreachable as runtime abort
@@ -310,6 +313,9 @@ module PFC
           tolerance:
             - common value attributes accepted as no-ops
             - trailing LLVM metadata attachments accepted as no-ops
+            - typed-pointer-style syntax accepted as ptr
+            - llvm.assume and llvm.dbg.* accepted as no-op intrinsics
+            - llvm.expect.* accepted as identity intrinsic
           libc:
             - putchar, getchar, puts
             - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags
@@ -323,6 +329,8 @@ module PFC
           "byte-addressed numeric globals with global writable and constant read-only semantics",
           "read-only global string byte memory for load/getelementptr/ptrtoint",
           "constant and dynamic getelementptr for integer element sizes",
+          "named struct alloca and struct field getelementptr",
+          "constant-count alloca, with dynamic-count alloca reserving tape-size capacity",
           "volatile load/store accepted as backend-equivalent memory access",
           "llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory",
           "llvm.lifetime.start/end accepted as no-op intrinsics"
@@ -335,7 +343,8 @@ module PFC
           "ptrtoint and tagged inttoptr for local/global/string pointer values",
           "bitcast ptr-to-ptr",
           "integer and pointer icmp, including null pointer equality",
-          "integer and pointer select"
+          "integer and pointer select",
+          "pointer phi"
         ],
         control: [
           "br, switch, phi, ret",
@@ -345,7 +354,10 @@ module PFC
         ],
         tolerance: [
           "common value attributes accepted as no-ops",
-          "trailing LLVM metadata attachments accepted as no-ops"
+          "trailing LLVM metadata attachments accepted as no-ops",
+          "typed-pointer-style syntax accepted as ptr",
+          "llvm.assume and llvm.dbg.* accepted as no-op intrinsics",
+          "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [
           "putchar, getchar, puts",
