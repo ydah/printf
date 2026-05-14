@@ -909,6 +909,14 @@ module PFC
           helper = output_bits == 64 ? "pf_output_u64_decimal" : "pf_output_u32_decimal"
           cast = unsigned_cast(output_bits).delete_prefix("(").delete_suffix(")")
           ["    if (#{helper}((#{cast})(#{value}), &#{count_name}) != 0) PF_ABORT();"]
+        when "x", "X", "o"
+          bits, value = typed_integer_value(argument, context:)
+          output_bits = printf_integer_bits(bits, length_modifier)
+          helper = output_bits == 64 ? "pf_output_u64_radix" : "pf_output_u32_radix"
+          cast = unsigned_cast(output_bits).delete_prefix("(").delete_suffix(")")
+          base = specifier.chr == "o" ? 8 : 16
+          digits = specifier.chr == "X" ? "0123456789ABCDEF" : "0123456789abcdef"
+          ["    if (#{helper}((#{cast})(#{value}), #{base}u, \"#{digits}\", &#{count_name}) != 0) PF_ABORT();"]
         when "c"
           if length_modifier
             raise Frontend::LLVMSubset::ParseError, "unsupported printf format: %#{length_modifier}#{specifier.chr}"

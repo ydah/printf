@@ -459,6 +459,26 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "pf_output_i64_decimal((long long)(-7), &pf_printf_count_0)"
   end
 
+  def test_emits_printf_for_radix_formats
+    source = <<~LLVM
+      @.fmt = private unnamed_addr constant [17 x i8] c"%x %X %o %llx\\00", align 1
+      declare i32 @printf(ptr, ...)
+
+      define i32 @main() {
+      entry:
+        %result = call i32 (ptr, ...) @printf(ptr @.fmt, i32 48879, i32 48879, i32 511, i64 4294967301)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "pf_output_u32_radix((unsigned int)(48879), 16u, \"0123456789abcdef\", &pf_printf_count_0)"
+    assert_includes generated, "pf_output_u32_radix((unsigned int)(48879), 16u, \"0123456789ABCDEF\", &pf_printf_count_0)"
+    assert_includes generated, "pf_output_u32_radix((unsigned int)(511), 8u, \"0123456789abcdef\", &pf_printf_count_0)"
+    assert_includes generated, "pf_output_u64_radix((unsigned long long)(4294967301), 16u, \"0123456789abcdef\", &pf_printf_count_0)"
+  end
+
   def test_reports_source_line_for_unsupported_llvm_instruction
     source = <<~LLVM
       define i32 @main() {
