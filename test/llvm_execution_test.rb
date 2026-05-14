@@ -56,6 +56,26 @@ class LLVMExecutionTest < Minitest::Test
     assert_equal "B", compile_llvm_source_and_run(source)
   end
 
+  def test_runs_global_integer_program
+    source = <<~LLVM
+      @.value = global i32 16961, align 4
+      @.items = constant [2 x i32] [i32 65, i32 66], align 4
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %low = load i8, ptr @.value, align 1
+        call i32 @putchar(i32 %low)
+        %second = getelementptr inbounds [2 x i32], ptr @.items, i64 0, i64 1
+        %ch = load i32, ptr %second, align 4
+        call i32 @putchar(i32 %ch)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "AB", compile_llvm_source_and_run(source)
+  end
+
   def test_runs_signed_extension_program
     source = <<~LLVM
       declare i32 @putchar(i32)

@@ -205,6 +205,7 @@ module PFC
             block_order:,
             blocks:,
             function_signatures: parse_function_signatures,
+            global_numeric_data: parse_global_numeric_data,
             global_strings: parse_global_strings,
             internal_functions:,
             source:,
@@ -274,6 +275,59 @@ module PFC
 
             strings[match[1]] = bytes
           end
+        end
+
+        def parse_global_numeric_data
+          source.each_line.each_with_object({}) do |line, globals|
+            stripped = line.sub(/;.*/, "").strip
+            next if stripped.empty?
+
+            if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+i(1|8|16|32|64)\s+(-?\d+|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = integer_bytes(match[3], match[2].to_i)
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\]\s+(zeroinitializer|\[(.*)\])(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = global_integer_array_bytes(match, stripped)
+            end
+          end
+        end
+
+        def global_integer_array_bytes(match, line)
+          count = match[2].to_i
+          bits = match[3].to_i
+          if match[4] == "zeroinitializer"
+            return Array.new(count * byte_width(bits), 0)
+          end
+
+          elements = Instruction.split_arguments(match[5])
+          if elements.length != count
+            raise parse_error("global array #{match[1]} has #{elements.length} elements, expected #{count}", line)
+          end
+
+          elements.flat_map do |element|
+            element_match = element.match(/\Ai#{bits}\s+(-?\d+|zeroinitializer)\z/)
+            unless element_match
+              raise parse_error("unsupported global array element: #{element}", line)
+            end
+
+            integer_bytes(element_match[1], bits)
+          end
+        end
+
+        def integer_bytes(raw_value, bits)
+          value = raw_value == "zeroinitializer" ? 0 : raw_value.to_i
+          unsigned_value = value & integer_mask(bits)
+          Array.new(byte_width(bits)) do |offset|
+            (unsigned_value >> (offset * 8)) & 255
+          end
+        end
+
+        def integer_mask(bits)
+          return 1 if bits == 1
+
+          (1 << bits) - 1
+        end
+
+        def byte_width(bits)
+          [(bits + 7) / 8, 1].max
         end
 
         def parse_function_signatures

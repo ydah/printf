@@ -56,6 +56,23 @@ class LLVMSubsetTest < Minitest::Test
     assert_equal [65, 10, 66, 0], parsed.fetch(:global_strings).fetch("@.msg")
   end
 
+  def test_parser_decodes_global_integer_data
+    source = <<~LLVM
+      @.value = global i32 16961, align 4
+      @.words = constant [3 x i16] [i16 65, i16 66, i16 256], align 2
+
+      define i32 @main() {
+      entry:
+        ret i32 0
+      }
+    LLVM
+
+    parsed = PFC::Frontend::LLVMSubset::Parser.parse(source)
+
+    assert_equal [65, 66, 0, 0], parsed.fetch(:global_numeric_data).fetch("@.value")
+    assert_equal [65, 0, 66, 0, 0, 1], parsed.fetch(:global_numeric_data).fetch("@.words")
+  end
+
   def test_parser_rejects_undefined_branch_label
     source = <<~LLVM
       define i32 @main() {
@@ -305,6 +322,32 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "pf_llvm_store(llvm_memory, pf_slot_index, (unsigned long long)(16961 & 4294967295u), 4);"
     assert_includes generated, "pf_slot_index = (int)(((0) + ((5) * 1)));"
     assert_includes generated, "pf_v_ch = (unsigned int)(pf_llvm_load(llvm_memory, pf_slot_index, 1) & 255u);"
+  end
+
+  def test_emits_global_integer_loads
+    source = <<~LLVM
+      @.value = global i32 16961, align 4
+      @.items = constant [2 x i32] [i32 65, i32 66], align 4
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %low = load i8, ptr @.value, align 1
+        call i32 @putchar(i32 %low)
+        %second = getelementptr inbounds [2 x i32], ptr @.items, i64 0, i64 1
+        %ch = load i32, ptr %second, align 4
+        call i32 @putchar(i32 %ch)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "enum { PF_LLVM_GLOBAL_MEMORY_SIZE = 12 };"
+    assert_includes generated, "unsigned char llvm_global_memory[PF_LLVM_GLOBAL_MEMORY_SIZE] = {65u, 66u, 0u, 0u, 65u, 0u, 0u, 0u, 66u, 0u, 0u, 0u};"
+    assert_includes generated, "pf_v_low = (unsigned int)(pf_llvm_load(llvm_global_memory, pf_slot_index, 1) & 255u);"
+    assert_includes generated, "pf_slot_index = (int)(((4) + ((0) * 8) + ((1) * 4)));"
+    assert_includes generated, "pf_v_ch = (unsigned int)(pf_llvm_load(llvm_global_memory, pf_slot_index, 4) & 4294967295u);"
   end
 
   def test_emits_memory_intrinsic_loops
