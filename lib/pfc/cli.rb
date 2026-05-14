@@ -288,8 +288,10 @@ module PFC
           memory:
             - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64
             - byte-addressed numeric globals, with global writable and constant read-only
+            - struct/array global initializers and aggregate load/store byte copies
             - read-only global string byte memory for load/getelementptr/ptrtoint
-            - constant and dynamic getelementptr for integer element sizes
+            - constant and dynamic getelementptr for integer, array, and struct element sizes
+            - constant-expression getelementptr pointer operands
             - named struct alloca and struct field getelementptr
             - constant-count alloca, with dynamic-count alloca reserving tape-size capacity
             - volatile load/store accepted as backend-equivalent memory access
@@ -305,15 +307,18 @@ module PFC
             - integer and pointer icmp, including null pointer equality
             - integer and pointer select
             - pointer phi
+            - extractvalue and insertvalue for scalar integer fields in aggregate values
           control:
             - br, switch, phi, ret
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
-            - void @main and nested non-recursive internal calls with integer and pointer arguments
+            - void @main and nested non-recursive internal calls with integer/pointer/void returns and integer/pointer arguments
           tolerance:
             - common value attributes accepted as no-ops
             - trailing LLVM metadata attachments accepted as no-ops
             - typed-pointer-style syntax accepted as ptr
+            - target datalayout used for pointer width and struct layout
+            - module-level metadata and attributes blocks accepted as no-ops
             - llvm.assume and llvm.dbg.* accepted as no-op intrinsics
             - llvm.expect.* accepted as identity intrinsic
           libc:
@@ -327,8 +332,10 @@ module PFC
         memory: [
           "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64",
           "byte-addressed numeric globals with global writable and constant read-only semantics",
+          "struct/array global initializers and aggregate load/store byte copies",
           "read-only global string byte memory for load/getelementptr/ptrtoint",
-          "constant and dynamic getelementptr for integer element sizes",
+          "constant and dynamic getelementptr for integer, array, and struct element sizes",
+          "constant-expression getelementptr pointer operands",
           "named struct alloca and struct field getelementptr",
           "constant-count alloca, with dynamic-count alloca reserving tape-size capacity",
           "volatile load/store accepted as backend-equivalent memory access",
@@ -344,18 +351,21 @@ module PFC
           "bitcast ptr-to-ptr",
           "integer and pointer icmp, including null pointer equality",
           "integer and pointer select",
-          "pointer phi"
+          "pointer phi",
+          "extractvalue and insertvalue for scalar integer fields in aggregate values"
         ],
         control: [
           "br, switch, phi, ret",
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
-          "void @main and nested non-recursive internal calls with integer and pointer arguments"
+          "void @main and nested non-recursive internal calls with integer/pointer/void returns and integer/pointer arguments"
         ],
         tolerance: [
           "common value attributes accepted as no-ops",
           "trailing LLVM metadata attachments accepted as no-ops",
           "typed-pointer-style syntax accepted as ptr",
+          "target datalayout used for pointer width and struct layout",
+          "module-level metadata and attributes blocks accepted as no-ops",
           "llvm.assume and llvm.dbg.* accepted as no-op intrinsics",
           "llvm.expect.* accepted as identity intrinsic"
         ],
