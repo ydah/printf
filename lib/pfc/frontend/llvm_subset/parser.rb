@@ -172,7 +172,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*getelementptr(\s+inbounds)?\s+(.+?),\s+ptr\s+(#{POINTER_NAME}),\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*getelementptr(\s+inbounds)?\s+(.+?),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+(.+)\z/)
             return unless match
 
             @destination = match[1]
@@ -195,7 +195,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @destination = match[1]
@@ -209,7 +209,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @bits = match[1].to_i
@@ -303,7 +303,7 @@ module PFC
               return
             end
 
-            if (match = text.match(/\A(#{NAME})\s*=\s*ptrtoint\s+ptr\s+(#{POINTER_NAME})\s+to\s+i(1|8|16|32|64)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})\s+to\s+i(1|8|16|32|64)\z/))
               @destination = match[1]
               @operator = "ptrtoint"
               @from_type = "ptr"
@@ -313,7 +313,7 @@ module PFC
               return
             end
 
-            if (match = text.match(/\A(#{NAME})\s*=\s*bitcast\s+ptr\s+(.+?)\s+to\s+ptr\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*bitcast\s+(?:ptr|.+?\*)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/))
               @destination = match[1]
               @operator = "bitcast"
               @from_type = "ptr"
@@ -322,7 +322,7 @@ module PFC
               return
             end
 
-            match = text.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+ptr\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/)
             return unless match
 
             @destination = match[1]
@@ -352,16 +352,26 @@ module PFC
         end
 
         class PhiInstruction < Instruction
-          attr_reader :bits, :destination, :incoming
+          attr_reader :bits, :destination, :incoming, :value_type
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/)
+            if (match = text.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/))
+              @destination = match[1]
+              @bits = match[2].to_i
+              @value_type = "i#{match[2]}"
+              @incoming = match[3].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/).map do |value, label|
+                [value, label]
+              end.freeze
+              return
+            end
+
+            match = text.match(/\A(#{NAME})\s*=\s*phi\s+(?:ptr|.+?\*)\s+(.+)\z/)
             return unless match
 
             @destination = match[1]
-            @bits = match[2].to_i
-            @incoming = match[3].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/).map do |value, label|
+            @value_type = "ptr"
+            @incoming = match[2].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/).map do |value, label|
               [value, label]
             end.freeze
           end
@@ -405,7 +415,8 @@ module PFC
             global_strings: parse_global_strings,
             internal_functions:,
             source:,
-            source_line_numbers:
+            source_line_numbers:,
+            struct_types: parse_struct_types
           }
         end
 
@@ -470,6 +481,16 @@ module PFC
             end
 
             strings[match[1]] = bytes
+          end
+        end
+
+        def parse_struct_types
+          source.each_line.each_with_object({}) do |line, structs|
+            stripped = line.sub(/;.*/, "").strip
+            match = stripped.match(/\A(%[-A-Za-z$._0-9]+)\s*=\s*type\s+(?:<)?\{\s*(.*?)\s*\}(?:>)?\z/)
+            next unless match
+
+            structs[match[1]] = Instruction.split_arguments(match[2]).freeze
           end
         end
 
@@ -652,7 +673,7 @@ module PFC
               next({ type: "...", name: nil })
             end
 
-            type_pattern = allow_pointer ? /i(?:1|8|16|32|64)|ptr/ : /i(?:1|8|16|32|64)/
+            type_pattern = allow_pointer ? /i(?:1|8|16|32|64)|ptr|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
             match = stripped.match(/\A(#{type_pattern})(?:\s+(.+))?\z/)
             raise ParseError, "unsupported function parameter: #{parameter}" unless match
             name = match[2]&.match(/#{NAME}/)&.[](0)
@@ -660,8 +681,12 @@ module PFC
               raise ParseError, "unsupported function parameter: #{parameter}"
             end
 
-            { type: match[1], name: }
+            { type: pointer_type?(match[1]) ? "ptr" : match[1], name: }
           end
+        end
+
+        def pointer_type?(type)
+          type == "ptr" || type.end_with?("*")
         end
 
         def normalized_lines(body)
@@ -688,6 +713,7 @@ module PFC
           normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?call\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\b/, '\1call \2')
           normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?load\s+volatile\s+/, '\1load ')
           normalized = normalized.sub(/\Astore\s+volatile\s+/, "store ")
+          normalized = normalized.sub(/\s+#\d+\z/, "")
           loop do
             stripped = normalized.sub(/,\s*![A-Za-z0-9_.-]+(?:\s+![A-Za-z0-9_.-]+|\s+\{[^}]*\})?\z/, "")
             break if stripped == normalized
