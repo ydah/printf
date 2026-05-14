@@ -3,6 +3,8 @@
 require_relative "test_helper"
 
 class LLVMFeatureExtensionTest < Minitest::Test
+  include PFCTestHelper
+
   def test_printf_width_and_precision_formats
     source = <<~LLVM
       @.fmt = private unnamed_addr constant [29 x i8] c"n=%05d x=%.4x s=%5.2s c=%3c\\0A\\00"

@@ -3,6 +3,8 @@
 require_relative "test_helper"
 
 class LLVMCompatibilityTest < Minitest::Test
+  include PFCTestHelper
+
   def test_pointer_phi_selects_runtime_pointer
     source = <<~LLVM
       declare i32 @putchar(i32)
