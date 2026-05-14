@@ -494,7 +494,7 @@ module PFC
           value = line.value
           pointer = line.pointer
         else
-          match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+          match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
           bits = match[1].to_i
@@ -515,7 +515,7 @@ module PFC
           bits = line.bits
           pointer = line.pointer
         else
-          match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+          match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
           destination = match[1]
@@ -923,7 +923,7 @@ module PFC
           value = line.value
           pointer = line.pointer
         else
-          match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+          match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
           bits = match[1].to_i
@@ -944,7 +944,7 @@ module PFC
           bits = line.bits
           pointer = line.pointer
         else
-          match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+          match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
           destination = match[1]

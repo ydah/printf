@@ -172,7 +172,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*getelementptr(\s+inbounds)?\s+(.+?),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*getelementptr(\s+inbounds)?\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME}),\s+(.+)\z/)
             return unless match
 
             @destination = match[1]
@@ -195,7 +195,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @destination = match[1]
@@ -209,7 +209,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @bits = match[1].to_i
