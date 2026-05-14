@@ -14,7 +14,8 @@ module PFC
       POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
       GlobalStringPointer = Struct.new(:name, :offset, keyword_init: true)
       GlobalMemoryPointer = Struct.new(:name, :offset, keyword_init: true)
-      MemoryAddress = Struct.new(:limit, :memory, :name, :offset, :readonly, keyword_init: true)
+      EncodedPointer = Struct.new(:value, keyword_init: true)
+      MemoryAddress = Struct.new(:invalid_expression, :limit, :memory, :name, :offset, :readonly, :readonly_expression, keyword_init: true)
       BUILTIN_FUNCTION_SIGNATURES = {
         "getchar" => { return_type: "i32", parameter_types: [], varargs: false },
         "printf" => { return_type: "i32", parameter_types: ["ptr"], varargs: true },
@@ -30,6 +31,7 @@ module PFC
         @global_numeric_data = parsed.fetch(:global_numeric_data)
         @global_numeric_mutability = parsed.fetch(:global_numeric_mutability)
         @global_strings = parsed.fetch(:global_strings)
+        @global_string_offsets = build_global_string_offsets
         @internal_functions = parsed.fetch(:internal_functions)
         @blocks = parsed.fetch(:blocks)
         @block_order = parsed.fetch(:block_order)
@@ -99,7 +101,7 @@ module PFC
 
       private
 
-      attr_reader :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
+      attr_reader :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -116,6 +118,14 @@ module PFC
         end
 
         [offsets, bytes]
+      end
+
+      def build_global_string_offsets
+        offset = 0
+        global_strings.each_with_object({}) do |(name, bytes), offsets|
+          offsets[name] = offset
+          offset += bytes.length + 1
+        end
       end
 
       def analyze_global_numeric_pointers
@@ -151,6 +161,8 @@ module PFC
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*alloca\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*getelementptr\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*inttoptr\b/)
+          next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*bitcast\s+ptr\b/)
+          next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*select\s+i1\s+.+?,\s+ptr\b/)
 
           registers[lhs] = c_value_name(lhs)
         end
@@ -220,6 +232,10 @@ module PFC
           "",
           "    enum { PF_LLVM_MEMORY_SIZE = #{[slot_count, 1].max} };",
           "    enum { PF_LLVM_GLOBAL_MEMORY_SIZE = #{[global_numeric_bytes.length, 1].max} };",
+          "    const unsigned long long PF_LLVM_GLOBAL_POINTER_TAG = 9223372036854775808ull;",
+          "    const unsigned long long PF_LLVM_READONLY_POINTER_TAG = 4611686018427387904ull;",
+          "    const unsigned long long PF_LLVM_STRING_POINTER_TAG = 2305843009213693952ull;",
+          "    const unsigned long long PF_LLVM_POINTER_OFFSET_MASK = 2305843009213693951ull;",
           "    unsigned char llvm_memory[PF_LLVM_MEMORY_SIZE] = {0};",
           "    unsigned char llvm_global_memory[PF_LLVM_GLOBAL_MEMORY_SIZE] = {#{global_memory_initializer}};",
           "    int pf_return_code = 0;",
@@ -357,7 +373,7 @@ module PFC
         width = byte_width(bits)
         address = memory_address(pointer)
         ensure_writable_address!(address)
-        slot_lines(address, width) + [
+        dynamic_writable_address_lines(address) + slot_lines(address, width) + [
           "    pf_llvm_store(#{address.memory}, pf_slot_index, (unsigned long long)(#{llvm_value(value)} & #{integer_mask_literal(bits)}), #{width});"
         ]
       end
@@ -404,6 +420,21 @@ module PFC
       end
 
       def emit_select(line)
+        if line.respond_to?(:value_type) && line.value_type == "ptr"
+          condition = llvm_value(line.condition)
+          true_value = encoded_pointer_value(line.true_value)
+          false_value = encoded_pointer_value(line.false_value)
+          pointers[line.destination] = EncodedPointer.new(value: "(((#{condition}) != 0u) ? (#{true_value}) : (#{false_value}))")
+          return []
+        end
+
+        if line.respond_to?(:destination) && line.respond_to?(:condition) && line.respond_to?(:bits) && line.bits
+          condition = llvm_value(line.condition)
+          true_value = llvm_value(line.true_value)
+          false_value = llvm_value(line.false_value)
+          return ["    #{register(line.destination)} = #{unsigned_cast(line.bits)}(((#{condition}) != 0u ? (#{true_value}) : (#{false_value})) & #{integer_mask_literal(line.bits)});"]
+        end
+
         match = line.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32|64)\s+(.+?),\s+i(?:1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported select: #{line}" unless match
 
@@ -418,6 +449,7 @@ module PFC
         if line.respond_to?(:destination) && line.respond_to?(:operator) && line.operator
           return emit_ptrtoint_cast(line.destination, line.value, line.to_bits) if line.operator == "ptrtoint"
           return emit_inttoptr_cast(line.destination, line.value) if line.operator == "inttoptr"
+          return emit_pointer_bitcast(line.destination, line.value) if line.operator == "bitcast"
 
           if line.from_bits
             destination = line.destination
@@ -430,6 +462,8 @@ module PFC
           return emit_ptrtoint_cast(match[1], match[2], match[3].to_i)
         elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+ptr\z/))
           return emit_inttoptr_cast(match[1], match[2])
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*bitcast\s+ptr\s+(.+?)\s+to\s+ptr\z/))
+          return emit_pointer_bitcast(match[1], match[2])
         else
           match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
@@ -446,25 +480,37 @@ module PFC
       end
 
       def emit_ptrtoint_cast(destination, value, to_bits, context: nil)
-        address = memory_address(value, context:)
+        encoded = encoded_pointer_value(value, context:)
         target = context ? inline_register(context, destination) : register(destination)
-        ["    #{target} = #{unsigned_cast(to_bits)}(((unsigned long long)(#{address.offset})) & #{integer_mask_literal(to_bits)});"]
+        ["    #{target} = #{unsigned_cast(to_bits)}((#{encoded}) & #{integer_mask_literal(to_bits)});"]
       end
 
       def emit_inttoptr_cast(destination, value, context: nil)
         pointer = context ? inline_value(value, context) : llvm_value(value)
         pointer_map = context ? context.fetch(:pointers) : pointers
-        pointer_map[destination] = pointer
+        pointer_map[destination] = EncodedPointer.new(value: pointer)
+        []
+      end
+
+      def emit_pointer_bitcast(destination, value, context: nil)
+        pointer_map = context ? context.fetch(:pointers) : pointers
+        pointer_map[destination] = pointer_binding(value, context:)
         []
       end
 
       def emit_icmp(line)
+        if line.respond_to?(:operand_type) && line.operand_type == "ptr"
+          return emit_pointer_icmp(line.destination, line.predicate, line.left, line.right)
+        end
+
         if line.respond_to?(:destination) && line.respond_to?(:predicate) && line.respond_to?(:bits) && line.bits
           destination = line.destination
           predicate = line.predicate
           bits = line.bits
           left = llvm_value(line.left)
           right = llvm_value(line.right)
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne)\s+ptr\s+(.+?),\s+(.+)\z/))
+          return emit_pointer_icmp(match[1], match[2], match[3], match[4])
         else
           match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
@@ -481,6 +527,18 @@ module PFC
           right = signed_expression(right, bits)
         end
         ["    #{register(destination)} = ((#{left}) #{operator} (#{right})) ? 1u : 0u;"]
+      end
+
+      def emit_pointer_icmp(destination, predicate, left, right, context: nil)
+        unless %w[eq ne].include?(predicate)
+          raise Frontend::LLVMSubset::ParseError, "unsupported pointer icmp predicate: #{predicate}"
+        end
+
+        target = context ? inline_register(context, destination) : register(destination)
+        operator = predicate == "eq" ? "==" : "!="
+        left_value = encoded_pointer_value(left, context:)
+        right_value = encoded_pointer_value(right, context:)
+        ["    #{target} = ((#{left_value}) #{operator} (#{right_value})) ? 1u : 0u;"]
       end
 
       def emit_call(line)
@@ -554,6 +612,11 @@ module PFC
         context = inline_context(prefix, return_destination, function, call_stack + [function.fetch(:name)])
         lines = inline_declarations(context, function)
         function.fetch(:params).zip(arguments).each_with_index do |(param, argument), index|
+          if function.fetch(:param_types).fetch(index) == "ptr"
+            context.fetch(:pointers)[param] = pointer_binding(argument, context: caller_context)
+            next
+          end
+
           local = context.fetch(:values).fetch(param)
           value = caller_context ? inline_value(argument, caller_context) : llvm_value(argument)
           lines << "    #{local} = (unsigned long long)(#{value});"
@@ -572,6 +635,8 @@ module PFC
         values = {}
         pointers = function.fetch(:allocations).dup
         function.fetch(:params).each_with_index do |param, index|
+          next if function.fetch(:param_types).fetch(index) == "ptr"
+
           values[param] = "#{prefix}_arg#{index}"
         end
         inline_register_names(function).each do |name|
@@ -597,6 +662,8 @@ module PFC
           next nil if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*alloca\b/)
           next nil if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*getelementptr\b/)
           next nil if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*inttoptr\b/)
+          next nil if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*bitcast\s+ptr\b/)
+          next nil if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*select\s+i1\s+.+?,\s+ptr\b/)
 
           lhs
         end.uniq
@@ -605,7 +672,9 @@ module PFC
       def inline_declarations(context, function)
         declared = []
         lines = []
-        function.fetch(:params).each do |param|
+        function.fetch(:params).each_with_index do |param, index|
+          next if function.fetch(:param_types).fetch(index) == "ptr"
+
           name = context.fetch(:values).fetch(param)
           lines << "    unsigned long long #{name} = 0;"
           declared << name
@@ -719,7 +788,7 @@ module PFC
         width = byte_width(bits)
         address = memory_address(pointer, context:)
         ensure_writable_address!(address)
-        inline_slot_lines(address, width) + [
+        dynamic_writable_address_lines(address) + inline_slot_lines(address, width) + [
           "    pf_llvm_store(#{address.memory}, pf_slot_index, (unsigned long long)(#{inline_value(value, context)} & #{integer_mask_literal(bits)}), #{width});"
         ]
       end
@@ -767,6 +836,22 @@ module PFC
       end
 
       def emit_inline_select(line, context)
+        if line.respond_to?(:value_type) && line.value_type == "ptr"
+          condition = inline_value(line.condition, context)
+          true_value = encoded_pointer_value(line.true_value, context:)
+          false_value = encoded_pointer_value(line.false_value, context:)
+          context.fetch(:pointers)[line.destination] = EncodedPointer.new(value: "(((#{condition}) != 0u) ? (#{true_value}) : (#{false_value}))")
+          return []
+        end
+
+        if line.respond_to?(:destination) && line.respond_to?(:condition) && line.respond_to?(:bits) && line.bits
+          local = inline_register(context, line.destination)
+          condition = inline_value(line.condition, context)
+          true_value = inline_value(line.true_value, context)
+          false_value = inline_value(line.false_value, context)
+          return ["    #{local} = #{unsigned_cast(line.bits)}(((#{condition}) != 0u ? (#{true_value}) : (#{false_value})) & #{integer_mask_literal(line.bits)});"]
+        end
+
         match = line.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32|64)\s+(.+?),\s+i(?:1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported select: #{line}" unless match
 
@@ -781,6 +866,7 @@ module PFC
         if line.respond_to?(:destination) && line.respond_to?(:operator) && line.operator
           return emit_ptrtoint_cast(line.destination, line.value, line.to_bits, context:) if line.operator == "ptrtoint"
           return emit_inttoptr_cast(line.destination, line.value, context:) if line.operator == "inttoptr"
+          return emit_pointer_bitcast(line.destination, line.value, context:) if line.operator == "bitcast"
 
           if line.from_bits
             destination = line.destination
@@ -793,6 +879,8 @@ module PFC
           return emit_ptrtoint_cast(match[1], match[2], match[3].to_i, context:)
         elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+ptr\z/))
           return emit_inttoptr_cast(match[1], match[2], context:)
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*bitcast\s+ptr\s+(.+?)\s+to\s+ptr\z/))
+          return emit_pointer_bitcast(match[1], match[2], context:)
         else
           match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
@@ -810,12 +898,18 @@ module PFC
       end
 
       def emit_inline_icmp(line, context)
+        if line.respond_to?(:operand_type) && line.operand_type == "ptr"
+          return emit_pointer_icmp(line.destination, line.predicate, line.left, line.right, context:)
+        end
+
         if line.respond_to?(:destination) && line.respond_to?(:predicate) && line.respond_to?(:bits) && line.bits
           destination = line.destination
           predicate = line.predicate
           bits = line.bits
           left = inline_value(line.left, context)
           right = inline_value(line.right, context)
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne)\s+ptr\s+(.+?),\s+(.+)\z/))
+          return emit_pointer_icmp(match[1], match[2], match[3], match[4], context:)
         else
           match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported icmp: #{line}" unless match
@@ -1612,6 +1706,8 @@ module PFC
           "        long long #{prefix}_len = (long long)(#{length});",
           "        long long #{prefix}_offset = 0;",
           "        unsigned char #{prefix}_value = (unsigned char)(#{byte_value});",
+          *dynamic_valid_address_lines(destination),
+          *dynamic_writable_address_lines(destination),
           "        if (#{prefix}_dst < 0 || #{prefix}_len < 0 || #{prefix}_dst + #{prefix}_len > #{destination.limit}) {",
           "            fprintf(stderr, \"pfc runtime error: LLVM memory intrinsic out of range\\n\");",
           "            PF_ABORT();",
@@ -1635,6 +1731,9 @@ module PFC
           "        long long #{prefix}_src = (long long)(#{source.offset});",
           "        long long #{prefix}_len = (long long)(#{length});",
           "        long long #{prefix}_offset = 0;",
+          *dynamic_valid_address_lines(destination),
+          *dynamic_valid_address_lines(source),
+          *dynamic_writable_address_lines(destination),
           "        if (#{prefix}_dst < 0 || #{prefix}_src < 0 || #{prefix}_len < 0 || #{prefix}_dst + #{prefix}_len > #{destination.limit} || #{prefix}_src + #{prefix}_len > #{source.limit}) {",
           "            fprintf(stderr, \"pfc runtime error: LLVM memory intrinsic out of range\\n\");",
           "            PF_ABORT();",
@@ -1658,6 +1757,9 @@ module PFC
           "        long long #{prefix}_src = (long long)(#{source.offset});",
           "        long long #{prefix}_len = (long long)(#{length});",
           "        long long #{prefix}_offset = 0;",
+          *dynamic_valid_address_lines(destination),
+          *dynamic_valid_address_lines(source),
+          *dynamic_writable_address_lines(destination),
           "        if (#{prefix}_dst < 0 || #{prefix}_src < 0 || #{prefix}_len < 0 || #{prefix}_dst + #{prefix}_len > #{destination.limit} || #{prefix}_src + #{prefix}_len > #{source.limit}) {",
           "            fprintf(stderr, \"pfc runtime error: LLVM memory intrinsic out of range\\n\");",
           "            PF_ABORT();",
@@ -1787,7 +1889,11 @@ module PFC
       end
 
       def memory_address(name, context: nil)
+        return encoded_memory_address("0ull") if name.to_s.strip == "null"
+
         pointer = resolve_pointer(name, context:)
+        return encoded_memory_address(pointer.value) if pointer.is_a?(EncodedPointer)
+
         if pointer.is_a?(GlobalStringPointer)
           raise Frontend::LLVMSubset::ParseError, "global string pointer is only supported for puts/printf: #{name}"
         end
@@ -1797,11 +1903,23 @@ module PFC
             memory: "llvm_global_memory",
             name: pointer.name,
             readonly: !global_numeric_mutability.fetch(pointer.name, false),
+            readonly_expression: nil,
             offset: pointer.offset
           )
         end
 
         MemoryAddress.new(limit: "PF_LLVM_MEMORY_SIZE", memory: "llvm_memory", offset: pointer, readonly: false)
+      end
+
+      def encoded_memory_address(encoded)
+        MemoryAddress.new(
+          invalid_expression: "(((#{encoded}) & PF_LLVM_STRING_POINTER_TAG) != 0ull)",
+          limit: "(((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? PF_LLVM_GLOBAL_MEMORY_SIZE : PF_LLVM_MEMORY_SIZE)",
+          memory: "(((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? llvm_global_memory : llvm_memory)",
+          offset: "((#{encoded}) & PF_LLVM_POINTER_OFFSET_MASK)",
+          readonly: false,
+          readonly_expression: "(((#{encoded}) & PF_LLVM_READONLY_POINTER_TAG) != 0ull)"
+        )
       end
 
       def resolve_pointer(name, context:)
@@ -1825,6 +1943,54 @@ module PFC
         return unless address.readonly
 
         raise Frontend::LLVMSubset::ParseError, "cannot write to constant global: #{address.name}"
+      end
+
+      def dynamic_writable_address_lines(address)
+        return [] unless address.readonly_expression
+
+        [
+          "    if (#{address.readonly_expression}) {",
+          "        fprintf(stderr, \"pfc runtime error: LLVM write to constant global through pointer\\n\");",
+          "        PF_ABORT();",
+          "    }"
+        ]
+      end
+
+      def dynamic_valid_address_lines(address)
+        return [] unless address.invalid_expression
+
+        [
+          "    if (#{address.invalid_expression}) {",
+          "        fprintf(stderr, \"pfc runtime error: LLVM string pointer dereference is unsupported\\n\");",
+          "        PF_ABORT();",
+          "    }"
+        ]
+      end
+
+      def encoded_pointer_value(raw, context: nil)
+        token = raw.to_s.strip.split(/\s+/).last
+        return "0ull" if token == "null"
+
+        pointer = pointer_binding(token, context:)
+        return pointer.value if pointer.is_a?(EncodedPointer)
+        return "((unsigned long long)(#{pointer}))" unless pointer.is_a?(GlobalMemoryPointer) || pointer.is_a?(GlobalStringPointer)
+
+        if pointer.is_a?(GlobalStringPointer)
+          offset = global_string_offsets.fetch(pointer.name) + pointer.offset
+          return "((unsigned long long)(#{offset}) | PF_LLVM_GLOBAL_POINTER_TAG | PF_LLVM_READONLY_POINTER_TAG | PF_LLVM_STRING_POINTER_TAG)"
+        end
+
+        tags = ["PF_LLVM_GLOBAL_POINTER_TAG"]
+        tags << "PF_LLVM_READONLY_POINTER_TAG" unless global_numeric_mutability.fetch(pointer.name, false)
+        "((unsigned long long)(#{pointer.offset}) | #{tags.join(' | ')})"
+      end
+
+      def pointer_binding(raw, context: nil)
+        token = raw.to_s.strip.split(/\s+/).last
+        return EncodedPointer.new(value: "0ull") if token == "null"
+        return GlobalStringPointer.new(name: token, offset: 0) if global_strings.key?(token)
+
+        resolve_pointer(token, context:)
       end
 
       def register(name)
@@ -1878,7 +2044,16 @@ module PFC
       end
 
       def slot_lines(address, width)
-        [
+        lines = []
+        if address.invalid_expression
+          lines.concat([
+            "    if (#{address.invalid_expression}) {",
+            "        fprintf(stderr, \"pfc runtime error: LLVM string pointer dereference is unsupported\\n\");",
+            "        PF_ABORT();",
+            "    }"
+          ])
+        end
+        lines + [
           "    pf_slot_index = (int)(#{address.offset});",
           "    if (pf_slot_index < 0 || pf_slot_index + #{width} > #{address.limit}) {",
           "        fprintf(stderr, \"pfc runtime error: LLVM memory access out of range: %d\\n\", pf_slot_index);",
@@ -1888,7 +2063,16 @@ module PFC
       end
 
       def inline_slot_lines(address, width)
-        [
+        lines = []
+        if address.invalid_expression
+          lines.concat([
+            "    if (#{address.invalid_expression}) {",
+            "        fprintf(stderr, \"pfc runtime error: LLVM string pointer dereference is unsupported\\n\");",
+            "        PF_ABORT();",
+            "    }"
+          ])
+        end
+        lines + [
           "    pf_slot_index = (int)(#{address.offset});",
           "    if (pf_slot_index < 0 || pf_slot_index + #{width} > #{address.limit}) {",
           "        fprintf(stderr, \"pfc runtime error: LLVM memory access out of range: %d\\n\", pf_slot_index);",

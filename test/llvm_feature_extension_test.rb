@@ -74,4 +74,104 @@ class LLVMFeatureExtensionTest < Minitest::Test
 
     assert_equal "B", compile_llvm_source_and_run(source)
   end
+
+  def test_global_pointer_can_roundtrip_through_integer_casts
+    source = <<~LLVM
+      @.cell = global i8 65
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %address = ptrtoint ptr @.cell to i64
+        %pointer = inttoptr i64 %address to ptr
+        store i8 66, ptr %pointer
+        %value = load i8, ptr @.cell
+        call i32 @putchar(i32 %value)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_constant_global_integer_pointer_roundtrip_keeps_readonly_tag
+    source = <<~LLVM
+      @.cell = constant i8 65
+
+      define i32 @main() {
+      entry:
+        %address = ptrtoint ptr @.cell to i64
+        %pointer = inttoptr i64 %address to ptr
+        store i8 66, ptr %pointer
+        ret i32 0
+      }
+    LLVM
+
+    c_source = PFC::Backend::LLVMCEmitter.new(source).emit
+    assert_includes c_source, "PF_LLVM_READONLY_POINTER_TAG"
+    assert_includes c_source, "LLVM write to constant global through pointer"
+  end
+
+  def test_pointer_icmp_with_null
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %pointer = inttoptr i64 0 to ptr
+        %is_null = icmp eq ptr %pointer, null
+        %ch = select i1 %is_null, i32 66, i32 78
+        call i32 @putchar(i32 %ch)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_internal_function_accepts_pointer_argument_and_bitcast
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define void @write(ptr %target) {
+      entry:
+        store i8 66, ptr %target
+        ret void
+      }
+
+      define i32 @main() {
+      entry:
+        %buffer = alloca [1 x i8]
+        %slot = getelementptr [1 x i8], ptr %buffer, i32 0, i32 0
+        %casted = bitcast ptr %slot to ptr
+        call void @write(ptr %casted)
+        %value = load i8, ptr %slot
+        call i32 @putchar(i32 %value)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_select_can_choose_pointer_values
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %left = alloca i8
+        %right = alloca i8
+        store i8 65, ptr %left
+        store i8 66, ptr %right
+        %selected = select i1 1, ptr %right, ptr %left
+        %value = load i8, ptr %selected
+        call i32 @putchar(i32 %value)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
 end

@@ -23,6 +23,7 @@ module PFC
             when :store then StoreInstruction.new(text)
             when :binary then BinaryInstruction.new(text)
             when :icmp then ICmpInstruction.new(text)
+            when :select then SelectInstruction.new(text)
             when :cast then CastInstruction.new(text)
             when :switch then SwitchInstruction.new(text)
             when :phi then PhiInstruction.new(text)
@@ -120,7 +121,7 @@ module PFC
             return :load if text.include?(" load ")
             return :binary if text.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
             return :select if text.match?(/\A#{NAME}\s*=\s*select\b/)
-            return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr)\b/)
+            return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr|bitcast)\b/)
             return :icmp if text.match?(/\A#{NAME}\s*=\s*icmp\b/)
             return :call if text.include?("call ")
             return :switch if text.start_with?("switch ")
@@ -234,18 +235,54 @@ module PFC
         end
 
         class ICmpInstruction < Instruction
-          attr_reader :bits, :destination, :left, :predicate, :right
+          attr_reader :bits, :destination, :left, :operand_type, :predicate, :right
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/))
+              @destination = match[1]
+              @predicate = match[2]
+              @bits = match[3].to_i
+              @operand_type = "i#{match[3]}"
+              @left = match[4]
+              @right = match[5]
+              return
+            end
+
+            match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne)\s+ptr\s+(.+?),\s+(.+)\z/)
             return unless match
 
             @destination = match[1]
             @predicate = match[2]
-            @bits = match[3].to_i
-            @left = match[4]
-            @right = match[5]
+            @operand_type = "ptr"
+            @left = match[3]
+            @right = match[4]
+          end
+        end
+
+        class SelectInstruction < Instruction
+          attr_reader :bits, :condition, :destination, :false_value, :true_value, :value_type
+
+          def initialize(text)
+            super
+            if (match = text.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32|64)\s+(.+?),\s+i(?:1|8|16|32|64)\s+(.+)\z/))
+              @destination = match[1]
+              @condition = match[2]
+              @bits = match[3].to_i
+              @value_type = "i#{match[3]}"
+              @true_value = match[4]
+              @false_value = match[5]
+              return
+            end
+
+            match = text.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+ptr\s+(.+?),\s+ptr\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @condition = match[2]
+            @value_type = "ptr"
+            @true_value = match[3]
+            @false_value = match[4]
           end
         end
 
@@ -272,6 +309,15 @@ module PFC
               @value = match[2]
               @to_bits = match[3].to_i
               @to_type = "i#{match[3]}"
+              return
+            end
+
+            if (match = text.match(/\A(#{NAME})\s*=\s*bitcast\s+ptr\s+(.+?)\s+to\s+ptr\z/))
+              @destination = match[1]
+              @operator = "bitcast"
+              @from_type = "ptr"
+              @value = match[2]
+              @to_type = "ptr"
               return
             end
 
@@ -394,7 +440,7 @@ module PFC
 
             unless name == "main"
               order, blocks = parse_function_blocks(body.join)
-              parameter_declarations = parse_parameter_declarations(match[3], require_names: true, allow_pointer: false, allow_varargs: false)
+              parameter_declarations = parse_parameter_declarations(match[3], require_names: true, allow_pointer: true, allow_varargs: false)
               functions[name] = {
                 allocations: {},
                 blocks:,
