@@ -28,6 +28,7 @@ module PFC
         @source = parsed.fetch(:source)
         @tape_size = Integer(tape_size)
         @function_signatures = parsed.fetch(:function_signatures)
+        @target_datalayout = parsed.fetch(:target_datalayout)
         @global_numeric_data = parsed.fetch(:global_numeric_data)
         @global_numeric_mutability = parsed.fetch(:global_numeric_mutability)
         @global_strings = parsed.fetch(:global_strings)
@@ -42,7 +43,9 @@ module PFC
         @slot_count = 0
         @pointers = {}
         @global_numeric_offsets, @global_numeric_bytes = build_global_numeric_layout
+        @aggregate_registers = {}
         @registers = {}
+        @aggregate_copy_index = 0
         @inline_call_index = 0
         @memory_intrinsic_index = 0
         @printf_call_index = 0
@@ -104,7 +107,7 @@ module PFC
 
       private
 
-      attr_reader :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :struct_types, :tape_size
+      attr_reader :aggregate_registers, :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :struct_types, :target_datalayout, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -174,6 +177,10 @@ module PFC
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*inttoptr\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*bitcast\s+(?:ptr|.+?\*)\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*select\s+i1\s+.+?,\s+ptr\b/)
+          if (match = line.match(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|insertvalue)\s+(.+?)(?:,|\s+)/)) && aggregate_type?(match[1])
+            aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(match[1]), type: match[1] }
+            next
+          end
 
           registers[lhs] = c_value_name(lhs)
           pointers[lhs] = EncodedPointer.new(value: registers.fetch(lhs)) if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*phi\s+(?:ptr|.+?\*)\b/)
@@ -211,10 +218,17 @@ module PFC
       def type_size(raw_type)
         type = raw_type.strip
         return byte_width(Regexp.last_match(1).to_i) if type.match(/\Ai(1|8|16|32|64)\z/)
-        return 8 if pointer_type_name?(type)
+        return pointer_size if pointer_type_name?(type)
         return type_size(Regexp.last_match(2)) * Regexp.last_match(1).to_i if type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
         return struct_layout(type).fetch(:size) if struct_type?(type)
         raise Frontend::LLVMSubset::ParseError, "unsupported LLVM type: #{raw_type}"
+      end
+
+      def pointer_size
+        return 8 unless target_datalayout
+
+        match = target_datalayout.match(/(?:\A|-)p(?::\d+)?:([0-9]+)/)
+        match ? byte_width(match[1].to_i) : 8
       end
 
       def type_align(raw_type)
@@ -300,6 +314,48 @@ module PFC
         offset
       end
 
+      def aggregate_type?(type)
+        stripped = type.to_s.strip
+        struct_type?(stripped) || stripped.match?(/\A\[\d+\s+x\s+.+\]\z/)
+      end
+
+      def aggregate_register(name)
+        aggregate_registers.fetch(name) do
+          raise Frontend::LLVMSubset::ParseError, "unknown aggregate register: #{name}"
+        end
+      end
+
+      def aggregate_index_info(type, indices)
+        offset = 0
+        current_type = type.strip
+        indices.each do |index|
+          if current_type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+            current_type = Regexp.last_match(2)
+            offset += index * type_size(current_type)
+          elsif struct_type?(current_type)
+            layout = struct_layout(current_type)
+            offset += layout.fetch(:field_offsets).fetch(index)
+            current_type = layout.fetch(:fields).fetch(index)
+          else
+            raise Frontend::LLVMSubset::ParseError, "unsupported aggregate index into #{current_type}"
+          end
+        end
+        [offset, current_type]
+      end
+
+      def aggregate_value_bytes(value, _value_type)
+        return aggregate_register(value).fetch(:name) if aggregate_registers.key?(value)
+        return nil if %w[zeroinitializer undef poison].include?(value)
+
+        raise Frontend::LLVMSubset::ParseError, "unsupported aggregate value: #{value}"
+      end
+
+      def next_aggregate_copy_prefix
+        name = "pf_agg_#{@aggregate_copy_index}"
+        @aggregate_copy_index += 1
+        name
+      end
+
       def dump_blocks(order, block_map, indent:)
         order.flat_map do |label|
           lines = ["#{indent}block #{label}:"]
@@ -367,6 +423,9 @@ module PFC
         registers.each_value do |name|
           lines << "    unsigned long long #{name} = 0;"
         end
+        aggregate_registers.each_value do |aggregate|
+          lines << "    unsigned char #{aggregate.fetch(:name)}[#{aggregate.fetch(:size)}] = {0};"
+        end
         lines << "    (void)llvm_memory;"
         lines << "    (void)llvm_global_memory;"
         lines << "    (void)llvm_string_memory;"
@@ -374,6 +433,9 @@ module PFC
         lines << "    (void)pf_ch;"
         registers.each_value do |name|
           lines << "    (void)#{name};"
+        end
+        aggregate_registers.each_value do |aggregate|
+          lines << "    (void)#{aggregate.fetch(:name)};"
         end
         lines << ""
         lines << "    #define PF_ABORT() do { fclose(pf_sink); return 1; } while (0)"
@@ -416,6 +478,8 @@ module PFC
           when :binary then return emit_binary(line)
           when :select then return emit_select(line)
           when :cast then return emit_cast(line)
+          when :extractvalue then return emit_extractvalue(line)
+          when :insertvalue then return emit_insertvalue(line)
           when :icmp then return emit_icmp(line)
           when :call then return emit_call(line)
           when :switch then return emit_switch(label, line)
@@ -493,7 +557,13 @@ module PFC
           bits = line.bits
           value = line.value
           pointer = line.pointer
+        elsif line.respond_to?(:value_type) && line.value_type && aggregate_type?(line.value_type)
+          return emit_aggregate_store(line.value_type, line.value, line.pointer)
         else
+          if (aggregate_match = line.match(/\Astore\s+(.+?)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)) && aggregate_type?(aggregate_match[1])
+            return emit_aggregate_store(aggregate_match[1], aggregate_match[2], aggregate_match[3])
+          end
+
           match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
@@ -514,7 +584,13 @@ module PFC
           destination = line.destination
           bits = line.bits
           pointer = line.pointer
+        elsif line.respond_to?(:value_type) && line.value_type && aggregate_type?(line.value_type)
+          return emit_aggregate_load(line.destination, line.value_type, line.pointer)
         else
+          if (aggregate_match = line.match(/\A(#{NAME})\s*=\s*load\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)) && aggregate_type?(aggregate_match[2])
+            return emit_aggregate_load(aggregate_match[1], aggregate_match[2], aggregate_match[3])
+          end
+
           match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
@@ -616,6 +692,41 @@ module PFC
         ["    #{target} = #{unsigned_cast(to_bits)}((#{encoded}) & #{integer_mask_literal(to_bits)});"]
       end
 
+      def emit_extractvalue(line)
+        aggregate_type = line.aggregate_type
+        offset, value_type = aggregate_index_info(aggregate_type, line.indices)
+        unless value_type.match?(/\Ai(?:1|8|16|32|64)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported extractvalue result type: #{value_type}"
+        end
+
+        bits = value_type.delete_prefix("i").to_i
+        aggregate = aggregate_register(line.aggregate)
+        [
+          "    #{register(line.destination)} = #{unsigned_cast(bits)}(pf_llvm_load(#{aggregate.fetch(:name)}, #{offset}, #{byte_width(bits)}) & #{integer_mask_literal(bits)});"
+        ]
+      end
+
+      def emit_insertvalue(line)
+        aggregate = aggregate_register(line.destination)
+        source = aggregate_value_bytes(line.aggregate, line.aggregate_type)
+        offset, value_type = aggregate_index_info(line.aggregate_type, line.indices)
+        unless value_type.match?(/\Ai(?:1|8|16|32|64)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported insertvalue field type: #{value_type}"
+        end
+
+        bits = value_type.delete_prefix("i").to_i
+        copy_prefix = next_aggregate_copy_prefix
+        [
+          "    {",
+          "        int #{copy_prefix}_i = 0;",
+          "        for (#{copy_prefix}_i = 0; #{copy_prefix}_i < #{aggregate.fetch(:size)}; #{copy_prefix}_i++) {",
+          "            #{aggregate.fetch(:name)}[#{copy_prefix}_i] = #{source ? "#{source}[#{copy_prefix}_i]" : '0u'};",
+          "        }",
+          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{offset}, (unsigned long long)(#{llvm_value(line.value)} & #{integer_mask_literal(bits)}), #{byte_width(bits)});",
+          "    }"
+        ]
+      end
+
       def emit_inttoptr_cast(destination, value, context: nil)
         pointer = context ? inline_value(value, context) : llvm_value(value)
         pointer_map = context ? context.fetch(:pointers) : pointers
@@ -627,6 +738,36 @@ module PFC
         pointer_map = context ? context.fetch(:pointers) : pointers
         pointer_map[destination] = pointer_binding(value, context:)
         []
+      end
+
+      def emit_aggregate_load(destination, value_type, pointer)
+        aggregate = aggregate_register(destination)
+        address = memory_address(pointer)
+        prefix = next_aggregate_copy_prefix
+        slot_lines(address, aggregate.fetch(:size)) + [
+          "    {",
+          "        int #{prefix}_i = 0;",
+          "        for (#{prefix}_i = 0; #{prefix}_i < #{aggregate.fetch(:size)}; #{prefix}_i++) {",
+          "            #{aggregate.fetch(:name)}[#{prefix}_i] = #{address.memory}[pf_slot_index + #{prefix}_i];",
+          "        }",
+          "    }"
+        ]
+      end
+
+      def emit_aggregate_store(value_type, value, pointer)
+        size = type_size(value_type)
+        address = memory_address(pointer)
+        ensure_writable_address!(address)
+        source = aggregate_value_bytes(value, value_type)
+        prefix = next_aggregate_copy_prefix
+        dynamic_writable_address_lines(address) + slot_lines(address, size) + [
+          "    {",
+          "        int #{prefix}_i = 0;",
+          "        for (#{prefix}_i = 0; #{prefix}_i < #{size}; #{prefix}_i++) {",
+          "            #{address.memory}[pf_slot_index + #{prefix}_i] = #{source ? "#{source}[#{prefix}_i]" : '0u'};",
+          "        }",
+          "    }"
+        ]
       end
 
       def emit_icmp(line)
@@ -702,7 +843,7 @@ module PFC
       end
 
       def emit_internal_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         destination = match[1]
@@ -743,6 +884,10 @@ module PFC
                                "#{prefix}_ignored_return"
                              end
         context = inline_context(prefix, return_destination, function, call_stack + [function.fetch(:name)])
+        if destination && function.fetch(:return_type) == "ptr"
+          pointer_map = caller_context ? caller_context.fetch(:pointers) : pointers
+          pointer_map[destination] = EncodedPointer.new(value: return_destination)
+        end
         lines = inline_declarations(context, function)
         function.fetch(:params).zip(arguments).each_with_index do |(param, argument), index|
           if function.fetch(:param_types).fetch(index) == "ptr"
@@ -1096,7 +1241,7 @@ module PFC
 
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@putchar\(i32\s+(.+)\)\z/)
         unless match
-          match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+          match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported internal call: #{line}" unless match
 
           raise Frontend::LLVMSubset::ParseError, "void call cannot assign a result: #{line}" if match[1] && match[2] == "void"
@@ -1188,7 +1333,7 @@ module PFC
           end
 
           return [
-            "    #{context.fetch(:return_destination)} = (unsigned long long)(#{inline_value(line.value, context)});",
+            "    #{context.fetch(:return_destination)} = (unsigned long long)(#{line.return_type == 'ptr' ? encoded_pointer_value(line.value, context:) : inline_value(line.value, context)});",
             "    goto #{context.fetch(:return_label)};"
           ]
         end
@@ -1275,6 +1420,7 @@ module PFC
       def emit_return(line)
         if line.respond_to?(:return_type) && line.return_type
           return ["    goto pf_done;"] if line.return_type == "void"
+          raise Frontend::LLVMSubset::ParseError, "main cannot return ptr" if line.return_type == "ptr"
 
           return [
             "    pf_return_code = (int)(#{llvm_value(line.value)});",
@@ -1858,9 +2004,18 @@ module PFC
 
       def pointer_argument(argument)
         stripped = argument.to_s.strip
-        return stripped.split(/\s+/).last if stripped.start_with?("ptr ") || stripped.match?(/\A.+?\*\s+/)
+        return pointer_argument_value(stripped) if stripped.start_with?("ptr ") || stripped.match?(/\A.+?\*\s+/)
 
         raise Frontend::LLVMSubset::ParseError, "unsupported printf pointer argument: #{argument}"
+      end
+
+      def pointer_argument_value(stripped)
+        return stripped.delete_prefix("ptr ").strip if stripped.start_with?("ptr ")
+
+        match = stripped.match(/\A.+?\*\s+(.+)\z/)
+        return match[1] if match
+
+        stripped.split(/\s+/).last
       end
 
       def split_call_arguments(raw_arguments)
@@ -1893,7 +2048,7 @@ module PFC
       end
 
       def parsed_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         {
@@ -1911,7 +2066,7 @@ module PFC
             next({ type: match[1], value: match[2] })
           end
           if stripped.start_with?("ptr ") || stripped.match?(/\A.+?\*\s+/)
-            next({ type: "ptr", value: stripped.split(/\s+/).last })
+            next({ type: "ptr", value: pointer_argument_value(stripped) })
           end
           if stripped.start_with?("metadata ")
             next({ type: "metadata", value: stripped.delete_prefix("metadata ").strip })
@@ -2279,9 +2434,14 @@ module PFC
       end
 
       def memory_address(name, context: nil)
-        return encoded_memory_address("0ull") if name.to_s.strip == "null"
+        stripped = name.to_s.strip
+        return encoded_memory_address("0ull") if stripped == "null"
 
-        pointer = resolve_pointer(name, context:)
+        pointer = if global_strings.key?(stripped)
+                    GlobalStringPointer.new(name: stripped, offset: 0)
+                  else
+                    resolve_pointer(stripped, context:)
+                  end
         return encoded_memory_address(pointer.value) if pointer.is_a?(EncodedPointer)
 
         if pointer.is_a?(GlobalStringPointer)
@@ -2312,6 +2472,7 @@ module PFC
           invalid_expression: nil,
           limit: "(((#{encoded}) & PF_LLVM_STRING_POINTER_TAG) != 0ull ? PF_LLVM_STRING_MEMORY_SIZE : (((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? PF_LLVM_GLOBAL_MEMORY_SIZE : PF_LLVM_MEMORY_SIZE))",
           memory: "(((#{encoded}) & PF_LLVM_STRING_POINTER_TAG) != 0ull ? llvm_string_memory : (((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? llvm_global_memory : llvm_memory))",
+          name: encoded,
           offset: "((#{encoded}) & PF_LLVM_POINTER_OFFSET_MASK)",
           readonly: false,
           readonly_expression: "(((#{encoded}) & PF_LLVM_READONLY_POINTER_TAG) != 0ull)"
@@ -2332,6 +2493,9 @@ module PFC
           GlobalMemoryPointer.new(name: address.name, offset:)
         elsif address.memory == "llvm_string_memory"
           EncodedPointer.new(value: "((unsigned long long)(#{offset}) | PF_LLVM_GLOBAL_POINTER_TAG | PF_LLVM_READONLY_POINTER_TAG | PF_LLVM_STRING_POINTER_TAG)")
+        elsif address.readonly_expression && address.name
+          tags = "((#{address.name}) & (PF_LLVM_GLOBAL_POINTER_TAG | PF_LLVM_READONLY_POINTER_TAG | PF_LLVM_STRING_POINTER_TAG))"
+          EncodedPointer.new(value: "((unsigned long long)(#{offset}) | #{tags})")
         else
           offset
         end
@@ -2366,10 +2530,10 @@ module PFC
       end
 
       def encoded_pointer_value(raw, context: nil)
-        token = raw.to_s.strip.split(/\s+/).last
-        return "0ull" if token == "null"
+        stripped = raw.to_s.strip
+        return "0ull" if stripped == "null"
 
-        pointer = pointer_binding(token, context:)
+        pointer = pointer_binding(stripped, context:)
         return pointer.value if pointer.is_a?(EncodedPointer)
         return "((unsigned long long)(#{pointer}))" unless pointer.is_a?(GlobalMemoryPointer) || pointer.is_a?(GlobalStringPointer)
 
@@ -2384,11 +2548,28 @@ module PFC
       end
 
       def pointer_binding(raw, context: nil)
-        token = raw.to_s.strip.split(/\s+/).last
+        stripped = raw.to_s.strip
+        constant = constant_gep_pointer(stripped, context:)
+        return constant if constant
+
+        token = stripped.split(/\s+/).last
         return EncodedPointer.new(value: "0ull") if token == "null"
         return GlobalStringPointer.new(name: token, offset: 0) if global_strings.key?(token)
 
         resolve_pointer(token, context:)
+      end
+
+      def constant_gep_pointer(raw, context:)
+        match = raw.match(/\Agetelementptr(?:\s+inbounds)?\s*\((.+?),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+(.+)\)\z/)
+        return nil unless match
+
+        source_type = match[1]
+        base = match[2]
+        index_arguments = Frontend::LLVMSubset::Parser::Instruction.split_arguments(match[3])
+        indices = index_arguments.map { |argument| argument.split(/\s+/, 2).last }
+        base_address = memory_address(base, context:)
+        offset = gep_offset_expression(source_type, indices, base_address.offset, context:)
+        pointer_from_address(base_address, offset)
       end
 
       def global_string_offset_expression(pointer)
@@ -2416,6 +2597,10 @@ module PFC
 
       def c_value_name(name)
         "pf_v_#{name.delete_prefix('%').gsub(/[^A-Za-z0-9_]/, '_')}"
+      end
+
+      def c_aggregate_name(name)
+        "pf_a_#{name.delete_prefix('%').gsub(/[^A-Za-z0-9_]/, '_')}"
       end
 
       def integer_mask(bits)

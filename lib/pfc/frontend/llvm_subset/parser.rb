@@ -9,6 +9,8 @@ module PFC
         NAME = /%[-A-Za-z$._0-9]+/
         GLOBAL_NAME = /@[-A-Za-z$._0-9]+/
         POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
+        INTEGER_TYPE = /i(?:1|8|16|32|64)/
+        RETURN_TYPE = /(?:#{INTEGER_TYPE}|ptr|void)/
 
         class Instruction
           attr_reader :kind, :text
@@ -25,6 +27,8 @@ module PFC
             when :icmp then ICmpInstruction.new(text)
             when :select then SelectInstruction.new(text)
             when :cast then CastInstruction.new(text)
+            when :extractvalue then ExtractValueInstruction.new(text)
+            when :insertvalue then InsertValueInstruction.new(text)
             when :switch then SwitchInstruction.new(text)
             when :phi then PhiInstruction.new(text)
             when :return then ReturnInstruction.new(text)
@@ -115,6 +119,7 @@ module PFC
 
           def classify(text)
             return :phi if text.match?(/\A#{NAME}\s*=\s*phi\b/)
+            return :call if text.include?("call ")
             return :gep if text.include?("getelementptr")
             return :alloca if text.match?(/\A#{NAME}\s*=\s*alloca\b/)
             return :store if text.start_with?("store ")
@@ -122,8 +127,9 @@ module PFC
             return :binary if text.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
             return :select if text.match?(/\A#{NAME}\s*=\s*select\b/)
             return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr|bitcast)\b/)
+            return :extractvalue if text.match?(/\A#{NAME}\s*=\s*extractvalue\b/)
+            return :insertvalue if text.match?(/\A#{NAME}\s*=\s*insertvalue\b/)
             return :icmp if text.match?(/\A#{NAME}\s*=\s*icmp\b/)
-            return :call if text.include?("call ")
             return :switch if text.start_with?("switch ")
             return :branch if text.start_with?("br ")
             return :return if text.start_with?("ret ")
@@ -138,7 +144,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(?:[-\w]+\s+)*(#{RETURN_TYPE})\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
             return unless match
 
             @destination = match[1]
@@ -191,28 +197,30 @@ module PFC
         end
 
         class LoadInstruction < Instruction
-          attr_reader :bits, :destination, :pointer
+          attr_reader :bits, :destination, :pointer, :value_type
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*load\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @destination = match[1]
-            @bits = match[2].to_i
+            @value_type = match[2]
+            @bits = match[2].delete_prefix("i").to_i if match[2].match?(/\Ai(?:1|8|16|32|64)\z/)
             @pointer = match[3]
           end
         end
 
         class StoreInstruction < Instruction
-          attr_reader :bits, :pointer, :value
+          attr_reader :bits, :pointer, :value, :value_type
 
           def initialize(text)
             super
-            match = text.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\Astore\s+(.+?)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
             return unless match
 
-            @bits = match[1].to_i
+            @value_type = match[1]
+            @bits = match[1].delete_prefix("i").to_i if match[1].match?(/\Ai(?:1|8|16|32|64)\z/)
             @value = match[2]
             @pointer = match[3]
           end
@@ -334,6 +342,38 @@ module PFC
           end
         end
 
+        class ExtractValueInstruction < Instruction
+          attr_reader :aggregate, :aggregate_type, :destination, :indices
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*extractvalue\s+(.+?)\s+(#{NAME}),\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @aggregate_type = match[2]
+            @aggregate = match[3]
+            @indices = Instruction.split_arguments(match[4]).map(&:to_i).freeze
+          end
+        end
+
+        class InsertValueInstruction < Instruction
+          attr_reader :aggregate, :aggregate_type, :destination, :indices, :insert_type, :value
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*insertvalue\s+(.+?)\s+(#{NAME}|zeroinitializer|undef|poison),\s+(.+?)\s+(.+?),\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @aggregate_type = match[2]
+            @aggregate = match[3]
+            @insert_type = match[4]
+            @value = match[5]
+            @indices = Instruction.split_arguments(match[6]).map(&:to_i).freeze
+          end
+        end
+
         class SwitchInstruction < Instruction
           attr_reader :bits, :cases, :default_label, :value
 
@@ -382,7 +422,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Aret\s+(void|i(?:1|8|16|32|64))(?:\s+(.+))?\z/)
+            match = text.match(/\Aret\s+(void|ptr|i(?:1|8|16|32|64))(?:\s+(.+))?\z/)
             return unless match
 
             @return_type = match[1]
@@ -410,6 +450,7 @@ module PFC
             block_order:,
             blocks:,
             function_signatures: parse_function_signatures,
+            target_datalayout: parse_target_datalayout,
             global_numeric_data: parse_global_numeric_data,
             global_numeric_mutability: parse_global_numeric_mutability,
             global_strings: parse_global_strings,
@@ -435,7 +476,7 @@ module PFC
 
           while index < lines.length
             header = lines[index].strip
-            match = header.match(/\Adefine\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)\s*\{\z/)
+            match = header.match(/\Adefine\s+(?:[-\w]+\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+[^{}]+)?\s*\{\z/)
             unless match
               index += 1
               next
@@ -484,6 +525,15 @@ module PFC
           end
         end
 
+        def parse_target_datalayout
+          source.each_line do |line|
+            match = line.strip.match(/\Atarget\s+datalayout\s*=\s*"([^"]*)"\z/)
+            return match[1] if match
+          end
+
+          nil
+        end
+
         def parse_struct_types
           source.each_line.each_with_object({}) do |line, structs|
             stripped = line.sub(/;.*/, "").strip
@@ -503,6 +553,8 @@ module PFC
               globals[match[1]] = integer_bytes(match[3], match[2].to_i)
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\]\s+(zeroinitializer|\[(.*)\])(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = global_integer_array_bytes(match, stripped)
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+(.+?)\s+(\{.*\}|\[.*\]|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = aggregate_initializer_bytes(match[2], match[3], stripped)
             end
           end
         end
@@ -516,8 +568,75 @@ module PFC
               globals[match[1]] = match[2] == "global"
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+\[\d+\s+x\s+i(?:1|8|16|32|64)\]\s+(?:zeroinitializer|\[.*\])(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = match[2] == "global"
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+.+?\s+(?:\{.*\}|\[.*\]|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = match[2] == "global"
             end
           end
+        end
+
+        def aggregate_initializer_bytes(type, initializer, line)
+          return Array.new(type_size(type), 0) if initializer == "zeroinitializer"
+
+          values = initializer.delete_prefix("{").delete_prefix("[").delete_suffix("}").delete_suffix("]")
+          elements = Instruction.split_arguments(values)
+          fields = aggregate_fields(type)
+          if elements.length != fields.length
+            raise parse_error("aggregate initializer has #{elements.length} elements, expected #{fields.length}", line)
+          end
+
+          output = Array.new(type_size(type), 0)
+          fields.zip(elements).each_with_index do |(field_type, element), index|
+            element_match = element.match(/\A(.+?)\s+(.+)\z/)
+            raise parse_error("unsupported aggregate element: #{element}", line) unless element_match
+
+            bytes = typed_initializer_bytes(element_match[1], element_match[2], line)
+            offset = aggregate_field_offsets(type).fetch(index)
+            bytes.each_with_index { |byte, byte_index| output[offset + byte_index] = byte }
+          end
+          output
+        end
+
+        def typed_initializer_bytes(type, value, line)
+          if (match = type.match(/\Ai(1|8|16|32|64)\z/))
+            return integer_bytes(value, match[1].to_i)
+          end
+          return aggregate_initializer_bytes(type, value, line) if aggregate_type?(type)
+
+          raise parse_error("unsupported aggregate initializer type: #{type}", line)
+        end
+
+        def aggregate_type?(type)
+          type.strip.match?(/\A(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|\{.*\})\z/)
+        end
+
+        def aggregate_fields(type)
+          stripped = type.strip
+          if (match = stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/))
+            return Array.new(match[1].to_i, match[2])
+          end
+          return parse_struct_types.fetch(stripped) if parse_struct_types.key?(stripped)
+          if stripped.match?(/\A\{.*\}\z/)
+            return Instruction.split_arguments(stripped.delete_prefix("{").delete_suffix("}"))
+          end
+
+          raise ParseError, "unsupported aggregate type: #{type}"
+        end
+
+        def aggregate_field_offsets(type)
+          offset = 0
+          aggregate_fields(type).map do |field|
+            current = offset
+            offset += type_size(field)
+            current
+          end
+        end
+
+        def type_size(type)
+          stripped = type.strip
+          return byte_width(Regexp.last_match(1).to_i) if stripped.match(/\Ai(1|8|16|32|64)\z/)
+          return aggregate_fields(stripped).sum { |field| type_size(field) } if aggregate_type?(stripped)
+
+          raise ParseError, "unsupported type: #{type}"
         end
 
         def global_integer_array_bytes(match, line)
@@ -565,13 +684,13 @@ module PFC
             stripped = line.sub(/;.*/, "").strip
             next if stripped.empty?
 
-            if (match = stripped.match(/\Adeclare\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+#[0-9]+)?\z/))
+            if (match = stripped.match(/\Adeclare\s+(?:[-\w]+\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+#[0-9]+)?\z/))
               add_function_signature!(
                 signatures,
                 build_function_signature(match[2], match[1], match[3], defined: false),
                 stripped
               )
-            elsif (match = stripped.match(/\Adefine\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)\s*\{\z/))
+            elsif (match = stripped.match(/\Adefine\s+(?:[-\w]+\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+[^{}]+)?\s*\{\z/))
               add_function_signature!(
                 signatures,
                 build_function_signature(match[2], match[1], match[3], defined: true),
@@ -737,7 +856,7 @@ module PFC
 
         def extract_main_body
           lines = source.each_line.to_a
-          start = lines.index { |line| line.match?(/\A\s*define\s+(?:[-\w]+\s+)*(?:i(?:1|8|16|32|64)|void)\s+@main\s*\(/) }
+          start = lines.index { |line| line.match?(/\A\s*define\s+(?:[-\w]+\s+)*(?:#{RETURN_TYPE})\s+@main\s*\(/) }
           raise ParseError, "missing define @main()" if start.nil?
 
           body = []
