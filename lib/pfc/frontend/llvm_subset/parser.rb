@@ -120,7 +120,7 @@ module PFC
             return :load if text.include?(" load ")
             return :binary if text.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
             return :select if text.match?(/\A#{NAME}\s*=\s*select\b/)
-            return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc)\b/)
+            return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr)\b/)
             return :icmp if text.match?(/\A#{NAME}\s*=\s*icmp\b/)
             return :call if text.include?("call ")
             return :switch if text.start_with?("switch ")
@@ -250,18 +250,40 @@ module PFC
         end
 
         class CastInstruction < Instruction
-          attr_reader :destination, :from_bits, :operator, :to_bits, :value
+          attr_reader :destination, :from_bits, :from_type, :operator, :to_bits, :to_type, :value
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
+            if (match = text.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
+              @destination = match[1]
+              @operator = match[2]
+              @from_bits = match[3].to_i
+              @from_type = "i#{match[3]}"
+              @value = match[4]
+              @to_bits = match[5].to_i
+              @to_type = "i#{match[5]}"
+              return
+            end
+
+            if (match = text.match(/\A(#{NAME})\s*=\s*ptrtoint\s+ptr\s+(#{POINTER_NAME})\s+to\s+i(1|8|16|32|64)\z/))
+              @destination = match[1]
+              @operator = "ptrtoint"
+              @from_type = "ptr"
+              @value = match[2]
+              @to_bits = match[3].to_i
+              @to_type = "i#{match[3]}"
+              return
+            end
+
+            match = text.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+ptr\z/)
             return unless match
 
             @destination = match[1]
-            @operator = match[2]
-            @from_bits = match[3].to_i
-            @value = match[4]
-            @to_bits = match[5].to_i
+            @operator = "inttoptr"
+            @from_bits = match[2].to_i
+            @from_type = "i#{match[2]}"
+            @value = match[3]
+            @to_type = "ptr"
           end
         end
 

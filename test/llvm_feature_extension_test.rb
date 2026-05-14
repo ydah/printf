@@ -54,4 +54,24 @@ class LLVMFeatureExtensionTest < Minitest::Test
     end
     assert_includes error.message, "cannot write to constant global: @.cell"
   end
+
+  def test_local_pointer_can_roundtrip_through_integer_casts
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %buffer = alloca [4 x i8]
+        %slot = getelementptr [4 x i8], ptr %buffer, i32 0, i32 1
+        %address = ptrtoint ptr %slot to i64
+        %pointer = inttoptr i64 %address to ptr
+        store i8 66, ptr %pointer
+        %value = load i8, ptr %slot
+        call i32 @putchar(i32 %value)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
 end

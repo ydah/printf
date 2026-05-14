@@ -150,6 +150,7 @@ module PFC
           next if lhs.nil?
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*alloca\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*getelementptr\b/)
+          next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*inttoptr\b/)
 
           registers[lhs] = c_value_name(lhs)
         end
@@ -414,12 +415,21 @@ module PFC
       end
 
       def emit_cast(line)
-        if line.respond_to?(:destination) && line.respond_to?(:operator) && line.respond_to?(:from_bits) && line.from_bits
-          destination = line.destination
-          operator = line.operator
-          from_bits = line.from_bits
-          value = line.value
-          to_bits = line.to_bits
+        if line.respond_to?(:destination) && line.respond_to?(:operator) && line.operator
+          return emit_ptrtoint_cast(line.destination, line.value, line.to_bits) if line.operator == "ptrtoint"
+          return emit_inttoptr_cast(line.destination, line.value) if line.operator == "inttoptr"
+
+          if line.from_bits
+            destination = line.destination
+            operator = line.operator
+            from_bits = line.from_bits
+            value = line.value
+            to_bits = line.to_bits
+          end
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+ptr\s+(#{POINTER_NAME})\s+to\s+i(1|8|16|32|64)\z/))
+          return emit_ptrtoint_cast(match[1], match[2], match[3].to_i)
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+ptr\z/))
+          return emit_inttoptr_cast(match[1], match[2])
         else
           match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
@@ -430,7 +440,22 @@ module PFC
           value = match[4]
           to_bits = match[5].to_i
         end
+        raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless from_bits
+
         ["    #{register(destination)} = #{cast_expression(operator, from_bits, to_bits, llvm_value(value))};"]
+      end
+
+      def emit_ptrtoint_cast(destination, value, to_bits, context: nil)
+        address = memory_address(value, context:)
+        target = context ? inline_register(context, destination) : register(destination)
+        ["    #{target} = #{unsigned_cast(to_bits)}(((unsigned long long)(#{address.offset})) & #{integer_mask_literal(to_bits)});"]
+      end
+
+      def emit_inttoptr_cast(destination, value, context: nil)
+        pointer = context ? inline_value(value, context) : llvm_value(value)
+        pointer_map = context ? context.fetch(:pointers) : pointers
+        pointer_map[destination] = pointer
+        []
       end
 
       def emit_icmp(line)
@@ -571,6 +596,7 @@ module PFC
           next nil if lhs.nil?
           next nil if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*alloca\b/)
           next nil if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*getelementptr\b/)
+          next nil if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*inttoptr\b/)
 
           lhs
         end.uniq
@@ -752,12 +778,21 @@ module PFC
       end
 
       def emit_inline_cast(line, context)
-        if line.respond_to?(:destination) && line.respond_to?(:operator) && line.respond_to?(:from_bits) && line.from_bits
-          destination = line.destination
-          operator = line.operator
-          from_bits = line.from_bits
-          value = line.value
-          to_bits = line.to_bits
+        if line.respond_to?(:destination) && line.respond_to?(:operator) && line.operator
+          return emit_ptrtoint_cast(line.destination, line.value, line.to_bits, context:) if line.operator == "ptrtoint"
+          return emit_inttoptr_cast(line.destination, line.value, context:) if line.operator == "inttoptr"
+
+          if line.from_bits
+            destination = line.destination
+            operator = line.operator
+            from_bits = line.from_bits
+            value = line.value
+            to_bits = line.to_bits
+          end
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+ptr\s+(#{POINTER_NAME})\s+to\s+i(1|8|16|32|64)\z/))
+          return emit_ptrtoint_cast(match[1], match[2], match[3].to_i, context:)
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+ptr\z/))
+          return emit_inttoptr_cast(match[1], match[2], context:)
         else
           match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
@@ -768,6 +803,8 @@ module PFC
           value = match[4]
           to_bits = match[5].to_i
         end
+        raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless from_bits
+
         local = inline_register(context, destination)
         ["    #{local} = #{cast_expression(operator, from_bits, to_bits, inline_value(value, context))};"]
       end
