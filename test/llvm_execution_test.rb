@@ -13,6 +13,25 @@ class LLVMExecutionTest < Minitest::Test
     assert_equal "Y 4294967301 -5\n", compile_llvm_and_run("samples/i64_ops.ll")
   end
 
+  def test_runs_byte_addressed_memory_program
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %arr = alloca [2 x i32], align 4
+        %second = getelementptr inbounds [2 x i32], ptr %arr, i64 0, i64 1
+        store i32 16961, ptr %second, align 4
+        %byte = getelementptr inbounds i8, ptr %arr, i64 5
+        %ch = load i8, ptr %byte, align 1
+        call i32 @putchar(i32 %ch)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
   def test_runs_signed_extension_program
     source = <<~LLVM
       declare i32 @putchar(i32)

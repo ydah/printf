@@ -278,8 +278,33 @@ class LLVMSubsetTest < Minitest::Test
 
     generated = PFC::Backend::LLVMCEmitter.new(source).emit
 
-    assert_includes generated, "llvm_slots[pf_slot_index] & 1u"
+    assert_includes generated, "pf_llvm_load(llvm_memory, pf_slot_index, 1) & 1u"
     assert_includes generated, "pf_v_cmp = ((pf_v_value) == (1)) ? 1u : 0u;"
+  end
+
+  def test_uses_byte_addressed_memory_for_local_gep
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %arr = alloca [2 x i32], align 4
+        %second = getelementptr inbounds [2 x i32], ptr %arr, i64 0, i64 1
+        store i32 16961, ptr %second, align 4
+        %byte = getelementptr inbounds i8, ptr %arr, i64 5
+        %ch = load i8, ptr %byte, align 1
+        call i32 @putchar(i32 %ch)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "enum { PF_LLVM_MEMORY_SIZE = 8 };"
+    assert_includes generated, "pf_slot_index = (int)(((0) + ((0) * 8) + ((1) * 4)));"
+    assert_includes generated, "pf_llvm_store(llvm_memory, pf_slot_index, (unsigned long long)(16961 & 4294967295u), 4);"
+    assert_includes generated, "pf_slot_index = (int)(((0) + ((5) * 1)));"
+    assert_includes generated, "pf_v_ch = (unsigned int)(pf_llvm_load(llvm_memory, pf_slot_index, 1) & 255u);"
   end
 
   def test_supports_i64_memory_arithmetic_and_printf
@@ -304,9 +329,9 @@ class LLVMSubsetTest < Minitest::Test
 
     generated = PFC::Backend::LLVMCEmitter.new(source).emit
 
-    assert_includes generated, "unsigned long long llvm_slots[PF_LLVM_SLOT_COUNT] = {0};"
-    assert_includes generated, "llvm_slots[pf_slot_index] = (unsigned long long)(4294967301 & 18446744073709551615ull);"
-    assert_includes generated, "pf_v_wide = (unsigned long long)(llvm_slots[pf_slot_index] & 18446744073709551615ull);"
+    assert_includes generated, "unsigned char llvm_memory[PF_LLVM_MEMORY_SIZE] = {0};"
+    assert_includes generated, "pf_llvm_store(llvm_memory, pf_slot_index, (unsigned long long)(4294967301 & 18446744073709551615ull), 8);"
+    assert_includes generated, "pf_v_wide = (unsigned long long)(pf_llvm_load(llvm_memory, pf_slot_index, 8) & 18446744073709551615ull);"
     assert_includes generated, "pf_v_cmp = ((pf_v_wide) == (4294967301)) ? 1u : 0u;"
     assert_includes generated, "pf_output_u64_decimal((unsigned long long)(pf_v_wide), &pf_printf_count_0)"
     assert_includes generated, "pf_output_i64_decimal((long long)(pf_v_minus), &pf_printf_count_0)"

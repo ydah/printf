@@ -48,6 +48,8 @@ module PFC
         lines << ""
         lines << PrintfPrimitives.source(tape_size: tape_size).rstrip
         lines << ""
+        lines << llvm_memory_primitives.rstrip
+        lines << ""
         lines << "int main(void) {"
         lines.concat(main_prelude)
         lines << "    goto #{c_label("entry")};"
@@ -98,19 +100,19 @@ module PFC
 
       def analyze_allocations
         all_lines.each do |line|
-          if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:1|8|16|32|64)\](?:,\s+align\s+\d+)?\z/))
-            allocate_pointer(match[1], match[2].to_i)
+          if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\](?:,\s+align\s+\d+)?\z/))
+            allocate_pointer(match[1], match[2].to_i * byte_width(match[3].to_i))
           elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32|64)(?:,\s+align\s+\d+)?\z/))
-            allocate_pointer(match[1], 1)
+            allocate_pointer(match[1], byte_width(match[2].to_i))
           end
         end
 
         internal_functions.each_value do |function|
           function.fetch(:blocks).values.flatten.each do |line|
-            if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(?:1|8|16|32|64)\](?:,\s+align\s+\d+)?\z/))
-              function.fetch(:allocations)[match[1]] = allocate_slots(match[2].to_i)
+            if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\](?:,\s+align\s+\d+)?\z/))
+              function.fetch(:allocations)[match[1]] = allocate_slots(match[2].to_i * byte_width(match[3].to_i))
             elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32|64)(?:,\s+align\s+\d+)?\z/))
-              function.fetch(:allocations)[match[1]] = allocate_slots(1)
+              function.fetch(:allocations)[match[1]] = allocate_slots(byte_width(match[2].to_i))
             end
           end
         end
@@ -156,6 +158,26 @@ module PFC
         end
       end
 
+      def llvm_memory_primitives
+        <<~C
+          static inline void PF_MAYBE_UNUSED pf_llvm_store(unsigned char *memory, int index, unsigned long long value, int width) {
+              int offset;
+              for (offset = 0; offset < width; offset++) {
+                  memory[index + offset] = (unsigned char)((value >> (offset * 8)) & 255ull);
+              }
+          }
+
+          static inline unsigned long long PF_MAYBE_UNUSED pf_llvm_load(const unsigned char *memory, int index, int width) {
+              unsigned long long value = 0ull;
+              int offset;
+              for (offset = 0; offset < width; offset++) {
+                  value |= ((unsigned long long)memory[index + offset]) << (offset * 8);
+              }
+              return value;
+          }
+        C
+      end
+
       def main_prelude
         lines = [
           "    FILE *pf_sink = tmpfile();",
@@ -164,8 +186,8 @@ module PFC
           "        return 1;",
           "    }",
           "",
-          "    enum { PF_LLVM_SLOT_COUNT = #{[slot_count, 1].max} };",
-          "    unsigned long long llvm_slots[PF_LLVM_SLOT_COUNT] = {0};",
+          "    enum { PF_LLVM_MEMORY_SIZE = #{[slot_count, 1].max} };",
+          "    unsigned char llvm_memory[PF_LLVM_MEMORY_SIZE] = {0};",
           "    int pf_return_code = 0;",
           "    int pf_slot_index = 0;",
           "    int pf_ch = 0;"
@@ -173,7 +195,7 @@ module PFC
         registers.each_value do |name|
           lines << "    unsigned long long #{name} = 0;"
         end
-        lines << "    (void)llvm_slots;"
+        lines << "    (void)llvm_memory;"
         lines << "    (void)pf_slot_index;"
         lines << "    (void)pf_ch;"
         registers.each_value do |name|
@@ -238,19 +260,20 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32|64)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
-          width = match[2].to_i
-          base = pointer_expr(match[3])
-          first_index = llvm_value(match[4])
-          second_index = llvm_value(match[5])
-          pointers[match[1]] = "((#{base}) + ((#{first_index}) * #{width}) + (#{second_index}))"
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+          element_width = byte_width(match[3].to_i)
+          aggregate_width = match[2].to_i * element_width
+          base = pointer_expr(match[4])
+          first_index = llvm_value(match[5])
+          second_index = llvm_value(match[6])
+          pointers[match[1]] = "((#{base}) + ((#{first_index}) * #{aggregate_width}) + ((#{second_index}) * #{element_width}))"
           return []
         end
 
         match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32|64),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
-        pointers[match[1]] = "((#{pointer_expr(match[3])}) + (#{llvm_value(match[4])}))"
+        pointers[match[1]] = "((#{pointer_expr(match[3])}) + ((#{llvm_value(match[4])}) * #{byte_width(match[2].to_i)}))"
         []
       end
 
@@ -258,8 +281,10 @@ module PFC
         match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
-        slot_lines(match[3]) + [
-          "    llvm_slots[pf_slot_index] = (unsigned long long)(#{llvm_value(match[2])} & #{integer_mask_literal(match[1].to_i)});"
+        bits = match[1].to_i
+        width = byte_width(bits)
+        slot_lines(match[3], width) + [
+          "    pf_llvm_store(llvm_memory, pf_slot_index, (unsigned long long)(#{llvm_value(match[2])} & #{integer_mask_literal(bits)}), #{width});"
         ]
       end
 
@@ -267,8 +292,10 @@ module PFC
         match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
-        slot_lines(match[3]) + [
-          "    #{register(match[1])} = #{unsigned_cast(match[2].to_i)}(llvm_slots[pf_slot_index] & #{integer_mask_literal(match[2].to_i)});"
+        bits = match[2].to_i
+        width = byte_width(bits)
+        slot_lines(match[3], width) + [
+          "    #{register(match[1])} = #{unsigned_cast(bits)}(pf_llvm_load(llvm_memory, pf_slot_index, #{width}) & #{integer_mask_literal(bits)});"
         ]
       end
 
@@ -489,19 +516,20 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(?:1|8|16|32|64)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
-          width = match[2].to_i
-          base = inline_pointer_expr(context, match[3])
-          first_index = inline_value(match[4], context)
-          second_index = inline_value(match[5], context)
-          context.fetch(:pointers)[match[1]] = "((#{base}) + ((#{first_index}) * #{width}) + (#{second_index}))"
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+          element_width = byte_width(match[3].to_i)
+          aggregate_width = match[2].to_i * element_width
+          base = inline_pointer_expr(context, match[4])
+          first_index = inline_value(match[5], context)
+          second_index = inline_value(match[6], context)
+          context.fetch(:pointers)[match[1]] = "((#{base}) + ((#{first_index}) * #{aggregate_width}) + ((#{second_index}) * #{element_width}))"
           return []
         end
 
         match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32|64),\s+ptr\s+(#{NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
-        context.fetch(:pointers)[match[1]] = "((#{inline_pointer_expr(context, match[3])}) + (#{inline_value(match[4], context)}))"
+        context.fetch(:pointers)[match[1]] = "((#{inline_pointer_expr(context, match[3])}) + ((#{inline_value(match[4], context)}) * #{byte_width(match[2].to_i)}))"
         []
       end
 
@@ -509,8 +537,10 @@ module PFC
         match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
-        inline_slot_lines(context, match[3]) + [
-          "    llvm_slots[pf_slot_index] = (unsigned long long)(#{inline_value(match[2], context)} & #{integer_mask_literal(match[1].to_i)});"
+        bits = match[1].to_i
+        width = byte_width(bits)
+        inline_slot_lines(context, match[3], width) + [
+          "    pf_llvm_store(llvm_memory, pf_slot_index, (unsigned long long)(#{inline_value(match[2], context)} & #{integer_mask_literal(bits)}), #{width});"
         ]
       end
 
@@ -518,8 +548,10 @@ module PFC
         match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{NAME})(?:,\s+align\s+\d+)?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
-        inline_slot_lines(context, match[3]) + [
-          "    #{inline_register(context, match[1])} = #{unsigned_cast(match[2].to_i)}(llvm_slots[pf_slot_index] & #{integer_mask_literal(match[2].to_i)});"
+        bits = match[2].to_i
+        width = byte_width(bits)
+        inline_slot_lines(context, match[3], width) + [
+          "    #{inline_register(context, match[1])} = #{unsigned_cast(bits)}(pf_llvm_load(llvm_memory, pf_slot_index, #{width}) & #{integer_mask_literal(bits)});"
         ]
       end
 
@@ -1188,6 +1220,10 @@ module PFC
         (1 << bits) - 1
       end
 
+      def byte_width(bits)
+        [(bits + 7) / 8, 1].max
+      end
+
       def integer_mask_literal(bits)
         "#{integer_mask(bits)}#{integer_suffix(bits)}"
       end
@@ -1208,21 +1244,21 @@ module PFC
         "#{1 << (bits - 1)}#{integer_suffix(bits)}"
       end
 
-      def slot_lines(pointer_name)
+      def slot_lines(pointer_name, width)
         [
           "    pf_slot_index = (int)(#{pointer_expr(pointer_name)});",
-          "    if (pf_slot_index < 0 || pf_slot_index >= PF_LLVM_SLOT_COUNT) {",
-          "        fprintf(stderr, \"pfc runtime error: LLVM slot out of range: %d\\n\", pf_slot_index);",
+          "    if (pf_slot_index < 0 || pf_slot_index + #{width} > PF_LLVM_MEMORY_SIZE) {",
+          "        fprintf(stderr, \"pfc runtime error: LLVM memory access out of range: %d\\n\", pf_slot_index);",
           "        PF_ABORT();",
           "    }"
         ]
       end
 
-      def inline_slot_lines(context, pointer_name)
+      def inline_slot_lines(context, pointer_name, width)
         [
           "    pf_slot_index = (int)(#{inline_pointer_expr(context, pointer_name)});",
-          "    if (pf_slot_index < 0 || pf_slot_index >= PF_LLVM_SLOT_COUNT) {",
-          "        fprintf(stderr, \"pfc runtime error: LLVM slot out of range: %d\\n\", pf_slot_index);",
+          "    if (pf_slot_index < 0 || pf_slot_index + #{width} > PF_LLVM_MEMORY_SIZE) {",
+          "        fprintf(stderr, \"pfc runtime error: LLVM memory access out of range: %d\\n\", pf_slot_index);",
           "        PF_ABORT();",
           "    }"
         ]
