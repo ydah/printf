@@ -153,6 +153,73 @@ class LLVMSubsetTest < Minitest::Test
     assert_equal [["89", "yes"], ["78", "no"]], phi.incoming
   end
 
+  def test_parser_exposes_structured_memory_and_scalar_instructions
+    source = <<~LLVM
+      define i32 @main() {
+      entry:
+        %slot = alloca [2 x i32], align 4
+        %ptr = getelementptr inbounds [2 x i32], ptr %slot, i64 0, i64 1
+        store i32 65, ptr %ptr, align 4
+        %value = load i32, ptr %ptr, align 4
+        %wide = sext i32 %value to i64
+        %sum = add nsw i64 %wide, 1
+        %cmp = icmp eq i64 %sum, 66
+        switch i1 %cmp, label %no [ i1 1, label %yes ]
+      yes:
+        ret i32 0
+      no:
+        ret i32 1
+      }
+    LLVM
+
+    instructions = PFC::Frontend::LLVMSubset::Parser.parse(source).fetch(:blocks).fetch("entry")
+    gep = instructions[1]
+    store = instructions[2]
+    load = instructions[3]
+    cast = instructions[4]
+    binary = instructions[5]
+    icmp = instructions[6]
+    switch = instructions[7]
+
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::GEPInstruction, gep
+    assert_equal "%ptr", gep.destination
+    assert gep.inbounds
+    assert_equal "[2 x i32]", gep.source_type
+    assert_equal "%slot", gep.base_pointer
+    assert_equal 2, gep.array_count
+    assert_equal 32, gep.element_bits
+    assert_equal ["0", "1"], gep.indices
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::StoreInstruction, store
+    assert_equal 32, store.bits
+    assert_equal "65", store.value
+    assert_equal "%ptr", store.pointer
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::LoadInstruction, load
+    assert_equal "%value", load.destination
+    assert_equal 32, load.bits
+    assert_equal "%ptr", load.pointer
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::CastInstruction, cast
+    assert_equal "sext", cast.operator
+    assert_equal 32, cast.from_bits
+    assert_equal 64, cast.to_bits
+    assert_equal "%value", cast.value
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::BinaryInstruction, binary
+    assert_equal "add", binary.operator
+    assert_equal ["nsw"], binary.flags
+    assert_equal 64, binary.bits
+    assert_equal "%wide", binary.left
+    assert_equal "1", binary.right
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::ICmpInstruction, icmp
+    assert_equal "eq", icmp.predicate
+    assert_equal 64, icmp.bits
+    assert_equal "%sum", icmp.left
+    assert_equal "66", icmp.right
+    assert_instance_of PFC::Frontend::LLVMSubset::Parser::SwitchInstruction, switch
+    assert_equal 1, switch.bits
+    assert_equal "%cmp", switch.value
+    assert_equal "no", switch.default_label
+    assert_equal [["1", "yes"]], switch.cases
+  end
+
   def test_emits_constant_putchar_program
     source = PFC::Backend::LLVMCEmitter.new(File.read(File.expand_path("../samples/putchar.ll", __dir__))).emit
 

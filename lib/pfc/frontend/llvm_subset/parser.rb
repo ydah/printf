@@ -7,6 +7,8 @@ module PFC
     class LLVMSubset
       class Parser
         NAME = /%[-A-Za-z$._0-9]+/
+        GLOBAL_NAME = /@[-A-Za-z$._0-9]+/
+        POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
 
         class Instruction
           attr_reader :kind, :text
@@ -16,6 +18,13 @@ module PFC
             case instruction.kind
             when :call then CallInstruction.new(text)
             when :branch then BranchInstruction.new(text)
+            when :gep then GEPInstruction.new(text)
+            when :load then LoadInstruction.new(text)
+            when :store then StoreInstruction.new(text)
+            when :binary then BinaryInstruction.new(text)
+            when :icmp then ICmpInstruction.new(text)
+            when :cast then CastInstruction.new(text)
+            when :switch then SwitchInstruction.new(text)
             when :phi then PhiInstruction.new(text)
             when :return then ReturnInstruction.new(text)
             else instruction
@@ -153,6 +162,123 @@ module PFC
 
             @condition = match[1]
             @targets = [match[2], match[3]].freeze
+          end
+        end
+
+        class GEPInstruction < Instruction
+          attr_reader :array_count, :base_pointer, :destination, :element_bits, :inbounds, :indices, :source_type
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*getelementptr(\s+inbounds)?\s+(.+?),\s+ptr\s+(#{POINTER_NAME}),\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @inbounds = !match[2].nil?
+            @source_type = match[3]
+            @base_pointer = match[4]
+            @indices = Instruction.split_arguments(match[5]).map { |argument| argument.split(/\s+/, 2).last }.freeze
+            if (array_match = source_type.match(/\A\[(\d+)\s+x\s+i(1|8|16|32|64)\]\z/))
+              @array_count = array_match[1].to_i
+              @element_bits = array_match[2].to_i
+            elsif (scalar_match = source_type.match(/\Ai(1|8|16|32|64)\z/))
+              @array_count = nil
+              @element_bits = scalar_match[1].to_i
+            end
+          end
+        end
+
+        class LoadInstruction < Instruction
+          attr_reader :bits, :destination, :pointer
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            return unless match
+
+            @destination = match[1]
+            @bits = match[2].to_i
+            @pointer = match[3]
+          end
+        end
+
+        class StoreInstruction < Instruction
+          attr_reader :bits, :pointer, :value
+
+          def initialize(text)
+            super
+            match = text.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|i(?:1|8|16|32|64)\*)\s+(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            return unless match
+
+            @bits = match[1].to_i
+            @value = match[2]
+            @pointer = match[3]
+          end
+        end
+
+        class BinaryInstruction < Instruction
+          attr_reader :bits, :destination, :flags, :left, :operator, :right
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact))*)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @operator = match[2]
+            @flags = match[3].split.freeze
+            @bits = match[4].to_i
+            @left = match[5]
+            @right = match[6]
+          end
+        end
+
+        class ICmpInstruction < Instruction
+          attr_reader :bits, :destination, :left, :predicate, :right
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @predicate = match[2]
+            @bits = match[3].to_i
+            @left = match[4]
+            @right = match[5]
+          end
+        end
+
+        class CastInstruction < Instruction
+          attr_reader :destination, :from_bits, :operator, :to_bits, :value
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
+            return unless match
+
+            @destination = match[1]
+            @operator = match[2]
+            @from_bits = match[3].to_i
+            @value = match[4]
+            @to_bits = match[5].to_i
+          end
+        end
+
+        class SwitchInstruction < Instruction
+          attr_reader :bits, :cases, :default_label, :value
+
+          def initialize(text)
+            super
+            match = text.match(/\Aswitch\s+i(1|8|16|32|64)\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+)\s+\[(.*)\]\z/)
+            return unless match
+
+            @bits = match[1].to_i
+            @value = match[2]
+            @default_label = match[3]
+            @cases = match[4].scan(/i(?:1|8|16|32|64)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/).map do |case_value, label|
+              [case_value, label]
+            end.freeze
           end
         end
 

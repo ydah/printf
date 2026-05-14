@@ -267,18 +267,20 @@ module PFC
 
       def emit_statement(label, line)
         with_statement_context(line) do
-          return emit_gep(line) if line.include?("getelementptr")
-          return [] if alloca?(line)
-          return emit_store(line) if line.start_with?("store ")
-          return emit_load(line) if line.include?(" load ")
-          return emit_binary(line) if line.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
-          return emit_select(line) if line.match?(/\A#{NAME}\s*=\s*select\b/)
-          return emit_cast(line) if line.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc)\b/)
-          return emit_icmp(line) if line.match?(/\A#{NAME}\s*=\s*icmp\b/)
-          return emit_call(line) if line.include?("call ")
-          return emit_switch(label, line) if line.start_with?("switch ")
-          return emit_branch(label, line) if line.start_with?("br ")
-          return emit_return(line) if line.start_with?("ret ")
+          case instruction_kind(line)
+          when :gep then return emit_gep(line)
+          when :alloca then return []
+          when :store then return emit_store(line)
+          when :load then return emit_load(line)
+          when :binary then return emit_binary(line)
+          when :select then return emit_select(line)
+          when :cast then return emit_cast(line)
+          when :icmp then return emit_icmp(line)
+          when :call then return emit_call(line)
+          when :switch then return emit_switch(label, line)
+          when :branch then return emit_branch(label, line)
+          when :return then return emit_return(line)
+          end
 
           raise Frontend::LLVMSubset::ParseError, "unsupported LLVM instruction: #{line}"
         end
@@ -531,18 +533,20 @@ module PFC
 
       def emit_inline_statement(line, context, label)
         with_statement_context(line) do
-          return emit_inline_gep(line, context) if line.include?("getelementptr")
-          return [] if alloca?(line)
-          return emit_inline_store(line, context) if line.start_with?("store ")
-          return emit_inline_load(line, context) if line.include?(" load ")
-          return emit_inline_binary(line, context) if line.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
-          return emit_inline_select(line, context) if line.match?(/\A#{NAME}\s*=\s*select\b/)
-          return emit_inline_cast(line, context) if line.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc)\b/)
-          return emit_inline_icmp(line, context) if line.match?(/\A#{NAME}\s*=\s*icmp\b/)
-          return emit_inline_call(line, context) if line.include?("call ")
-          return emit_inline_switch(line, context, label) if line.start_with?("switch ")
-          return emit_inline_branch(line, context, label) if line.start_with?("br ")
-          return emit_inline_return(line, context) if line.start_with?("ret ")
+          case instruction_kind(line)
+          when :gep then return emit_inline_gep(line, context)
+          when :alloca then return []
+          when :store then return emit_inline_store(line, context)
+          when :load then return emit_inline_load(line, context)
+          when :binary then return emit_inline_binary(line, context)
+          when :select then return emit_inline_select(line, context)
+          when :cast then return emit_inline_cast(line, context)
+          when :icmp then return emit_inline_icmp(line, context)
+          when :call then return emit_inline_call(line, context)
+          when :switch then return emit_inline_switch(line, context, label)
+          when :branch then return emit_inline_branch(line, context, label)
+          when :return then return emit_inline_return(line, context)
+          end
 
           raise Frontend::LLVMSubset::ParseError, "unsupported internal function instruction: #{line}"
         end
