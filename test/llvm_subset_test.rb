@@ -312,6 +312,31 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "pf_output_i64_decimal((long long)(pf_v_minus), &pf_printf_count_0)"
   end
 
+  def test_accepts_llvm_arithmetic_flags
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %sum = add nsw i32 40, 2
+        %wide = mul nuw i64 4294967296, 2
+        %half = udiv exact i64 %wide, 2
+        %shifted = shl nuw nsw i32 %sum, 1
+        %cmp = icmp eq i64 %half, 4294967296
+        %out = select i1 %cmp, i32 %shifted, i32 78
+        call i32 @putchar(i32 %out)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "pf_v_sum = (unsigned int)(((40) + (2)) & 4294967295u);"
+    assert_includes generated, "pf_v_wide = (unsigned long long)(((4294967296) * (2)) & 18446744073709551615ull);"
+    assert_includes generated, "pf_v_half = (unsigned long long)(((pf_v_wide) / (2)) & 18446744073709551615ull);"
+    assert_includes generated, "pf_v_shifted = (unsigned int)(((pf_v_sum) << (1)) & 4294967295u);"
+  end
+
   def test_supports_signed_extension
     source = <<~LLVM
       declare i32 @putchar(i32)

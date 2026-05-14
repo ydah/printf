@@ -273,7 +273,7 @@ module PFC
       end
 
       def emit_binary(line)
-        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
 
         bits = match[3].to_i
@@ -524,7 +524,7 @@ module PFC
       end
 
       def emit_inline_binary(line, context)
-        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
 
         local = inline_register(context, match[1])
