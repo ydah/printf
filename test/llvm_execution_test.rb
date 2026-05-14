@@ -56,6 +56,39 @@ class LLVMExecutionTest < Minitest::Test
     assert_equal "B", compile_llvm_source_and_run(source)
   end
 
+  def test_runs_overlapping_memmove_program
+    source = <<~LLVM
+      declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg)
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %buffer = alloca [5 x i8], align 1
+        %p0 = getelementptr inbounds [5 x i8], ptr %buffer, i64 0, i64 0
+        %p1 = getelementptr inbounds [5 x i8], ptr %buffer, i64 0, i64 1
+        %p2 = getelementptr inbounds [5 x i8], ptr %buffer, i64 0, i64 2
+        %p3 = getelementptr inbounds [5 x i8], ptr %buffer, i64 0, i64 3
+        %p4 = getelementptr inbounds [5 x i8], ptr %buffer, i64 0, i64 4
+        store i8 65, ptr %p0, align 1
+        store i8 66, ptr %p1, align 1
+        store i8 67, ptr %p2, align 1
+        store i8 68, ptr %p3, align 1
+        call void @llvm.memmove.p0.p0.i64(ptr %p1, ptr %p0, i64 4, i1 false)
+        %c1 = load i8, ptr %p1, align 1
+        %c2 = load i8, ptr %p2, align 1
+        %c3 = load i8, ptr %p3, align 1
+        %c4 = load i8, ptr %p4, align 1
+        call i32 @putchar(i32 %c1)
+        call i32 @putchar(i32 %c2)
+        call i32 @putchar(i32 %c3)
+        call i32 @putchar(i32 %c4)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "ABCD", compile_llvm_source_and_run(source)
+  end
+
   def test_runs_global_integer_program
     source = <<~LLVM
       @.value = global i32 16961, align 4

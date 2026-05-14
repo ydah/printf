@@ -448,6 +448,26 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "llvm_memory[pf_mem_1_dst + pf_mem_1_offset] = llvm_memory[pf_mem_1_src + pf_mem_1_offset];"
   end
 
+  def test_emits_overlap_safe_memmove_loop
+    source = <<~LLVM
+      declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg)
+
+      define i32 @main() {
+      entry:
+        %buffer = alloca [5 x i8], align 1
+        %dst = getelementptr inbounds [5 x i8], ptr %buffer, i64 0, i64 1
+        call void @llvm.memmove.p0.p0.i64(ptr %dst, ptr %buffer, i64 4, i1 false)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "if (pf_mem_0_dst > pf_mem_0_src && pf_mem_0_dst < pf_mem_0_src + pf_mem_0_len)"
+    assert_includes generated, "for (pf_mem_0_offset = pf_mem_0_len; pf_mem_0_offset > 0; pf_mem_0_offset--)"
+    assert_includes generated, "llvm_memory[pf_mem_0_dst + pf_mem_0_offset - 1] = llvm_memory[pf_mem_0_src + pf_mem_0_offset - 1];"
+  end
+
   def test_supports_i64_memory_arithmetic_and_printf
     source = <<~LLVM
       @.fmt = private unnamed_addr constant [11 x i8] c"%llu %lld\\0A\\00", align 1

@@ -1306,7 +1306,7 @@ module PFC
       end
 
       def llvm_memory_intrinsic?(name)
-        llvm_memset_intrinsic?(name) || llvm_memcpy_intrinsic?(name)
+        llvm_memset_intrinsic?(name) || llvm_memcpy_intrinsic?(name) || llvm_memmove_intrinsic?(name)
       end
 
       def llvm_memset_intrinsic?(name)
@@ -1315,6 +1315,10 @@ module PFC
 
       def llvm_memcpy_intrinsic?(name)
         name.start_with?("llvm.memcpy.")
+      end
+
+      def llvm_memmove_intrinsic?(name)
+        name.start_with?("llvm.memmove.")
       end
 
       def validate_memory_intrinsic_signature!(call)
@@ -1353,6 +1357,9 @@ module PFC
         arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
         if llvm_memset_intrinsic?(call.fetch(:function_name))
           return emit_memset_intrinsic(arguments, context:)
+        end
+        if llvm_memmove_intrinsic?(call.fetch(:function_name))
+          return emit_memmove_intrinsic(arguments, context:)
         end
 
         emit_memcpy_intrinsic(arguments, context:)
@@ -1400,6 +1407,45 @@ module PFC
           "        }",
           "    }"
         ]
+      end
+
+      def emit_memmove_intrinsic(arguments, context:)
+        prefix = next_memory_intrinsic_prefix
+        destination = memory_address(arguments.fetch(0).fetch(:value), context:)
+        source = memory_address(arguments.fetch(1).fetch(:value), context:)
+        length = scalar_value(arguments.fetch(2).fetch(:value), context:)
+        lines = [
+          "    {",
+          "        long long #{prefix}_dst = (long long)(#{destination.offset});",
+          "        long long #{prefix}_src = (long long)(#{source.offset});",
+          "        long long #{prefix}_len = (long long)(#{length});",
+          "        long long #{prefix}_offset = 0;",
+          "        if (#{prefix}_dst < 0 || #{prefix}_src < 0 || #{prefix}_len < 0 || #{prefix}_dst + #{prefix}_len > #{destination.limit} || #{prefix}_src + #{prefix}_len > #{source.limit}) {",
+          "            fprintf(stderr, \"pfc runtime error: LLVM memory intrinsic out of range\\n\");",
+          "            PF_ABORT();",
+          "        }"
+        ]
+        if destination.memory == source.memory
+          lines.concat([
+            "        if (#{prefix}_dst > #{prefix}_src && #{prefix}_dst < #{prefix}_src + #{prefix}_len) {",
+            "            for (#{prefix}_offset = #{prefix}_len; #{prefix}_offset > 0; #{prefix}_offset--) {",
+            "                #{destination.memory}[#{prefix}_dst + #{prefix}_offset - 1] = #{source.memory}[#{prefix}_src + #{prefix}_offset - 1];",
+            "            }",
+            "        } else {",
+            "            for (#{prefix}_offset = 0; #{prefix}_offset < #{prefix}_len; #{prefix}_offset++) {",
+            "                #{destination.memory}[#{prefix}_dst + #{prefix}_offset] = #{source.memory}[#{prefix}_src + #{prefix}_offset];",
+            "            }",
+            "        }"
+          ])
+        else
+          lines.concat([
+            "        for (#{prefix}_offset = 0; #{prefix}_offset < #{prefix}_len; #{prefix}_offset++) {",
+            "            #{destination.memory}[#{prefix}_dst + #{prefix}_offset] = #{source.memory}[#{prefix}_src + #{prefix}_offset];",
+            "        }"
+          ])
+        end
+        lines << "    }"
+        lines
       end
 
       def next_memory_intrinsic_prefix
