@@ -32,6 +32,7 @@ module PFC
         @global_numeric_mutability = parsed.fetch(:global_numeric_mutability)
         @global_strings = parsed.fetch(:global_strings)
         @global_string_offsets = build_global_string_offsets
+        @global_string_bytes = build_global_string_memory
         @internal_functions = parsed.fetch(:internal_functions)
         @blocks = parsed.fetch(:blocks)
         @block_order = parsed.fetch(:block_order)
@@ -102,7 +103,7 @@ module PFC
 
       private
 
-      attr_reader :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
+      attr_reader :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -127,6 +128,10 @@ module PFC
           offsets[name] = offset
           offset += bytes.length + 1
         end
+      end
+
+      def build_global_string_memory
+        global_strings.values.flat_map { |bytes| bytes + [0] }
       end
 
       def analyze_global_numeric_pointers
@@ -223,6 +228,11 @@ module PFC
         bytes.map { |byte| "#{byte}u" }.join(", ")
       end
 
+      def global_string_memory_initializer
+        bytes = global_string_bytes.empty? ? [0] : global_string_bytes
+        bytes.map { |byte| "#{byte}u" }.join(", ")
+      end
+
       def main_prelude
         lines = [
           "    FILE *pf_sink = tmpfile();",
@@ -233,12 +243,14 @@ module PFC
           "",
           "    enum { PF_LLVM_MEMORY_SIZE = #{[slot_count, 1].max} };",
           "    enum { PF_LLVM_GLOBAL_MEMORY_SIZE = #{[global_numeric_bytes.length, 1].max} };",
+          "    enum { PF_LLVM_STRING_MEMORY_SIZE = #{[global_string_bytes.length, 1].max} };",
           "    const unsigned long long PF_LLVM_GLOBAL_POINTER_TAG = 9223372036854775808ull;",
           "    const unsigned long long PF_LLVM_READONLY_POINTER_TAG = 4611686018427387904ull;",
           "    const unsigned long long PF_LLVM_STRING_POINTER_TAG = 2305843009213693952ull;",
           "    const unsigned long long PF_LLVM_POINTER_OFFSET_MASK = 2305843009213693951ull;",
           "    unsigned char llvm_memory[PF_LLVM_MEMORY_SIZE] = {0};",
           "    unsigned char llvm_global_memory[PF_LLVM_GLOBAL_MEMORY_SIZE] = {#{global_memory_initializer}};",
+          "    const unsigned char llvm_string_memory[PF_LLVM_STRING_MEMORY_SIZE] = {#{global_string_memory_initializer}};",
           "    int pf_return_code = 0;",
           "    int pf_slot_index = 0;",
           "    int pf_ch = 0;"
@@ -248,6 +260,7 @@ module PFC
         end
         lines << "    (void)llvm_memory;"
         lines << "    (void)llvm_global_memory;"
+        lines << "    (void)llvm_string_memory;"
         lines << "    (void)pf_slot_index;"
         lines << "    (void)pf_ch;"
         registers.each_value do |name|
@@ -299,6 +312,7 @@ module PFC
           when :switch then return emit_switch(label, line)
           when :branch then return emit_branch(label, line)
           when :return then return emit_return(line)
+          when :unreachable then return emit_unreachable
           end
 
           raise Frontend::LLVMSubset::ParseError, "unsupported LLVM instruction: #{line}"
@@ -545,6 +559,7 @@ module PFC
       def emit_call(line)
         call = parsed_call(line)
         validate_call_signature!(call, line)
+        return [] if llvm_noop_intrinsic?(call.fetch(:function_name))
         return emit_memory_intrinsic_call(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
@@ -714,6 +729,7 @@ module PFC
           when :switch then return emit_inline_switch(line, context, label)
           when :branch then return emit_inline_branch(line, context, label)
           when :return then return emit_inline_return(line, context)
+          when :unreachable then return emit_unreachable
           end
 
           raise Frontend::LLVMSubset::ParseError, "unsupported internal function instruction: #{line}"
@@ -932,6 +948,7 @@ module PFC
       def emit_inline_call(line, context)
         call = parsed_call(line)
         validate_call_signature!(call, line)
+        return [] if llvm_noop_intrinsic?(call.fetch(:function_name))
         return emit_memory_intrinsic_call(call, context:) if llvm_memory_intrinsic?(call.fetch(:function_name))
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
@@ -1145,6 +1162,13 @@ module PFC
         ]
       end
 
+      def emit_unreachable
+        [
+          "    fprintf(stderr, \"pfc runtime error: LLVM unreachable executed\\n\");",
+          "    PF_ABORT();"
+        ]
+      end
+
       def phi_goto(from_label, to_label, indent: 1)
         spaces = "    " * indent
         assignments = phi_lines(to_label).filter_map do |line|
@@ -1243,6 +1267,8 @@ module PFC
       def llvm_value(raw)
         tokens = raw.strip.split(/\s+/)
         token = tokens.last
+        return "1u" if token == "true"
+        return "0u" if token == "false" || token == "undef" || token == "poison" || token == "zeroinitializer"
         return token if token.match?(/\A-?\d+\z/)
         return register(token) if token.match?(/\A#{NAME}\z/)
 
@@ -1251,6 +1277,8 @@ module PFC
 
       def inline_value(raw, context)
         token = raw.strip.split(/\s+/).last
+        return "1u" if token == "true"
+        return "0u" if token == "false" || token == "undef" || token == "poison" || token == "zeroinitializer"
         return token if token.match?(/\A-?\d+\z/)
         return context.fetch(:values).fetch(token) if context.fetch(:values).key?(token)
         return register(token) if token.match?(/\A#{NAME}\z/)
@@ -1716,7 +1744,7 @@ module PFC
       end
 
       def parsed_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         {
@@ -1743,6 +1771,7 @@ module PFC
 
       def validate_call_signature!(call, line)
         return validate_memory_intrinsic_signature!(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
+        return validate_noop_intrinsic_signature!(call) if llvm_noop_intrinsic?(call.fetch(:function_name))
 
         signature = function_signature(call.fetch(:function_name))
         unless signature
@@ -1784,6 +1813,10 @@ module PFC
         llvm_memset_intrinsic?(name) || llvm_memcpy_intrinsic?(name) || llvm_memmove_intrinsic?(name)
       end
 
+      def llvm_noop_intrinsic?(name)
+        name.start_with?("llvm.lifetime.start.") || name.start_with?("llvm.lifetime.end.")
+      end
+
       def llvm_memset_intrinsic?(name)
         name.start_with?("llvm.memset.")
       end
@@ -1794,6 +1827,19 @@ module PFC
 
       def llvm_memmove_intrinsic?(name)
         name.start_with?("llvm.memmove.")
+      end
+
+      def validate_noop_intrinsic_signature!(call)
+        name = call.fetch(:function_name)
+        unless call.fetch(:return_type) == "void"
+          raise Frontend::LLVMSubset::ParseError, "call return type mismatch for @#{name}: expected void, got #{call.fetch(:return_type)}"
+        end
+        if call.fetch(:destination)
+          raise Frontend::LLVMSubset::ParseError, "void call cannot assign a result: @#{name}"
+        end
+
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        validate_memory_intrinsic_arguments!(name, arguments, [%w[i32 i64], "ptr"])
       end
 
       def validate_memory_intrinsic_signature!(call)
@@ -2041,7 +2087,13 @@ module PFC
         return encoded_memory_address(pointer.value) if pointer.is_a?(EncodedPointer)
 
         if pointer.is_a?(GlobalStringPointer)
-          raise Frontend::LLVMSubset::ParseError, "global string pointer is only supported for puts/printf: #{name}"
+          return MemoryAddress.new(
+            limit: "PF_LLVM_STRING_MEMORY_SIZE",
+            memory: "llvm_string_memory",
+            name: pointer.name,
+            offset: global_string_offset_expression(pointer),
+            readonly: true
+          )
         end
         if pointer.is_a?(GlobalMemoryPointer)
           return MemoryAddress.new(
@@ -2059,9 +2111,9 @@ module PFC
 
       def encoded_memory_address(encoded)
         MemoryAddress.new(
-          invalid_expression: "(((#{encoded}) & PF_LLVM_STRING_POINTER_TAG) != 0ull)",
-          limit: "(((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? PF_LLVM_GLOBAL_MEMORY_SIZE : PF_LLVM_MEMORY_SIZE)",
-          memory: "(((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? llvm_global_memory : llvm_memory)",
+          invalid_expression: nil,
+          limit: "(((#{encoded}) & PF_LLVM_STRING_POINTER_TAG) != 0ull ? PF_LLVM_STRING_MEMORY_SIZE : (((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? PF_LLVM_GLOBAL_MEMORY_SIZE : PF_LLVM_MEMORY_SIZE))",
+          memory: "(((#{encoded}) & PF_LLVM_STRING_POINTER_TAG) != 0ull ? llvm_string_memory : (((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? llvm_global_memory : llvm_memory))",
           offset: "((#{encoded}) & PF_LLVM_POINTER_OFFSET_MASK)",
           readonly: false,
           readonly_expression: "(((#{encoded}) & PF_LLVM_READONLY_POINTER_TAG) != 0ull)"
@@ -2080,6 +2132,8 @@ module PFC
       def pointer_from_address(address, offset)
         if address.memory == "llvm_global_memory"
           GlobalMemoryPointer.new(name: address.name, offset:)
+        elsif address.memory == "llvm_string_memory"
+          EncodedPointer.new(value: "((unsigned long long)(#{offset}) | PF_LLVM_GLOBAL_POINTER_TAG | PF_LLVM_READONLY_POINTER_TAG | PF_LLVM_STRING_POINTER_TAG)")
         else
           offset
         end
@@ -2122,7 +2176,7 @@ module PFC
         return "((unsigned long long)(#{pointer}))" unless pointer.is_a?(GlobalMemoryPointer) || pointer.is_a?(GlobalStringPointer)
 
         if pointer.is_a?(GlobalStringPointer)
-          offset = global_string_offsets.fetch(pointer.name) + pointer.offset
+          offset = global_string_offset_expression(pointer)
           return "((unsigned long long)(#{offset}) | PF_LLVM_GLOBAL_POINTER_TAG | PF_LLVM_READONLY_POINTER_TAG | PF_LLVM_STRING_POINTER_TAG)"
         end
 
@@ -2137,6 +2191,13 @@ module PFC
         return GlobalStringPointer.new(name: token, offset: 0) if global_strings.key?(token)
 
         resolve_pointer(token, context:)
+      end
+
+      def global_string_offset_expression(pointer)
+        base = global_string_offsets.fetch(pointer.name)
+        return base + pointer.offset if pointer.offset.is_a?(Integer)
+
+        "(#{base} + (#{pointer.offset}))"
       end
 
       def register(name)

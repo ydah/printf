@@ -224,4 +224,58 @@ class LLVMFeatureExtensionTest < Minitest::Test
 
     assert_equal "p=0x8000000000000000\n", compile_llvm_source_and_run(source)
   end
+
+  def test_accepts_common_attributes_metadata_and_boolean_constants
+    source = <<~LLVM
+      declare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture)
+      declare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture)
+      declare i32 @putchar(i32 noundef)
+
+      define noundef i32 @main() {
+      entry:
+        %slot = alloca i8, align 1
+        call void @llvm.lifetime.start.p0(i64 1, ptr nonnull %slot), !dbg !1
+        store volatile i8 66, ptr nonnull %slot, align 1, !tbaa !2
+        %value = load volatile i8, ptr nonnull %slot, align 1, !tbaa !2
+        %ok = icmp eq i1 true, true
+        %selected = select i1 %ok, i8 %value, i8 poison
+        %extended = zext i8 %selected to i32
+        tail call noundef i32 @putchar(i32 noundef %extended)
+        call void @llvm.lifetime.end.p0(i64 1, ptr nonnull %slot)
+        ret i32 zeroinitializer
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_global_string_memory_can_be_loaded
+    source = <<~LLVM
+      @.str = private unnamed_addr constant [3 x i8] c"BC\\00"
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %ptr = getelementptr [3 x i8], ptr @.str, i32 0, i32 0
+        %value = load i8, ptr %ptr
+        call i32 @putchar(i32 %value)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_unreachable_emits_runtime_abort
+    source = <<~LLVM
+      define i32 @main() {
+      entry:
+        unreachable
+      }
+    LLVM
+
+    c_source = PFC::Backend::LLVMCEmitter.new(source).emit
+    assert_includes c_source, "LLVM unreachable executed"
+  end
 end

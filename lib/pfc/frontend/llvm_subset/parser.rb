@@ -127,6 +127,7 @@ module PFC
             return :switch if text.start_with?("switch ")
             return :branch if text.start_with?("br ")
             return :return if text.start_with?("ret ")
+            return :unreachable if text == "unreachable"
 
             :unknown
           end
@@ -137,7 +138,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
             return unless match
 
             @destination = match[1]
@@ -543,7 +544,7 @@ module PFC
             stripped = line.sub(/;.*/, "").strip
             next if stripped.empty?
 
-            if (match = stripped.match(/\Adeclare\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)\z/))
+            if (match = stripped.match(/\Adeclare\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+#[0-9]+)?\z/))
               add_function_signature!(
                 signatures,
                 build_function_signature(match[2], match[1], match[3], defined: false),
@@ -674,11 +675,26 @@ module PFC
               line = collect_switch_line(line, source_lines, index + 1)
               index += 1 until index >= source_lines.length || source_lines[index].include?("]")
             end
-            lines << line.gsub(/\s+/, " ")
+            lines << normalize_instruction_line(line)
             index += 1
           end
 
           lines
+        end
+
+        def normalize_instruction_line(line)
+          normalized = line.gsub(/\s+/, " ")
+          normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?(?:tail|musttail|notail)\s+call\b/, '\1call')
+          normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?call\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\b/, '\1call \2')
+          normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?load\s+volatile\s+/, '\1load ')
+          normalized = normalized.sub(/\Astore\s+volatile\s+/, "store ")
+          loop do
+            stripped = normalized.sub(/,\s*![A-Za-z0-9_.-]+(?:\s+![A-Za-z0-9_.-]+|\s+\{[^}]*\})?\z/, "")
+            break if stripped == normalized
+
+            normalized = stripped
+          end
+          normalized
         end
 
         def collect_switch_line(line, source_lines, start_index)
@@ -763,8 +779,8 @@ module PFC
         end
 
         def outgoing_labels(lines)
-          terminator = lines.reverse.find { |line| line.start_with?("br ") || line.start_with?("switch ") || line.start_with?("ret ") }
-          return [] if terminator.nil? || terminator.start_with?("ret ")
+          terminator = lines.reverse.find { |line| line.start_with?("br ") || line.start_with?("switch ") || line.start_with?("ret ") || line == "unreachable" }
+          return [] if terminator.nil? || terminator.start_with?("ret ") || terminator == "unreachable"
 
           branch_labels(terminator) + switch_labels(terminator)
         end
