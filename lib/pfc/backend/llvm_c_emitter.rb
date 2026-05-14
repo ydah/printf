@@ -12,11 +12,18 @@ module PFC
       NAME = /%[-A-Za-z$._0-9]+/
       GLOBAL_NAME = /@[-A-Za-z$._0-9]+/
       GlobalStringPointer = Struct.new(:name, :offset, keyword_init: true)
+      BUILTIN_FUNCTION_SIGNATURES = {
+        "getchar" => { return_type: "i32", parameter_types: [], varargs: false },
+        "printf" => { return_type: "i32", parameter_types: ["ptr"], varargs: true },
+        "putchar" => { return_type: "i32", parameter_types: ["i32"], varargs: false },
+        "puts" => { return_type: "i32", parameter_types: ["ptr"], varargs: false }
+      }.freeze
 
       def initialize(source, tape_size: DEFAULT_TAPE_SIZE)
         parsed = Frontend::LLVMSubset::Parser.parse(source)
         @source = parsed.fetch(:source)
         @tape_size = Integer(tape_size)
+        @function_signatures = parsed.fetch(:function_signatures)
         @global_strings = parsed.fetch(:global_strings)
         @internal_functions = parsed.fetch(:internal_functions)
         @blocks = parsed.fetch(:blocks)
@@ -30,6 +37,7 @@ module PFC
         @printf_call_index = 0
         @phi_temp_index = 0
         validate_tape_size!
+        validate_builtin_declarations!
         analyze_allocations
         analyze_registers
       end
@@ -80,7 +88,7 @@ module PFC
 
       private
 
-      attr_reader :blocks, :block_order, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
+      attr_reader :blocks, :block_order, :function_signatures, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -311,6 +319,8 @@ module PFC
       end
 
       def emit_call(line)
+        validate_call_signature!(parsed_call(line), line)
+
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
           output = ["    pf_ch = getchar();"]
           output << "    #{register(match[1])} = pf_ch == EOF ? 0u : (unsigned int)(unsigned char)pf_ch;" if match[1]
@@ -351,14 +361,7 @@ module PFC
       end
 
       def parse_call_arguments(raw)
-        return [] if raw.strip.empty?
-
-        raw.split(",").map do |argument|
-          match = argument.strip.match(/\Ai(?:1|8|16|32|64)\s+(.+)\z/)
-          raise Frontend::LLVMSubset::ParseError, "unsupported call argument: #{argument}" unless match
-
-          match[1]
-        end
+        parse_typed_call_arguments(raw).map { |argument| argument.fetch(:value) }
       end
 
       def inline_function_call(destination, function, arguments, caller_context: nil)
@@ -565,6 +568,8 @@ module PFC
       end
 
       def emit_inline_call(line, context)
+        validate_call_signature!(parsed_call(line), line)
+
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
           output = ["    pf_ch = getchar();"]
           output << "    #{inline_register(context, match[1])} = pf_ch == EOF ? 0u : (unsigned int)(unsigned char)pf_ch;" if match[1]
@@ -953,6 +958,91 @@ module PFC
 
         arguments << current.strip unless current.strip.empty?
         arguments
+      end
+
+      def parsed_call(line)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
+
+        {
+          destination: match[1],
+          function_name: match[3],
+          raw_arguments: match[4],
+          return_type: match[2]
+        }
+      end
+
+      def parse_typed_call_arguments(raw)
+        split_call_arguments(raw).map do |argument|
+          stripped = argument.strip
+          if (match = stripped.match(/\A(i(?:1|8|16|32|64))\s+(.+)\z/))
+            next({ type: match[1], value: match[2] })
+          end
+          if (match = stripped.match(/\Aptr(?:\s+\w+)*\s+(.+)\z/))
+            next({ type: "ptr", value: match[1] })
+          end
+
+          raise Frontend::LLVMSubset::ParseError, "unsupported call argument: #{argument}"
+        end
+      end
+
+      def validate_call_signature!(call, line)
+        signature = function_signature(call.fetch(:function_name))
+        unless signature
+          raise Frontend::LLVMSubset::ParseError, "unknown function: @#{call.fetch(:function_name)}"
+        end
+        unless call.fetch(:return_type) == signature.fetch(:return_type)
+          raise Frontend::LLVMSubset::ParseError, "call return type mismatch for @#{call.fetch(:function_name)}: expected #{signature.fetch(:return_type)}, got #{call.fetch(:return_type)}"
+        end
+
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        parameter_types = signature.fetch(:parameter_types)
+        if signature.fetch(:varargs)
+          if arguments.length < parameter_types.length
+            raise Frontend::LLVMSubset::ParseError, "wrong argument count for @#{call.fetch(:function_name)}: expected at least #{parameter_types.length}, got #{arguments.length}"
+          end
+        elsif arguments.length != parameter_types.length
+          raise Frontend::LLVMSubset::ParseError, "wrong argument count for @#{call.fetch(:function_name)}: expected #{parameter_types.length}, got #{arguments.length}"
+        end
+
+        parameter_types.each_with_index do |type, index|
+          actual = arguments.fetch(index).fetch(:type)
+          next if type == actual
+
+          raise Frontend::LLVMSubset::ParseError, "call argument #{index + 1} type mismatch for @#{call.fetch(:function_name)}: expected #{type}, got #{actual}"
+        end
+      rescue Frontend::LLVMSubset::ParseError => e
+        raise e if e.message.start_with?("line ")
+
+        line_number = source_line_number(line)
+        prefix = line_number ? "line #{line_number}: " : ""
+        raise Frontend::LLVMSubset::ParseError, "#{prefix}#{e.message}"
+      end
+
+      def function_signature(name)
+        function_signatures[name] || BUILTIN_FUNCTION_SIGNATURES[name]
+      end
+
+      def validate_builtin_declarations!
+        BUILTIN_FUNCTION_SIGNATURES.each do |name, expected|
+          declared = function_signatures[name]
+          next unless declared
+          next if same_function_signature?(declared, expected)
+
+          raise Frontend::LLVMSubset::ParseError, "unsupported declaration for @#{name}: expected #{function_signature_description(expected)}"
+        end
+      end
+
+      def same_function_signature?(left, right)
+        left.fetch(:return_type) == right.fetch(:return_type) &&
+          left.fetch(:parameter_types) == right.fetch(:parameter_types) &&
+          left.fetch(:varargs) == right.fetch(:varargs)
+      end
+
+      def function_signature_description(signature)
+        parameters = signature.fetch(:parameter_types).dup
+        parameters << "..." if signature.fetch(:varargs)
+        "#{signature.fetch(:return_type)}(#{parameters.join(', ')})"
       end
 
       def global_string_pointer(raw_pointer, context:)

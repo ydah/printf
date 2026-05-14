@@ -35,6 +35,10 @@ class LLVMSubsetTest < Minitest::Test
     assert_equal "%value", ret.value
     assert_equal ["id"], parsed.fetch(:internal_functions).keys
     assert_equal ["ret i32 %x"], parsed.fetch(:internal_functions).fetch("id").fetch(:blocks).fetch("entry")
+    signature = parsed.fetch(:function_signatures).fetch("id")
+    assert_equal "i32", signature.fetch(:return_type)
+    assert_equal ["i32"], signature.fetch(:parameter_types)
+    refute signature.fetch(:varargs)
   end
 
   def test_parser_decodes_global_string_constants
@@ -451,5 +455,55 @@ class LLVMSubsetTest < Minitest::Test
     end
 
     assert_equal "line 3: unsupported LLVM instruction: fence seq_cst", error.message
+  end
+
+  def test_rejects_wrong_call_argument_count
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+      define i32 @main() {
+      entry:
+        call i32 @putchar()
+        ret i32 0
+      }
+    LLVM
+
+    error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(source).emit
+    end
+
+    assert_equal "line 4: wrong argument count for @putchar: expected 1, got 0", error.message
+  end
+
+  def test_rejects_wrong_call_argument_type
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+      define i32 @main() {
+      entry:
+        call i32 @putchar(i64 65)
+        ret i32 0
+      }
+    LLVM
+
+    error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(source).emit
+    end
+
+    assert_equal "line 4: call argument 1 type mismatch for @putchar: expected i32, got i64", error.message
+  end
+
+  def test_rejects_unsupported_builtin_declaration
+    source = <<~LLVM
+      declare i64 @putchar(i32)
+      define i32 @main() {
+      entry:
+        ret i32 0
+      }
+    LLVM
+
+    error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(source).emit
+    end
+
+    assert_equal "unsupported declaration for @putchar: expected i32(i32)", error.message
   end
 end

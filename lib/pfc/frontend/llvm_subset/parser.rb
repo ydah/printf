@@ -204,6 +204,7 @@ module PFC
           {
             block_order:,
             blocks:,
+            function_signatures: parse_function_signatures,
             global_strings: parse_global_strings,
             internal_functions:,
             source:,
@@ -243,12 +244,14 @@ module PFC
 
             unless name == "main"
               order, blocks = parse_function_blocks(body.join)
+              parameter_declarations = parse_parameter_declarations(match[3], require_names: true, allow_pointer: false, allow_varargs: false)
               functions[name] = {
                 allocations: {},
                 blocks:,
                 block_order: order,
                 name:,
-                params: parse_parameters(match[3]),
+                param_types: parameter_declarations.map { |parameter| parameter.fetch(:type) },
+                params: parameter_declarations.map { |parameter| parameter.fetch(:name) },
                 return_type:
               }
             end
@@ -271,6 +274,59 @@ module PFC
 
             strings[match[1]] = bytes
           end
+        end
+
+        def parse_function_signatures
+          source.each_line.each_with_object({}) do |line, signatures|
+            stripped = line.sub(/;.*/, "").strip
+            next if stripped.empty?
+
+            if (match = stripped.match(/\Adeclare\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)\z/))
+              add_function_signature!(
+                signatures,
+                build_function_signature(match[2], match[1], match[3], defined: false),
+                stripped
+              )
+            elsif (match = stripped.match(/\Adefine\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\s+@([-A-Za-z$._0-9]+)\((.*?)\)\s*\{\z/))
+              add_function_signature!(
+                signatures,
+                build_function_signature(match[2], match[1], match[3], defined: true),
+                stripped
+              )
+            end
+          end
+        end
+
+        def build_function_signature(name, return_type, raw_parameters, defined:)
+          parameters = parse_parameter_declarations(raw_parameters, require_names: false, allow_pointer: true, allow_varargs: true)
+          varargs = parameters.any? { |parameter| parameter.fetch(:type) == "..." }
+          fixed_parameters = parameters.reject { |parameter| parameter.fetch(:type) == "..." }
+          {
+            defined:,
+            name:,
+            parameter_types: fixed_parameters.map { |parameter| parameter.fetch(:type) },
+            return_type:,
+            varargs:
+          }
+        end
+
+        def add_function_signature!(signatures, signature, line)
+          existing = signatures[signature.fetch(:name)]
+          if existing && !same_function_signature?(existing, signature)
+            raise parse_error("conflicting function signature for @#{signature.fetch(:name)}", line)
+          end
+
+          if existing
+            existing[:defined] ||= signature.fetch(:defined)
+          else
+            signatures[signature.fetch(:name)] = signature
+          end
+        end
+
+        def same_function_signature?(left, right)
+          left.fetch(:return_type) == right.fetch(:return_type) &&
+            left.fetch(:parameter_types) == right.fetch(:parameter_types) &&
+            left.fetch(:varargs) == right.fetch(:varargs)
         end
 
         def decode_llvm_string(raw)
@@ -317,13 +373,30 @@ module PFC
         end
 
         def parse_parameters(raw)
+          parse_parameter_declarations(raw, require_names: true, allow_pointer: false, allow_varargs: false).map do |parameter|
+            parameter.fetch(:name)
+          end
+        end
+
+        def parse_parameter_declarations(raw, require_names:, allow_pointer:, allow_varargs:)
           return [] if raw.strip.empty?
 
           raw.split(",").map do |parameter|
-            match = parameter.strip.match(/\Ai(?:1|8|16|32|64)\s+(#{NAME})\z/)
-            raise ParseError, "unsupported function parameter: #{parameter}" unless match
+            stripped = parameter.strip
+            if stripped == "..."
+              raise ParseError, "unsupported function parameter: #{parameter}" unless allow_varargs
 
-            match[1]
+              next({ type: "...", name: nil })
+            end
+
+            type_pattern = allow_pointer ? /i(?:1|8|16|32|64)|ptr/ : /i(?:1|8|16|32|64)/
+            match = stripped.match(/\A(#{type_pattern})(?:\s+(#{NAME}))?\z/)
+            raise ParseError, "unsupported function parameter: #{parameter}" unless match
+            if require_names && match[2].nil?
+              raise ParseError, "unsupported function parameter: #{parameter}"
+            end
+
+            { type: match[1], name: match[2] }
           end
         end
 
