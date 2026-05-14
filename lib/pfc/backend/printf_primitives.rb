@@ -538,6 +538,133 @@ module PFC
               return 0;
           }
 
+          static inline int PF_MAYBE_UNUSED pf_output_i64_signed_formatted(long long value, unsigned int base, const char *digits, int width, int precision, int left_adjust, int zero_pad, int sign_mode, int *count) {
+              int negative = value < 0;
+              unsigned char sign = 0u;
+              unsigned long long magnitude = negative ? 0ull - (unsigned long long)value : (unsigned long long)value;
+              char output[64];
+              int length = 0;
+              int precision_padding;
+              int content_width;
+              int padding;
+
+              if (negative) {
+                  sign = (unsigned char)'-';
+              } else if (sign_mode == 1) {
+                  sign = (unsigned char)'+';
+              } else if (sign_mode == 2) {
+                  sign = (unsigned char)' ';
+              }
+
+              do {
+                  output[length] = digits[magnitude % base];
+                  magnitude /= base;
+                  length++;
+              } while (magnitude != 0ull);
+
+              if (precision == 0 && !negative && value == 0) {
+                  length = 0;
+              }
+
+              precision_padding = precision > length ? precision - length : 0;
+              content_width = length + precision_padding + (sign != 0u);
+              padding = width > content_width ? width - content_width : 0;
+              if (zero_pad && !left_adjust && precision < 0) {
+                  precision_padding += padding;
+                  padding = 0;
+              }
+
+              if (!left_adjust && pf_output_counted_padding(padding, count) != 0) {
+                  return 1;
+              }
+              if (sign != 0u && pf_output_counted_cell(sign, count) != 0) {
+                  return 1;
+              }
+              while (precision_padding > 0) {
+                  if (pf_output_counted_cell((unsigned char)'0', count) != 0) {
+                      return 1;
+                  }
+                  precision_padding--;
+              }
+              while (length > 0) {
+                  length--;
+                  if (pf_output_counted_cell((unsigned char)output[length], count) != 0) {
+                      return 1;
+                  }
+              }
+              if (left_adjust && pf_output_counted_padding(padding, count) != 0) {
+                  return 1;
+              }
+              return 0;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_output_u64_prefixed_formatted(unsigned long long value, unsigned int base, const char *digits, int width, int precision, int left_adjust, int zero_pad, int prefix_mode, int *count) {
+              unsigned long long original = value;
+              const char *prefix = "";
+              int prefix_length = 0;
+              char output[64];
+              int length = 0;
+              int precision_padding;
+              int content_width;
+              int padding;
+
+              do {
+                  output[length] = digits[value % base];
+                  value /= base;
+                  length++;
+              } while (value != 0ull);
+
+              if (precision == 0 && original == 0ull) {
+                  length = 0;
+              }
+
+              if ((prefix_mode == 1 && original != 0ull) || prefix_mode == 4) {
+                  prefix = "0x";
+                  prefix_length = 2;
+              } else if (prefix_mode == 2 && original != 0ull) {
+                  prefix = "0X";
+                  prefix_length = 2;
+              } else if (prefix_mode == 3 && (length == 0 || precision <= length)) {
+                  prefix = "0";
+                  prefix_length = 1;
+              }
+
+              precision_padding = precision > length ? precision - length : 0;
+              content_width = length + precision_padding + prefix_length;
+              padding = width > content_width ? width - content_width : 0;
+              if (zero_pad && !left_adjust && precision < 0) {
+                  precision_padding += padding;
+                  padding = 0;
+              }
+
+              if (!left_adjust && pf_output_counted_padding(padding, count) != 0) {
+                  return 1;
+              }
+              while (prefix_length > 0) {
+                  if (pf_output_counted_cell((unsigned char)*prefix, count) != 0) {
+                      return 1;
+                  }
+                  prefix++;
+                  prefix_length--;
+              }
+              while (precision_padding > 0) {
+                  if (pf_output_counted_cell((unsigned char)'0', count) != 0) {
+                      return 1;
+                  }
+                  precision_padding--;
+              }
+              while (length > 0) {
+                  length--;
+                  if (pf_output_counted_cell((unsigned char)output[length], count) != 0) {
+                      return 1;
+                  }
+              }
+              if (left_adjust && pf_output_counted_padding(padding, count) != 0) {
+                  return 1;
+              }
+              return 0;
+          }
+
           static inline int PF_MAYBE_UNUSED pf_output_cell16(unsigned short cell) {
               if (putchar((int)(cell & 255u)) == EOF) {
                   perror("putchar");

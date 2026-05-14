@@ -44,6 +44,7 @@ module PFC
         @inline_call_index = 0
         @memory_intrinsic_index = 0
         @printf_call_index = 0
+        @printf_format_index = 0
         @phi_temp_index = 0
         validate_tape_size!
         validate_builtin_declarations!
@@ -1311,7 +1312,7 @@ module PFC
             next
           end
 
-          format = parse_printf_format(format_bytes, index)
+          format = resolve_printf_format_arguments(parse_printf_format(format_bytes, index), arguments, context:)
           if format.fetch(:specifier) == 37
             if format.fetch(:length_modifier) || !format.fetch(:precision).nil?
               raise Frontend::LLVMSubset::ParseError, "unsupported printf format: #{printf_format_label(format)}"
@@ -1343,28 +1344,49 @@ module PFC
             flags << "-"
           when 48
             flags << "0"
-          when 32, 35, 43
-            raise Frontend::LLVMSubset::ParseError, "unsupported printf flag: #{format_bytes[cursor].chr}"
+          when 32
+            flags << " "
+          when 35
+            flags << "#"
+          when 43
+            flags << "+"
           else
             break
           end
           cursor += 1
         end
 
-        raise Frontend::LLVMSubset::ParseError, "unsupported printf dynamic width" if format_bytes[cursor] == 42
-
-        width, cursor = read_printf_decimal(format_bytes, cursor)
+        width_argument = false
+        if format_bytes[cursor] == 42
+          width_argument = true
+          width = nil
+          cursor += 1
+        else
+          width, cursor = read_printf_decimal(format_bytes, cursor)
+        end
         precision = nil
+        precision_argument = false
         if format_bytes[cursor] == 46
           cursor += 1
-          raise Frontend::LLVMSubset::ParseError, "unsupported printf dynamic precision" if format_bytes[cursor] == 42
-
-          precision, cursor = read_printf_decimal(format_bytes, cursor)
-          precision ||= 0
+          if format_bytes[cursor] == 42
+            precision_argument = true
+            cursor += 1
+          else
+            precision, cursor = read_printf_decimal(format_bytes, cursor)
+            precision ||= 0
+          end
         end
 
         length_modifier = nil
-        if format_bytes[cursor] == 108
+        if format_bytes[cursor] == 104
+          if format_bytes[cursor + 1] == 104
+            length_modifier = "hh"
+            cursor += 2
+          else
+            length_modifier = "h"
+            cursor += 1
+          end
+        elsif format_bytes[cursor] == 108
           if format_bytes[cursor + 1] == 108
             length_modifier = "ll"
             cursor += 2
@@ -1383,10 +1405,43 @@ module PFC
           length_modifier:,
           next_index: cursor + 1,
           precision:,
+          precision_argument:,
+          precision_expression: nil,
           specifier:,
           width: width || 0,
+          width_argument:,
+          width_expression: nil,
           zero_pad: flags.include?("0") && !flags.include?("-")
         }
+      end
+
+      def resolve_printf_format_arguments(format, arguments, context:)
+        resolved = format.dup
+        if format.fetch(:width_argument)
+          width_argument = arguments.shift
+          raise Frontend::LLVMSubset::ParseError, "missing printf dynamic width argument for #{printf_format_label(format)}" if width_argument.nil?
+
+          bits, width_value = typed_integer_value(width_argument, context:)
+          signed_width = signed_expression(width_value, bits)
+          resolved[:width_expression] = "((#{signed_width}) < 0 ? -(int)(#{signed_width}) : (int)(#{signed_width}))"
+          resolved[:left_adjust_expression] = format.fetch(:left_adjust) ? "1" : "((#{signed_width}) < 0 ? 1 : 0)"
+        else
+          resolved[:width_expression] = format.fetch(:width).to_s
+          resolved[:left_adjust_expression] = printf_bool(format.fetch(:left_adjust)).to_s
+        end
+
+        if format.fetch(:precision_argument)
+          precision_argument = arguments.shift
+          raise Frontend::LLVMSubset::ParseError, "missing printf dynamic precision argument for #{printf_format_label(format)}" if precision_argument.nil?
+
+          bits, precision_value = typed_integer_value(precision_argument, context:)
+          signed_precision = signed_expression(precision_value, bits)
+          resolved[:precision_expression] = "((#{signed_precision}) < 0 ? -1 : (int)(#{signed_precision}))"
+          resolved[:precision] = :dynamic
+        else
+          resolved[:precision_expression] = printf_precision(format).to_s
+        end
+        resolved
       end
 
       def read_printf_decimal(format_bytes, cursor)
@@ -1403,40 +1458,40 @@ module PFC
         when "d", "i"
           bits, value = typed_integer_value(argument, context:)
           output_bits = printf_integer_bits(bits, length_modifier)
-          cast = signed_cast(output_bits)
           if formatted_integer_format?(format)
             return [
-              "    if (pf_output_i64_formatted((long long)((#{cast})(#{value})), 10u, \"0123456789\", #{printf_width(format)}, #{printf_precision(format)}, #{printf_bool(format.fetch(:left_adjust))}, #{printf_bool(format.fetch(:zero_pad))}, &#{count_name}) != 0) PF_ABORT();"
+              "    if (pf_output_i64_signed_formatted(#{printf_signed_integer_value(value, output_bits)}, 10u, \"0123456789\", #{printf_width(format)}, #{printf_precision(format)}, #{printf_left_adjust(format)}, #{printf_zero_pad(format)}, #{printf_sign_mode(format)}, &#{count_name}) != 0) PF_ABORT();"
             ]
           end
 
           helper = output_bits == 64 ? "pf_output_i64_decimal" : "pf_output_i32_decimal"
+          cast = signed_cast(output_bits)
           ["    if (#{helper}((#{cast})(#{value}), &#{count_name}) != 0) PF_ABORT();"]
         when "u"
           bits, value = typed_integer_value(argument, context:)
           output_bits = printf_integer_bits(bits, length_modifier)
-          cast = unsigned_cast(output_bits).delete_prefix("(").delete_suffix(")")
           if formatted_integer_format?(format)
             return [
-              "    if (pf_output_u64_formatted((unsigned long long)((#{cast})(#{value})), 10u, \"0123456789\", #{printf_width(format)}, #{printf_precision(format)}, #{printf_bool(format.fetch(:left_adjust))}, #{printf_bool(format.fetch(:zero_pad))}, &#{count_name}) != 0) PF_ABORT();"
+              "    if (pf_output_u64_prefixed_formatted(#{printf_unsigned_integer_value(value, output_bits)}, 10u, \"0123456789\", #{printf_width(format)}, #{printf_precision(format)}, #{printf_left_adjust(format)}, #{printf_zero_pad(format)}, 0, &#{count_name}) != 0) PF_ABORT();"
             ]
           end
 
           helper = output_bits == 64 ? "pf_output_u64_decimal" : "pf_output_u32_decimal"
+          cast = unsigned_cast(output_bits).delete_prefix("(").delete_suffix(")")
           ["    if (#{helper}((#{cast})(#{value}), &#{count_name}) != 0) PF_ABORT();"]
         when "x", "X", "o"
           bits, value = typed_integer_value(argument, context:)
           output_bits = printf_integer_bits(bits, length_modifier)
-          cast = unsigned_cast(output_bits).delete_prefix("(").delete_suffix(")")
           base = specifier.chr == "o" ? 8 : 16
           digits = specifier.chr == "X" ? "0123456789ABCDEF" : "0123456789abcdef"
           if formatted_integer_format?(format)
             return [
-              "    if (pf_output_u64_formatted((unsigned long long)((#{cast})(#{value})), #{base}u, \"#{digits}\", #{printf_width(format)}, #{printf_precision(format)}, #{printf_bool(format.fetch(:left_adjust))}, #{printf_bool(format.fetch(:zero_pad))}, &#{count_name}) != 0) PF_ABORT();"
+              "    if (pf_output_u64_prefixed_formatted(#{printf_unsigned_integer_value(value, output_bits)}, #{base}u, \"#{digits}\", #{printf_width(format)}, #{printf_precision(format)}, #{printf_left_adjust(format)}, #{printf_zero_pad(format)}, #{printf_prefix_mode(specifier.chr, format)}, &#{count_name}) != 0) PF_ABORT();"
             ]
           end
 
           helper = output_bits == 64 ? "pf_output_u64_radix" : "pf_output_u32_radix"
+          cast = unsigned_cast(output_bits).delete_prefix("(").delete_suffix(")")
           ["    if (#{helper}((#{cast})(#{value}), #{base}u, \"#{digits}\", &#{count_name}) != 0) PF_ABORT();"]
         when "c"
           if length_modifier
@@ -1455,17 +1510,33 @@ module PFC
 
           pointer = global_string_pointer(pointer_argument(argument), context:)
           emit_formatted_static_bytes(null_terminated_bytes(pointer), count_name, format)
+        when "p"
+          if length_modifier || !format.fetch(:precision).nil?
+            raise Frontend::LLVMSubset::ParseError, "unsupported printf format: #{printf_format_label(format)}"
+          end
+
+          pointer = pointer_argument(argument)
+          [
+            "    if (pf_output_u64_prefixed_formatted(#{encoded_pointer_value(pointer, context:)}, 16u, \"0123456789abcdef\", #{printf_width(format)}, -1, #{printf_left_adjust(format)}, #{printf_zero_pad(format)}, 4, &#{count_name}) != 0) PF_ABORT();"
+          ]
         else
           raise Frontend::LLVMSubset::ParseError, "unsupported printf format: #{printf_format_label(format)}"
         end
       end
 
       def formatted_integer_format?(format)
-        format.fetch(:width).positive? || !format.fetch(:precision).nil?
+        (format.fetch(:flags) & ["+", " ", "#"]).any? ||
+          format.fetch(:width).positive? ||
+          format.fetch(:width_argument) ||
+          !format.fetch(:precision).nil? ||
+          format.fetch(:precision_argument) ||
+          %w[h hh].include?(format.fetch(:length_modifier))
       end
 
       def emit_formatted_character(value, count_name, format)
-        padding = [format.fetch(:width) - 1, 0].max
+        return emit_dynamic_formatted_character(value, count_name, format) if format.fetch(:width_argument)
+
+        padding = format.fetch(:width_argument) ? "((#{printf_width(format)}) - 1)" : [format.fetch(:width) - 1, 0].max
         lines = []
         lines.concat(counted_padding_lines(padding, count_name)) unless format.fetch(:left_adjust)
         lines << counted_output_line(value, count_name)
@@ -1473,7 +1544,24 @@ module PFC
         lines
       end
 
+      def emit_dynamic_formatted_character(value, count_name, format)
+        prefix = next_printf_format_prefix
+        [
+          "    {",
+          "        int #{prefix}_width = (int)(#{printf_width(format)});",
+          "        int #{prefix}_left = (int)(#{printf_left_adjust(format)});",
+          "        if (!#{prefix}_left && pf_output_counted_padding(#{prefix}_width - 1, &#{count_name}) != 0) PF_ABORT();",
+          "        if (pf_output_counted_cell((unsigned char)(#{value}), &#{count_name}) != 0) PF_ABORT();",
+          "        if (#{prefix}_left && pf_output_counted_padding(#{prefix}_width - 1, &#{count_name}) != 0) PF_ABORT();",
+          "    }"
+        ]
+      end
+
       def emit_formatted_static_bytes(bytes, count_name, format)
+        if format.fetch(:width_argument) || format.fetch(:precision_argument)
+          return emit_dynamic_formatted_static_bytes(bytes, count_name, format)
+        end
+
         selected = format.fetch(:precision).nil? ? bytes : bytes.take(format.fetch(:precision))
         padding = [format.fetch(:width) - selected.length, 0].max
         lines = []
@@ -1483,22 +1571,78 @@ module PFC
         lines
       end
 
+      def emit_dynamic_formatted_static_bytes(bytes, count_name, format)
+        prefix = next_printf_format_prefix
+        lines = [
+          "    {",
+          "        int #{prefix}_width = (int)(#{printf_width(format)});",
+          "        int #{prefix}_precision = (int)(#{printf_precision(format)});",
+          "        int #{prefix}_left = (int)(#{printf_left_adjust(format)});",
+          "        int #{prefix}_length = (#{prefix}_precision < 0 || #{prefix}_precision > #{bytes.length}) ? #{bytes.length} : #{prefix}_precision;"
+        ]
+        lines << "        if (!#{prefix}_left && pf_output_counted_padding(#{prefix}_width - #{prefix}_length, &#{count_name}) != 0) PF_ABORT();"
+        bytes.each_with_index do |byte, index|
+          lines << "        if (#{prefix}_length > #{index} && pf_output_counted_cell((unsigned char)(#{byte}), &#{count_name}) != 0) PF_ABORT();"
+        end
+        lines << "        if (#{prefix}_left && pf_output_counted_padding(#{prefix}_width - #{prefix}_length, &#{count_name}) != 0) PF_ABORT();"
+        lines << "    }"
+        lines
+      end
+
       def counted_padding_lines(width, count_name)
-        return [] unless width.positive?
+        return [] if width.is_a?(Integer) && !width.positive?
 
         ["    if (pf_output_counted_padding(#{width}, &#{count_name}) != 0) PF_ABORT();"]
       end
 
       def printf_width(format)
-        format.fetch(:width)
+        format.fetch(:width_expression) || format.fetch(:width)
       end
 
       def printf_precision(format)
-        format.fetch(:precision) || -1
+        format.fetch(:precision_expression) || (format.fetch(:precision) || -1)
+      end
+
+      def printf_left_adjust(format)
+        format.fetch(:left_adjust_expression) || printf_bool(format.fetch(:left_adjust))
+      end
+
+      def printf_zero_pad(format)
+        printf_bool(format.fetch(:zero_pad))
+      end
+
+      def printf_sign_mode(format)
+        return 1 if format.fetch(:flags).include?("+")
+        return 2 if format.fetch(:flags).include?(" ")
+
+        0
+      end
+
+      def printf_prefix_mode(specifier, format)
+        return 0 unless format.fetch(:flags).include?("#")
+        return 1 if specifier == "x"
+        return 2 if specifier == "X"
+        return 3 if specifier == "o"
+
+        0
+      end
+
+      def printf_signed_integer_value(value, bits)
+        "((long long)(#{signed_expression(value, bits)}))"
+      end
+
+      def printf_unsigned_integer_value(value, bits)
+        "((unsigned long long)((#{value}) & #{integer_mask_literal(bits)}))"
       end
 
       def printf_bool(value)
         value ? 1 : 0
+      end
+
+      def next_printf_format_prefix
+        name = "pf_printf_fmt_#{@printf_format_index}"
+        @printf_format_index += 1
+        name
       end
 
       def printf_format_label(format)
@@ -1511,6 +1655,8 @@ module PFC
 
       def printf_integer_bits(argument_bits, length_modifier)
         return 64 if length_modifier == "l" || length_modifier == "ll"
+        return 16 if length_modifier == "h"
+        return 8 if length_modifier == "hh"
         return argument_bits if length_modifier.nil?
 
         raise Frontend::LLVMSubset::ParseError, "unsupported printf length modifier: #{length_modifier}"

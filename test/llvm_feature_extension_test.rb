@@ -174,4 +174,54 @@ class LLVMFeatureExtensionTest < Minitest::Test
 
     assert_equal "B", compile_llvm_source_and_run(source)
   end
+
+  def test_printf_additional_integer_flags_and_short_lengths
+    source = <<~LLVM
+      @.fmt = private unnamed_addr constant [30 x i8] c"a=%+05d b=%#06x c=%#o e=%hhd\\0A\\00"
+
+      declare i32 @printf(ptr, ...)
+
+      define i32 @main() {
+      entry:
+        call i32 (ptr, ...) @printf(ptr @.fmt, i32 -7, i32 26, i32 9, i32 255)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "a=-0007 b=0x001a c=011 e=-1\n", compile_llvm_source_and_run(source)
+  end
+
+  def test_printf_dynamic_width_and_precision_for_static_strings
+    source = <<~LLVM
+      @.fmt = private unnamed_addr constant [9 x i8] c"[%*.*s]\\0A\\00"
+      @.str = private unnamed_addr constant [7 x i8] c"abcdef\\00"
+
+      declare i32 @printf(ptr, ...)
+
+      define i32 @main() {
+      entry:
+        call i32 (ptr, ...) @printf(ptr @.fmt, i32 6, i32 3, ptr @.str)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "[   abc]\n", compile_llvm_source_and_run(source)
+  end
+
+  def test_printf_pointer_format_outputs_encoded_pointer
+    source = <<~LLVM
+      @.fmt = private unnamed_addr constant [6 x i8] c"p=%p\\0A\\00"
+      @.cell = global i8 65
+
+      declare i32 @printf(ptr, ...)
+
+      define i32 @main() {
+      entry:
+        call i32 (ptr, ...) @printf(ptr @.fmt, ptr @.cell)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "p=0x8000000000000000\n", compile_llvm_source_and_run(source)
+  end
 end
