@@ -903,6 +903,19 @@ module PFC
       end
 
       def emit_inline_branch(line, context, label)
+        if line.respond_to?(:targets) && line.targets
+          return inline_phi_goto(context, label, line.targets.fetch(0)) if line.condition.nil?
+
+          true_label = line.targets.fetch(0)
+          false_label = line.targets.fetch(1)
+          lines = ["    if ((#{inline_value(line.condition, context)}) != 0u) {"]
+          lines.concat(inline_phi_goto(context, label, true_label, indent: 2))
+          lines << "    } else {"
+          lines.concat(inline_phi_goto(context, label, false_label, indent: 2))
+          lines << "    }"
+          return lines
+        end
+
         if (match = line.match(/\Abr\s+label\s+%([-A-Za-z$._0-9]+)\z/))
           return inline_phi_goto(context, label, match[1])
         end
@@ -910,9 +923,9 @@ module PFC
         match = line.match(/\Abr\s+i1\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+),\s+label\s+%([-A-Za-z$._0-9]+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported branch: #{line}" unless match
 
+        lines = ["    if ((#{inline_value(match[1], context)}) != 0u) {"]
         true_label = match[2]
         false_label = match[3]
-        lines = ["    if ((#{inline_value(match[1], context)}) != 0u) {"]
         lines.concat(inline_phi_goto(context, label, true_label, indent: 2))
         lines << "    } else {"
         lines.concat(inline_phi_goto(context, label, false_label, indent: 2))
@@ -921,6 +934,24 @@ module PFC
       end
 
       def emit_inline_return(line, context)
+        if line.respond_to?(:return_type) && line.return_type
+          if line.return_type == "void"
+            unless context.fetch(:function).fetch(:return_type) == "void"
+              raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}"
+            end
+
+            return ["    goto #{context.fetch(:return_label)};"]
+          end
+          if context.fetch(:function).fetch(:return_type) == "void" || line.value.nil?
+            raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}"
+          end
+
+          return [
+            "    #{context.fetch(:return_destination)} = (unsigned long long)(#{inline_value(line.value, context)});",
+            "    goto #{context.fetch(:return_label)};"
+          ]
+        end
+
         if line == "ret void"
           unless context.fetch(:function).fetch(:return_type) == "void"
             raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}"
@@ -942,6 +973,19 @@ module PFC
       end
 
       def emit_branch(label, line)
+        if line.respond_to?(:targets) && line.targets
+          return phi_goto(label, line.targets.fetch(0)) if line.condition.nil?
+
+          true_label = line.targets.fetch(0)
+          false_label = line.targets.fetch(1)
+          lines = ["    if ((#{llvm_value(line.condition)}) != 0u) {"]
+          lines.concat(phi_goto(label, true_label, indent: 2))
+          lines << "    } else {"
+          lines.concat(phi_goto(label, false_label, indent: 2))
+          lines << "    }"
+          return lines
+        end
+
         if (match = line.match(/\Abr\s+label\s+%([-A-Za-z$._0-9]+)\z/))
           return phi_goto(label, match[1])
         end
@@ -949,9 +993,9 @@ module PFC
         match = line.match(/\Abr\s+i1\s+(.+?),\s+label\s+%([-A-Za-z$._0-9]+),\s+label\s+%([-A-Za-z$._0-9]+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported branch: #{line}" unless match
 
+        lines = ["    if ((#{llvm_value(match[1])}) != 0u) {"]
         true_label = match[2]
         false_label = match[3]
-        lines = ["    if ((#{llvm_value(match[1])}) != 0u) {"]
         lines.concat(phi_goto(label, true_label, indent: 2))
         lines << "    } else {"
         lines.concat(phi_goto(label, false_label, indent: 2))
@@ -988,6 +1032,15 @@ module PFC
       end
 
       def emit_return(line)
+        if line.respond_to?(:return_type) && line.return_type
+          return ["    goto pf_done;"] if line.return_type == "void"
+
+          return [
+            "    pf_return_code = (int)(#{llvm_value(line.value)});",
+            "    goto pf_done;"
+          ]
+        end
+
         match = line.match(/\Aret\s+i(?:1|8|16|32|64)\s+(.+)\z/)
         return ["    goto pf_done;"] unless match
 
@@ -1012,13 +1065,22 @@ module PFC
       end
 
       def phi_assignment(line, from_label)
+        if line.respond_to?(:incoming) && line.incoming && line.bits
+          value = line.incoming.find { |_value, label| label == from_label }&.first
+          return nil if value.nil?
+
+          return {
+            expression: "#{unsigned_cast(line.bits)}((#{llvm_value(value)}) & #{integer_mask_literal(line.bits)})",
+            target: register(line.destination)
+          }
+        end
+
         match = line.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported phi: #{line}" unless match
 
         incoming = match[3].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/)
         value = incoming.find { |_value, label| label == from_label }&.first
         return nil if value.nil?
-
         bits = match[2].to_i
         {
           expression: "#{unsigned_cast(bits)}((#{llvm_value(value)}) & #{integer_mask_literal(bits)})",
@@ -1041,13 +1103,22 @@ module PFC
       end
 
       def inline_phi_assignment(context, line, from_label)
+        if line.respond_to?(:incoming) && line.incoming && line.bits
+          value = line.incoming.find { |_value, label| label == from_label }&.first
+          return nil if value.nil?
+
+          return {
+            expression: "#{unsigned_cast(line.bits)}((#{inline_value(value, context)}) & #{integer_mask_literal(line.bits)})",
+            target: inline_register(context, line.destination)
+          }
+        end
+
         match = line.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported phi: #{line}" unless match
 
         incoming = match[3].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/)
         value = incoming.find { |_value, label| label == from_label }&.first
         return nil if value.nil?
-
         bits = match[2].to_i
         {
           expression: "#{unsigned_cast(bits)}((#{inline_value(value, context)}) & #{integer_mask_literal(bits)})",
