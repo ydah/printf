@@ -284,7 +284,7 @@ class LLVMSubsetTest < Minitest::Test
 
   def test_supports_i64_memory_arithmetic_and_printf
     source = <<~LLVM
-      @.fmt = private unnamed_addr constant [7 x i8] c"%u %d\\0A\\00", align 1
+      @.fmt = private unnamed_addr constant [11 x i8] c"%llu %lld\\0A\\00", align 1
       declare i32 @putchar(i32)
       declare i32 @printf(ptr, ...)
 
@@ -439,6 +439,24 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes generated, "pf_output_u32_decimal((unsigned int)(42), &pf_printf_count_0)"
     assert_includes generated, "pf_output_counted_cell((unsigned char)(65), &pf_printf_count_0)"
     assert_includes generated, "pf_v_result = (unsigned int)(pf_printf_count_0);"
+  end
+
+  def test_emits_printf_for_long_length_modifiers
+    source = <<~LLVM
+      @.fmt = private unnamed_addr constant [8 x i8] c"%lu %ld\\00", align 1
+      declare i32 @printf(ptr, ...)
+
+      define i32 @main() {
+      entry:
+        %result = call i32 (ptr, ...) @printf(ptr @.fmt, i32 42, i32 -7)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "pf_output_u64_decimal((unsigned long long)(42), &pf_printf_count_0)"
+    assert_includes generated, "pf_output_i64_decimal((long long)(-7), &pf_printf_count_0)"
   end
 
   def test_reports_source_line_for_unsupported_llvm_instruction

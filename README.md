@@ -45,7 +45,7 @@ Supported commands:
 - `dump-cfg INPUT`
 - `dump-c INPUT`
 
-`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports scalar and fixed-array `alloca`/`load`/`store` for `i1`/`i8`/`i16`/`i32`/`i64`, constant or dynamic `getelementptr`, `add`/`sub`/`mul`/division/remainder, bitwise and shift operations, `icmp`, `select`, `switch`, `br`, simple `phi`, `ret`, `void @main`, nested internal integer and `void` calls with local CFG and memory, global `i8` string constants for direct `puts` and static `printf` calls with `%d`/`%i`/`%u`/`%c`/`%s`/`%%`, and `putchar`/`getchar`.
+`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports scalar and fixed-array `alloca`/`load`/`store` for `i1`/`i8`/`i16`/`i32`/`i64`, constant or dynamic `getelementptr`, `add`/`sub`/`mul`/division/remainder, bitwise and shift operations, `icmp`, `select`, `switch`, `br`, simple `phi`, `ret`, `void @main`, nested internal integer and `void` calls with local CFG and memory, global `i8` string constants for direct `puts` and static `printf` calls with `%d`/`%i`/`%u`/`%ld`/`%li`/`%lu`/`%lld`/`%lli`/`%llu`/`%c`/`%s`/`%%`, and `putchar`/`getchar`.
 
 The generated program still uses C control flow as the scheduler. It does not claim a single-call `printf` execution model, which would require implementation-dependent or undefined behavior outside this project's safety scope.
 

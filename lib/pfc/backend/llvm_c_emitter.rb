@@ -863,18 +863,29 @@ module PFC
             next
           end
 
-          specifier = format_bytes[index + 1]
+          specifier_index = index + 1
+          length_modifier = nil
+          if format_bytes[specifier_index] == 108
+            if format_bytes[specifier_index + 1] == 108
+              length_modifier = "ll"
+              specifier_index += 2
+            else
+              length_modifier = "l"
+              specifier_index += 1
+            end
+          end
+          specifier = format_bytes[specifier_index]
           raise Frontend::LLVMSubset::ParseError, "unterminated printf format specifier" if specifier.nil?
 
-          if specifier == 37
+          if specifier == 37 && length_modifier.nil?
             lines << counted_output_line(37, count_name)
           else
             argument = arguments.shift
             raise Frontend::LLVMSubset::ParseError, "missing printf argument for %#{specifier.chr}" if argument.nil?
 
-            lines.concat(emit_printf_specifier(specifier, argument, count_name, context:))
+            lines.concat(emit_printf_specifier(specifier, argument, count_name, context:, length_modifier:))
           end
-          index += 2
+          index = specifier_index + 1
         end
 
         unless arguments.empty?
@@ -884,27 +895,45 @@ module PFC
         lines
       end
 
-      def emit_printf_specifier(specifier, argument, count_name, context:)
+      def emit_printf_specifier(specifier, argument, count_name, context:, length_modifier: nil)
         case specifier.chr
         when "d", "i"
           bits, value = typed_integer_value(argument, context:)
-          helper = bits == 64 ? "pf_output_i64_decimal" : "pf_output_i32_decimal"
-          cast = signed_cast(bits)
+          output_bits = printf_integer_bits(bits, length_modifier)
+          helper = output_bits == 64 ? "pf_output_i64_decimal" : "pf_output_i32_decimal"
+          cast = signed_cast(output_bits)
           ["    if (#{helper}((#{cast})(#{value}), &#{count_name}) != 0) PF_ABORT();"]
         when "u"
           bits, value = typed_integer_value(argument, context:)
-          helper = bits == 64 ? "pf_output_u64_decimal" : "pf_output_u32_decimal"
-          cast = unsigned_cast(bits).delete_prefix("(").delete_suffix(")")
+          output_bits = printf_integer_bits(bits, length_modifier)
+          helper = output_bits == 64 ? "pf_output_u64_decimal" : "pf_output_u32_decimal"
+          cast = unsigned_cast(output_bits).delete_prefix("(").delete_suffix(")")
           ["    if (#{helper}((#{cast})(#{value}), &#{count_name}) != 0) PF_ABORT();"]
         when "c"
+          if length_modifier
+            raise Frontend::LLVMSubset::ParseError, "unsupported printf format: %#{length_modifier}#{specifier.chr}"
+          end
+
           _bits, value = typed_integer_value(argument, context:)
           [counted_output_line(value, count_name)]
         when "s"
+          if length_modifier
+            raise Frontend::LLVMSubset::ParseError, "unsupported printf format: %#{length_modifier}#{specifier.chr}"
+          end
+
           pointer = global_string_pointer(pointer_argument(argument), context:)
           null_terminated_bytes(pointer).map { |byte| counted_output_line(byte, count_name) }
         else
-          raise Frontend::LLVMSubset::ParseError, "unsupported printf format: %#{specifier.chr}"
+          modifier = length_modifier || ""
+          raise Frontend::LLVMSubset::ParseError, "unsupported printf format: %#{modifier}#{specifier.chr}"
         end
+      end
+
+      def printf_integer_bits(argument_bits, length_modifier)
+        return 64 if length_modifier == "l" || length_modifier == "ll"
+        return argument_bits if length_modifier.nil?
+
+        raise Frontend::LLVMSubset::ParseError, "unsupported printf length modifier: #{length_modifier}"
       end
 
       def counted_output_line(value, count_name)

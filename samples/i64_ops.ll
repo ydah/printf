@@ -1,4 +1,4 @@
-@.fmt = private unnamed_addr constant [8 x i8] c" %u %d\0A\00", align 1
+@.fmt = private unnamed_addr constant [12 x i8] c" %llu %lld\0A\00", align 1
 declare i32 @putchar(i32)
 declare i32 @printf(ptr, ...)
 
