@@ -707,6 +707,64 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes error.message, "llvm-capabilities --check"
   end
 
+  def test_reports_specific_unsupported_type_diagnostics
+    vector_source = <<~LLVM
+      define i32 @main() {
+      entry:
+        %x = add <2 x i32> <i32 1, i32 2>, <i32 3, i32 4>
+        ret i32 0
+      }
+    LLVM
+
+    vector_error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(vector_source).emit
+    end
+    assert_includes vector_error.message, "unsupported vector type"
+
+    float_source = <<~LLVM
+      define i32 @main() {
+      entry:
+        %x = fadd float 1.0, 2.0
+        ret i32 0
+      }
+    LLVM
+
+    float_error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(float_source).emit
+    end
+    assert_includes float_error.message, "unsupported floating-point type"
+  end
+
+  def test_rejects_non_zero_addrspace_and_external_globals
+    addrspace_source = <<~LLVM
+      define i32 @main(ptr addrspace(1) %p) {
+      entry:
+        %casted = addrspacecast ptr addrspace(1) %p to ptr
+        ret i32 0
+      }
+    LLVM
+
+    addrspace_error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(addrspace_source).emit
+    end
+    assert_includes addrspace_error.message, "unsupported non-zero address space cast"
+
+    external_source = <<~LLVM
+      @external = external global i8
+
+      define i32 @main() {
+      entry:
+        %value = load i8, ptr @external
+        ret i32 0
+      }
+    LLVM
+
+    external_error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+      PFC::Backend::LLVMCEmitter.new(external_source).emit
+    end
+    assert_includes external_error.message, "unsupported external global reference"
+  end
+
   def test_rejects_wrong_call_argument_count
     source = <<~LLVM
       declare i32 @putchar(i32)

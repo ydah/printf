@@ -127,7 +127,7 @@ module PFC
             return :load if text.include?(" load ")
             return :binary if text.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
             return :select if text.match?(/\A#{NAME}\s*=\s*select\b/)
-            return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr|bitcast)\b/)
+            return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast)\b/)
             return :freeze if text.match?(/\A#{NAME}\s*=\s*freeze\b/)
             return :gep if text.match?(/\A#{NAME}\s*=\s*getelementptr\b/)
             return :extractvalue if text.match?(/\A#{NAME}\s*=\s*extractvalue\b/)
@@ -147,7 +147,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(?:[-\w]+\s+)*(#{RETURN_TYPE})\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
             return unless match
 
             @destination = match[1]
@@ -181,7 +181,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*getelementptr(\s+inbounds)?\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME}),\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*getelementptr((?:\s+(?:inbounds|nuw|nusw|inrange))*)\s+(.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME}),\s+(.+)\z/)
             return unless match
 
             @destination = match[1]
@@ -204,12 +204,12 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*load\s+(.+?),\s+(?:ptr|.+?\*)\s+(.+?)(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*load\s+(.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @destination = match[1]
-            @value_type = match[2]
-            @bits = match[2].delete_prefix("i").to_i if match[2].match?(/\Ai(?:1|8|16|32|64)\z/)
+            @value_type = (match[2] == "ptr" || match[2].start_with?("ptr addrspace(") || match[2].end_with?("*")) ? "ptr" : match[2]
+            @bits = @value_type.delete_prefix("i").to_i if @value_type.match?(/\Ai(?:1|8|16|32|64)\z/)
             @pointer = match[3].strip
           end
         end
@@ -219,11 +219,11 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Astore\s+(.+?)\s+(.+?),\s+(?:ptr|.+?\*)\s+(.+?)(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\Astore\s+(.+?)\s+(.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)(?:,\s+align\s+\d+)?\z/)
             return unless match
 
-            @value_type = match[1]
-            @bits = match[1].delete_prefix("i").to_i if match[1].match?(/\Ai(?:1|8|16|32|64)\z/)
+            @value_type = (match[1] == "ptr" || match[1].start_with?("ptr addrspace(") || match[1].end_with?("*")) ? "ptr" : match[1]
+            @bits = @value_type.delete_prefix("i").to_i if @value_type.match?(/\Ai(?:1|8|16|32|64)\z/)
             @value = match[2]
             @pointer = match[3].strip
           end
@@ -324,7 +324,7 @@ module PFC
               return
             end
 
-            if (match = text.match(/\A(#{NAME})\s*=\s*bitcast\s+(?:ptr|.+?\*)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*bitcast\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)\s+to\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\z/))
               @destination = match[1]
               @operator = "bitcast"
               @from_type = "ptr"
@@ -333,7 +333,16 @@ module PFC
               return
             end
 
-            match = text.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/)
+            if (match = text.match(/\A(#{NAME})\s*=\s*addrspacecast\s+(ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)\s+to\s+(.+)\z/))
+              @destination = match[1]
+              @operator = "addrspacecast"
+              @from_type = match[2]
+              @value = match[3]
+              @to_type = match[4]
+              return
+            end
+
+            match = text.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\z/)
             return unless match
 
             @destination = match[1]
@@ -924,7 +933,7 @@ module PFC
               next({ type: "...", name: nil })
             end
 
-            type_pattern = allow_pointer ? /i(?:1|8|16|32|64)|ptr|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
+            type_pattern = allow_pointer ? /i(?:1|8|16|32|64)|ptr(?:\s+addrspace\(\d+\))?|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
             match = stripped.match(/\A(#{type_pattern})(?:\s+(.+))?\z/)
             raise ParseError, "unsupported function parameter: #{parameter}" unless match
             name = match[2]&.match(/#{NAME}/)&.[](0)
@@ -937,7 +946,7 @@ module PFC
         end
 
         def pointer_type?(type)
-          type == "ptr" || type.end_with?("*")
+          type == "ptr" || type.start_with?("ptr addrspace(") || type.end_with?("*")
         end
 
         def normalized_lines(body)

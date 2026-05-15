@@ -388,7 +388,16 @@ module PFC
       end
 
       def pointer_type_name?(type)
-        type == "ptr" || type.end_with?("*")
+        stripped = type.to_s.strip
+        stripped == "ptr" || stripped.start_with?("ptr addrspace(") || stripped.end_with?("*")
+      end
+
+      def zero_addrspace_pointer_type?(type)
+        stripped = type.to_s.strip
+        return true if stripped == "ptr" || stripped.end_with?("*")
+        return Regexp.last_match(1).to_i.zero? if stripped.match(/\Aptr\s+addrspace\((\d+)\)\z/)
+
+        false
       end
 
       def integer_type?(type)
@@ -673,7 +682,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i8\],\s+(?:ptr|.+?\*)\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+\[(\d+)\s+x\s+i8\],\s+(?:ptr|.+?\*)\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
           pointers[match[1]] = GlobalStringPointer.new(
             name: match[3],
             offset: (match[4].to_i * match[2].to_i) + match[5].to_i
@@ -681,7 +690,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           element_width = byte_width(match[3].to_i)
           aggregate_width = match[2].to_i * element_width
           base_address = memory_address(match[4])
@@ -693,7 +702,7 @@ module PFC
           return []
         end
 
-        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
         base_address = memory_address(match[3])
@@ -774,7 +783,7 @@ module PFC
           right = line.right
         else
           match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
-          raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
+          raise Frontend::LLVMSubset::ParseError, unsupported_instruction_message(line) unless match
 
           destination = match[1]
           operator = match[2]
@@ -817,6 +826,7 @@ module PFC
           return emit_ptrtoint_cast(line.destination, line.value, line.to_bits) if line.operator == "ptrtoint"
           return emit_inttoptr_cast(line.destination, line.value) if line.operator == "inttoptr"
           return emit_pointer_bitcast(line.destination, line.value) if line.operator == "bitcast"
+          return emit_addrspacecast(line.destination, line.value, line.from_type, line.to_type) if line.operator == "addrspacecast"
 
           if line.from_bits
             destination = line.destination
@@ -825,12 +835,14 @@ module PFC
             value = line.value
             to_bits = line.to_bits
           end
-        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr|.+?\*)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
           return emit_ptrtoint_cast(match[1], match[2], match[3].to_i)
-        elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/))
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\z/))
           return emit_inttoptr_cast(match[1], match[2])
-        elsif (match = line.match(/\A(#{NAME})\s*=\s*bitcast\s+(?:ptr|.+?\*)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/))
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*bitcast\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)\s+to\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\z/))
           return emit_pointer_bitcast(match[1], match[2])
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*addrspacecast\s+(.+?)\s+(.+?)\s+to\s+(.+)\z/))
+          return emit_addrspacecast(match[1], match[3], match[2], match[4])
         else
           match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
@@ -928,6 +940,14 @@ module PFC
         pointer_map = context ? context.fetch(:pointers) : pointers
         pointer_map[destination] = pointer_binding(value, context:)
         []
+      end
+
+      def emit_addrspacecast(destination, value, from_type, to_type, context: nil)
+        unless zero_addrspace_pointer_type?(from_type) && zero_addrspace_pointer_type?(to_type)
+          raise Frontend::LLVMSubset::ParseError, "unsupported non-zero address space cast: #{from_type} to #{to_type}"
+        end
+
+        emit_pointer_bitcast(destination, value, context:)
       end
 
       def emit_pointer_load(destination, pointer)
@@ -1241,7 +1261,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i8\],\s+(?:ptr|.+?\*)\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+\[(\d+)\s+x\s+i8\],\s+(?:ptr|.+?\*)\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
           context.fetch(:pointers)[match[1]] = GlobalStringPointer.new(
             name: match[3],
             offset: (match[4].to_i * match[2].to_i) + match[5].to_i
@@ -1249,7 +1269,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           element_width = byte_width(match[3].to_i)
           aggregate_width = match[2].to_i * element_width
           base_address = memory_address(match[4], context:)
@@ -1261,7 +1281,7 @@ module PFC
           return []
         end
 
-        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+inbounds)?\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
         base_address = memory_address(match[3], context:)
@@ -1332,7 +1352,7 @@ module PFC
           right = line.right
         else
           match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
-          raise Frontend::LLVMSubset::ParseError, "unsupported binary op: #{line}" unless match
+          raise Frontend::LLVMSubset::ParseError, unsupported_instruction_message(line) unless match
 
           destination = match[1]
           operator = match[2]
@@ -1377,6 +1397,7 @@ module PFC
           return emit_ptrtoint_cast(line.destination, line.value, line.to_bits, context:) if line.operator == "ptrtoint"
           return emit_inttoptr_cast(line.destination, line.value, context:) if line.operator == "inttoptr"
           return emit_pointer_bitcast(line.destination, line.value, context:) if line.operator == "bitcast"
+          return emit_addrspacecast(line.destination, line.value, line.from_type, line.to_type, context:) if line.operator == "addrspacecast"
 
           if line.from_bits
             destination = line.destination
@@ -1385,12 +1406,14 @@ module PFC
             value = line.value
             to_bits = line.to_bits
           end
-        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr|.+?\*)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
           return emit_ptrtoint_cast(match[1], match[2], match[3].to_i, context:)
-        elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/))
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\z/))
           return emit_inttoptr_cast(match[1], match[2], context:)
-        elsif (match = line.match(/\A(#{NAME})\s*=\s*bitcast\s+(?:ptr|.+?\*)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/))
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*bitcast\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)\s+to\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\z/))
           return emit_pointer_bitcast(match[1], match[2], context:)
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*addrspacecast\s+(.+?)\s+(.+?)\s+to\s+(.+)\z/))
+          return emit_addrspacecast(match[1], match[3], match[2], match[4], context:)
         else
           match = line.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless match
@@ -2392,7 +2415,7 @@ module PFC
       end
 
       def llvm_numeric_intrinsic?(name)
-        llvm_minmax_intrinsic?(name) || llvm_abs_intrinsic?(name)
+        llvm_minmax_intrinsic?(name) || llvm_abs_intrinsic?(name) || llvm_bit_count_intrinsic?(name) || llvm_bswap_intrinsic?(name)
       end
 
       def llvm_minmax_intrinsic?(name)
@@ -2401,6 +2424,14 @@ module PFC
 
       def llvm_abs_intrinsic?(name)
         name.match?(/\Allvm\.abs\.i(?:1|8|16|32|64)\z/)
+      end
+
+      def llvm_bit_count_intrinsic?(name)
+        name.match?(/\Allvm\.(?:ctpop|ctlz|cttz)\.i(?:1|8|16|32|64)\z/)
+      end
+
+      def llvm_bswap_intrinsic?(name)
+        name.match?(/\Allvm\.bswap\.i(?:16|32|64)\z/)
       end
 
       def llvm_memset_intrinsic?(name)
@@ -2465,7 +2496,13 @@ module PFC
         end
 
         arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
-        expected = llvm_abs_intrinsic?(name) ? ["i#{bits}", "i1"] : ["i#{bits}", "i#{bits}"]
+        expected = if llvm_abs_intrinsic?(name) || name.include?(".ctlz.") || name.include?(".cttz.")
+                     ["i#{bits}", "i1"]
+                   elsif llvm_bit_count_intrinsic?(name) || llvm_bswap_intrinsic?(name)
+                     ["i#{bits}"]
+                   else
+                     ["i#{bits}", "i#{bits}"]
+                   end
         validate_memory_intrinsic_arguments!(name, arguments, expected)
         unless call.fetch(:destination)
           raise Frontend::LLVMSubset::ParseError, "numeric intrinsic must assign a result: @#{name}"
@@ -2479,6 +2516,10 @@ module PFC
         left = scalar_value(arguments.fetch(0).fetch(:value), context:)
         expression = if llvm_abs_intrinsic?(name)
                        abs_expression(bits, left)
+                     elsif llvm_bswap_intrinsic?(name)
+                       bswap_expression(bits, left)
+                     elsif llvm_bit_count_intrinsic?(name)
+                       bit_count_expression(name, bits, left)
                      else
                        right = scalar_value(arguments.fetch(1).fetch(:value), context:)
                        minmax_expression(name, bits, left, right)
@@ -2673,7 +2714,7 @@ module PFC
       end
 
       def global_string_pointer_literal(raw_pointer)
-        if (match = raw_pointer.match(/getelementptr(?:\s+inbounds)?\s*\(\[(\d+)\s+x\s+i8\],\s+ptr\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\)/))
+        if (match = raw_pointer.match(/getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s*\(\[(\d+)\s+x\s+i8\],\s+ptr(?:\s+addrspace\(\d+\))?\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\)/))
           return GlobalStringPointer.new(
             name: match[2],
             offset: (match[3].to_i * match[1].to_i) + match[4].to_i
@@ -2741,6 +2782,9 @@ module PFC
         pointer = if global_strings.key?(stripped)
                     GlobalStringPointer.new(name: stripped, offset: 0)
                   else
+                    if external_global_declaration?(stripped)
+                      raise Frontend::LLVMSubset::ParseError, "unsupported external global reference: #{stripped}"
+                    end
                     resolve_pointer(stripped, context:)
                   end
         return encoded_memory_address(pointer.value) if pointer.is_a?(EncodedPointer)
@@ -2833,6 +2877,7 @@ module PFC
       def encoded_pointer_value(raw, context: nil)
         stripped = strip_value_attributes(raw)
         return "0ull" if stripped == "null"
+        return encoded_pointer_value(Regexp.last_match(1), context:) if stripped.match(/\Aptrtoint\s*\(ptr\s+(.+?)\s+to\s+i(?:1|8|16|32|64)\)\z/)
 
         pointer = pointer_binding(stripped, context:)
         return pointer.value if pointer.is_a?(EncodedPointer)
@@ -2850,14 +2895,34 @@ module PFC
 
       def pointer_binding(raw, context: nil)
         stripped = strip_value_attributes(raw)
+        raise Frontend::LLVMSubset::ParseError, "unsupported blockaddress constant expression: #{stripped}" if stripped.start_with?("blockaddress")
+
+        if stripped.match(/\A(?:bitcast|addrspacecast)\s*\((?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)\s+to\s+.+\)\z/)
+          return pointer_binding(Regexp.last_match(1), context:)
+        end
+        if stripped.match(/\Ainttoptr\s*\(i(?:1|8|16|32|64)\s+(.+?)\s+to\s+ptr(?:\s+addrspace\(\d+\))?\)\z/)
+          value = Regexp.last_match(1)
+          return pointer_binding(Regexp.last_match(1), context:) if value.match(/\Aptrtoint\s*\(ptr\s+(.+?)\s+to\s+i(?:1|8|16|32|64)\)\z/)
+
+          return EncodedPointer.new(value:)
+        end
         constant = constant_gep_pointer(stripped, context:)
         return constant if constant
 
         token = stripped.split(/\s+/).last
         return EncodedPointer.new(value: "0ull") if token == "null"
         return GlobalStringPointer.new(name: token, offset: 0) if global_strings.key?(token)
+        if external_global_declaration?(token)
+          raise Frontend::LLVMSubset::ParseError, "unsupported external global reference: #{token}"
+        end
 
         resolve_pointer(token, context:)
+      end
+
+      def external_global_declaration?(name)
+        source.each_line.any? do |line|
+          line.sub(/;.*/, "").strip.match?(/\A#{Regexp.escape(name)}\s*=.*?\bexternal\s+(?:global|constant)\b/)
+        end
       end
 
       def strip_value_attributes(raw)
@@ -2874,7 +2939,7 @@ module PFC
       end
 
       def constant_gep_pointer(raw, context:)
-        match = raw.match(/\Agetelementptr(?:\s+inbounds)?\s*\((.+?),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+(.+)\)\z/)
+        match = raw.match(/\Agetelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s*\((.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(#{POINTER_NAME}),\s+(.+)\)\z/)
         return nil unless match
 
         source_type = match[1]
@@ -2907,6 +2972,11 @@ module PFC
 
       def unsupported_instruction_message(line)
         opcode = line.to_s[/\A(?:#{NAME}\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
+        return "unsupported vector type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/(?:^|\s)<(?:vscale\s+x\s+)?\d+\s+x\s+[^>]+>/)
+        return "unsupported floating-point type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/\b(?:half|float|double|fp128|x86_fp80|ppc_fp128)\b/)
+        return "unsupported i128 type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/\bi128\b/)
+        return "unsupported blockaddress constant expression: #{line}" if line.to_s.include?("blockaddress")
+
         "unsupported LLVM instruction #{opcode}: #{line}. Run `pfc llvm-capabilities` for the supported subset or `pfc llvm-capabilities --check FILE.ll` to preflight a file."
       end
 
@@ -3019,6 +3089,39 @@ module PFC
 
       def abs_expression(bits, value)
         "(((#{value}) & #{sign_bit_literal(bits)}) ? ((~(#{value}) + 1ull) & #{integer_mask_literal(bits)}) : ((#{value}) & #{integer_mask_literal(bits)}))"
+      end
+
+      def bswap_expression(bits, value)
+        byte_count = byte_width(bits)
+        terms = byte_count.times.map do |index|
+          source_shift = index * 8
+          target_shift = (byte_count - index - 1) * 8
+          "(((#{value}) >> #{source_shift}) & 255ull) << #{target_shift}"
+        end
+        "(#{terms.join(') | (')})"
+      end
+
+      def bit_count_expression(name, bits, value)
+        masked = "((#{value}) & #{integer_mask_literal(bits)})"
+        if name.include?(".ctpop.")
+          terms = bits.times.map { |index| "((#{masked} >> #{index}) & 1ull)" }
+          return "(#{terms.join(' + ')})"
+        end
+
+        if name.include?(".ctlz.")
+          terms = bits.times.map do |count|
+            bit = bits - count - 1
+            condition = count.zero? ? "((#{masked} >> #{bit}) & 1ull)" : "((#{masked} >> #{bit}) & 1ull)"
+            "#{condition} ? #{count}ull"
+          end
+          return "(#{terms.join(' : ')} : #{bits}ull)"
+        end
+
+        terms = bits.times.map do |count|
+          condition = "((#{masked} >> #{count}) & 1ull)"
+          "#{condition} ? #{count}ull"
+        end
+        "(#{terms.join(' : ')} : #{bits}ull)"
       end
 
       def cast_expression(operator, from_bits, to_bits, value)

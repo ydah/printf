@@ -185,14 +185,30 @@ class LLVMCompatibilityTest < Minitest::Test
       declare i32 @putchar(i32)
       declare i32 @llvm.smax.i32(i32, i32)
       declare i32 @llvm.abs.i32(i32, i1)
+      declare i32 @llvm.bswap.i32(i32)
+      declare i32 @llvm.ctpop.i32(i32)
+      declare i32 @llvm.ctlz.i32(i32, i1)
+      declare i32 @llvm.cttz.i32(i32, i1)
 
       define noundef i32 @main() #0 {
       entry:
         %frozen = freeze i32 65
         %max = call noundef i32 @llvm.smax.i32(i32 noundef %frozen, i32 noundef 66), !range !0
         %abs = call i32 @llvm.abs.i32(i32 -66, i1 true), !tbaa !1
-        %same = icmp eq i32 %max, %abs
-        %value = select i1 %same, i32 %max, i32 78
+        %swap = call i32 @llvm.bswap.i32(i32 1107296256)
+        %pop = call i32 @llvm.ctpop.i32(i32 7)
+        %lz = call i32 @llvm.ctlz.i32(i32 1, i1 false)
+        %tz = call i32 @llvm.cttz.i32(i32 8, i1 false)
+        %same_abs = icmp eq i32 %max, %abs
+        %same_swap = icmp eq i32 %swap, 66
+        %same_pop = icmp eq i32 %pop, 3
+        %same_lz = icmp eq i32 %lz, 31
+        %same_tz = icmp eq i32 %tz, 3
+        %ok0 = and i1 %same_abs, %same_swap
+        %ok1 = and i1 %same_pop, %same_lz
+        %ok2 = and i1 %ok0, %ok1
+        %ok = and i1 %ok2, %same_tz
+        %value = select i1 %ok, i32 %max, i32 78
         call i32 @putchar(i32 %value)
         ret i32 0
       }
@@ -202,6 +218,78 @@ class LLVMCompatibilityTest < Minitest::Test
       !1 = !{!2, !2, i64 0}
       !2 = !{!"int", !3}
       !3 = !{!"omnipotent char"}
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_memcpy_inline_and_gep_flags
+    source = <<~LLVM
+      declare void @llvm.memcpy.inline.p0.p0.i64(ptr, ptr, i64, i1)
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %src = alloca [2 x i8], align 1
+        %dst = alloca [2 x i8], align 1
+        %src0 = getelementptr inbounds nuw [2 x i8], ptr %src, i64 0, i64 0
+        %src1 = getelementptr nusw [2 x i8], ptr %src, i64 0, i64 1
+        store i8 65, ptr %src0, align 1
+        store i8 66, ptr %src1, align 1
+        call void @llvm.memcpy.inline.p0.p0.i64(ptr %dst, ptr %src, i64 2, i1 false)
+        %dst1 = getelementptr inbounds [2 x i8], ptr %dst, i64 0, i64 1
+        %value = load i8, ptr %dst1, align 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_addrspacecast_zero_and_constant_bitcast
+    source = <<~LLVM
+      @.cell = global i8 66, align 1
+      @.ptr = global ptr bitcast (ptr @.cell to ptr), align 8
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %loaded = load ptr, ptr @.ptr, align 8
+        %casted = addrspacecast ptr %loaded to ptr
+        %value = load i8, ptr %casted, align 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_dense_switch_fixture
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        switch i32 4, label %default [
+          i32 0, label %default
+          i32 1, label %default
+          i32 2, label %default
+          i32 3, label %default
+          i32 4, label %hit
+          i32 5, label %default
+        ]
+      hit:
+        call i32 @putchar(i32 66)
+        ret i32 0
+      default:
+        call i32 @putchar(i32 78)
+        ret i32 0
+      }
     LLVM
 
     assert_equal "B", compile_llvm_source_and_run(source)
@@ -301,5 +389,9 @@ class LLVMCompatibilityTest < Minitest::Test
 
   def test_clang_attrs_intrinsics_smoke_fixture
     assert_equal "B", compile_llvm_and_run("samples/clang_attrs_intrinsics_smoke.ll")
+  end
+
+  def test_clang_optimized_smoke_fixture
+    assert_equal "B", compile_llvm_and_run("samples/clang/optimized_smoke.ll")
   end
 end
