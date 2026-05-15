@@ -1,10 +1,10 @@
 # printf Backend
 
-printf is not just a printer. With `%n`, the number of characters printed becomes a value, and that value can be written back to memory. This project turns that feature into a tiny educational compiler target.
+`printf` is not just a printer. With `%n`, the number of characters printed becomes a value, and that value can be written back to memory. This project uses that behavior as a tiny educational compiler target.
 
-The MVP compiles Brainfuck to C. The generated C uses ordinary C control flow as the scheduler, but cell updates and pointer writes go through `fprintf` with `%hhn` / `%hn` against memory owned by the generated program.
+The primary path compiles Brainfuck to C. Generated C uses ordinary C control flow as the scheduler, while cell updates and pointer writes go through `fprintf` with `%hhn` / `%hn` against memory owned by the generated program.
 
-## Usage
+## Quick Start
 
 ```sh
 bin/pfc compile samples/hello.bf -o hello.c
@@ -12,34 +12,15 @@ cc -std=c11 -Wall -Wextra -O0 hello.c -o hello
 ./hello
 ```
 
-Or let the CLI build and run it:
+Or build and run directly:
 
 ```sh
 bin/pfc run samples/hello.bf
-bin/pfc run samples/hello.bf --strict-printf
-bin/pfc run samples/hello.bf --backend=printf-threaded
-bin/pfc run samples/hello.bf --cell-bits=16
-bin/pfc dump-ir samples/hello.bf
-bin/pfc dump-c samples/hello.bf
-bin/pfc dump-cfg samples/dynamic_branch.ll
-bin/pfc llvm-capabilities
-bin/pfc llvm-capabilities --json
-bin/pfc run samples/putchar.ll
-printf A | bin/pfc run samples/dynamic_branch.ll
-bin/pfc run samples/ops_select.ll
-printf 1 | bin/pfc run samples/dynamic_gep.ll
-bin/pfc run samples/internal_call.ll
-bin/pfc run samples/internal_cfg.ll
-bin/pfc run samples/internal_memory.ll
-bin/pfc run samples/internal_nested_call.ll
-bin/pfc run samples/void_main.ll
-bin/pfc run samples/string_puts.ll
-bin/pfc run samples/printf_format.ll
-bin/pfc run samples/i64_ops.ll
-bin/pfc run samples/clang_smoke.ll
 ```
 
-Supported commands:
+## CLI
+
+Commands:
 
 - `compile INPUT -o OUTPUT.c`
 - `build INPUT -o OUTPUT`
@@ -49,13 +30,30 @@ Supported commands:
 - `dump-c INPUT`
 - `llvm-capabilities [--json]`
 
-`.ll` inputs are detected by extension and compiled with the experimental LLVM IR subset frontend. The LLVM path supports byte-addressed local memory for scalar and fixed-array `alloca`/`load`/`store` over `i1`/`i8`/`i16`/`i32`/`i64`, named struct `alloca` and struct-field `getelementptr`, struct/array global initializers, aggregate `load`/`store` byte copies, `extractvalue`/`insertvalue` for scalar integer fields, constant-count `alloca` with dynamic-count `alloca` reserving tape-size capacity, byte-addressed global integer scalars and fixed integer arrays with `global` writable and `constant` read-only semantics, read-only global string byte memory for `load`/`getelementptr`/`ptrtoint`, constant or dynamic `getelementptr` with integer, array, and struct element sizes, constant-expression `getelementptr` pointer operands, volatile `load`/`store` as backend-equivalent memory access, local/global `llvm.memset.*`, `llvm.memcpy.*`, and `llvm.memmove.*` intrinsics, no-op `llvm.lifetime.start/end`, no-op `llvm.assume`/`llvm.dbg.*`, identity `llvm.expect.*`, scalar constants `true`/`false`/`undef`/`poison`/`zeroinitializer`, `add`/`sub`/`mul`/division/remainder, bitwise and shift operations with common `nuw`/`nsw`/`exact` flags accepted as subset no-ops, `zext`/`sext`/`trunc`, tagged `ptrtoint`/`inttoptr` for local/global/string pointer values, typed-pointer-style syntax as `ptr`, `bitcast ptr-to-ptr`, integer and pointer `icmp` including `null`, integer and pointer `select`, pointer `phi`, `switch`, `br`, simple scalar `phi`, `ret`, `unreachable` as runtime abort, no-op `tail`/`musttail`/`notail` call markers, common value attributes, trailing metadata attachments, module-level metadata, and attributes blocks as no-ops, `target datalayout` pointer width and struct layout, `void @main`, nested non-recursive internal calls with integer/pointer/void returns and integer/pointer arguments, global `i8` string constants for direct `puts` and static `printf` calls with decimal `%d`/`%i`/`%u`, short and long integer length modifiers `%hhd`/`%hd`/`%ld`/`%lld`, radix `%x`/`%X`/`%o` and length variants, static or dynamic width, `0`/`-`/`+`/space/`#` flags, static or dynamic precision, `%c`/`%s`/`%p`/`%%`, and `putchar`/`getchar`.
+Common examples:
 
-The generated program still uses C control flow as the scheduler. It does not claim a single-call `printf` execution model, which would require implementation-dependent or undefined behavior outside this project's safety scope.
+```sh
+bin/pfc run samples/hello.bf --strict-printf
+bin/pfc run samples/hello.bf --backend=printf-threaded
+bin/pfc run samples/hello.bf --cell-bits=16
+bin/pfc dump-ir samples/hello.bf
+bin/pfc dump-c samples/hello.bf
+```
 
-Generated C uses `tmpfile()` as the internal printf sink, so it does not depend on `/dev/null`.
+LLVM examples:
 
-Supported options:
+```sh
+bin/pfc run samples/putchar.ll
+printf A | bin/pfc run samples/dynamic_branch.ll
+printf 1 | bin/pfc run samples/dynamic_gep.ll
+bin/pfc run samples/internal_call.ll
+bin/pfc run samples/printf_format.ll
+bin/pfc run samples/clang_smoke.ll
+bin/pfc llvm-capabilities
+bin/pfc llvm-capabilities --json
+```
+
+Options:
 
 - `--backend=printf-c-scheduler`
 - `--backend=printf-threaded`
@@ -66,6 +64,22 @@ Supported options:
 - `--cell-bits=32`
 - `--strict-printf`
 - `--debug`
+
+## LLVM IR Subset
+
+`.ll` inputs are detected by extension and compiled through the experimental LLVM IR subset frontend.
+
+Use `bin/pfc llvm-capabilities` for the full supported subset, or `bin/pfc llvm-capabilities --json` for machine-readable output. At a high level, the subset supports:
+
+- Memory: byte-addressed local memory, integer and aggregate `alloca`/`load`/`store`, numeric globals, string globals, struct/array initializers, `getelementptr`, and `llvm.memset.*` / `llvm.memcpy.*` / `llvm.memmove.*`.
+- Values: `i1`/`i8`/`i16`/`i32`/`i64`, integer arithmetic, bitwise and shift operations, casts, pointer tagging via `ptrtoint` / `inttoptr`, pointer `bitcast`, `icmp`, `select`, `phi`, constants, `extractvalue`, and `insertvalue`.
+- Control flow: `br`, `switch`, scalar and pointer `phi`, `ret`, `unreachable`, and nested non-recursive internal calls with integer, pointer, and void returns.
+- Clang tolerance: typed-pointer-style syntax, common value attributes, trailing metadata, module-level metadata, attributes blocks, `target datalayout`, no-op `llvm.assume` / `llvm.dbg.*`, and identity `llvm.expect.*`.
+- Libc surface: `putchar`, `getchar`, `puts`, and static `printf` formats for integer, character, string, pointer, width, precision, flags, and escaped percent cases.
+
+The generated program still uses C control flow as the scheduler. It does not claim a single-call `printf` execution model, which would require implementation-dependent or undefined behavior outside this project's safety scope.
+
+Generated C uses `tmpfile()` as the internal printf sink, so it does not depend on `/dev/null`.
 
 ## Safety Scope
 
