@@ -83,6 +83,7 @@ class CLITest < Minitest::Test
 
     assert_empty err
     capabilities = JSON.parse(out)
+    assert capabilities.fetch("values").join("\n").include?("literals")
     assert_includes capabilities.fetch("memory").join("\n"), "global string byte memory"
     assert_includes capabilities.fetch("memory").join("\n"), "aggregate load/store"
     assert_includes capabilities.fetch("memory").join("\n"), "pointer fields"
@@ -130,6 +131,7 @@ class CLITest < Minitest::Test
 
       assert_empty err
       result = JSON.parse(out)
+      assert_equal 1, result.fetch("schema_version")
       refute result.fetch("supported")
       messages = result.fetch("errors").map { |error| error.fetch("message") }.join("\n")
       assert_includes messages, "unsupported floating-point type"
@@ -137,9 +139,32 @@ class CLITest < Minitest::Test
 
       first_error = result.fetch("errors").first
       assert_equal "error", first_error.fetch("severity")
-      assert first_error.key?("opcode")
-      assert first_error.key?("hint")
-      assert first_error.key?("line_text")
+      assert_equal %w[explanation hint line line_text message opcode severity], first_error.keys.sort
+      assert_includes first_error.fetch("hint"), "Lower floating-point"
+      assert_includes first_error.fetch("explanation"), "floating-point semantics"
+    end
+  end
+
+  def test_llvm_capabilities_explain_prints_guidance
+    Dir.mktmpdir("pfc-cli-test") do |dir|
+      path = File.join(dir, "bad.ll")
+      File.write(path, <<~LLVM)
+        define i32 @main() {
+        entry:
+          %x = fadd float 1.0, 2.0
+          ret i32 0
+        }
+      LLVM
+
+      out, err = capture_io do
+        assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--explain", path]).run
+      end
+
+      assert_empty err
+      assert_includes out, "unsupported: #{path}"
+      assert_includes out, "opcode: fadd"
+      assert_includes out, "hint: Lower floating-point operations"
+      assert_includes out, "explanation: The backend models integer operations"
     end
   end
 
