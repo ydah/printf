@@ -46,6 +46,7 @@ module PFC
         @pointers = {}
         @global_numeric_offsets, raw_global_numeric_bytes = build_global_numeric_layout
         @aggregate_registers = {}
+        @i128_high_registers = {}
         @registers = {}
         @aggregate_copy_index = 0
         @inline_call_index = 0
@@ -111,7 +112,7 @@ module PFC
 
       private
 
-      attr_reader :aggregate_registers, :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
+      attr_reader :aggregate_registers, :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :i128_high_registers, :internal_functions, :pointers, :registers, :slot_count, :source, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -274,6 +275,7 @@ module PFC
           end
 
           registers[lhs] = c_value_name(lhs)
+          i128_high_registers[lhs] = "#{c_value_name(lhs)}_hi" if line.respond_to?(:bits) && line.bits == 128
           pointers[lhs] = EncodedPointer.new(value: registers.fetch(lhs)) if pointer_result || line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*phi\s+(?:ptr|.+?\*)\b/)
         end
       end
@@ -644,6 +646,9 @@ module PFC
         registers.each_value do |name|
           lines << "    unsigned long long #{name} = 0;"
         end
+        i128_high_registers.each_value do |name|
+          lines << "    unsigned long long #{name} = 0;"
+        end
         aggregate_registers.each_value do |aggregate|
           lines << "    unsigned char #{aggregate.fetch(:name)}[#{aggregate.fetch(:size)}] = {0};"
         end
@@ -653,6 +658,9 @@ module PFC
         lines << "    (void)pf_slot_index;"
         lines << "    (void)pf_ch;"
         registers.each_value do |name|
+          lines << "    (void)#{name};"
+        end
+        i128_high_registers.each_value do |name|
           lines << "    (void)#{name};"
         end
         aggregate_registers.each_value do |aggregate|
@@ -972,11 +980,18 @@ module PFC
         source = aggregate_value_bytes(line.vector, line.vector_type)
         index = llvm_value(line.index)
         width = byte_width(line.bits)
-        offset = "((#{index}) * #{width})"
         return ["    #{register(line.destination)} = 0u;"] if source.nil?
 
+        prefix = next_aggregate_copy_prefix
         [
-          "    #{register(line.destination)} = #{unsigned_cast(line.bits)}(pf_llvm_load(#{source}, #{offset}, #{width}) & #{integer_mask_literal(line.bits)});"
+          "    {",
+          "        long long #{prefix}_index = (long long)(#{index});",
+          "        if (#{prefix}_index < 0 || #{prefix}_index >= #{vector_element_count(line.vector_type)}) {",
+          "            fprintf(stderr, \"pfc runtime error: LLVM vector index out of range\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        #{register(line.destination)} = #{unsigned_cast(line.bits)}(pf_llvm_load(#{source}, #{prefix}_index * #{width}, #{width}) & #{integer_mask_literal(line.bits)});",
+          "    }"
         ]
       end
 
@@ -985,15 +1000,19 @@ module PFC
         source = aggregate_value_bytes(line.vector, line.vector_type)
         index = llvm_value(line.index)
         width = byte_width(line.bits)
-        offset = "((#{index}) * #{width})"
         copy_prefix = next_aggregate_copy_prefix
         [
           "    {",
           "        int #{copy_prefix}_i = 0;",
+          "        long long #{copy_prefix}_index = (long long)(#{index});",
+          "        if (#{copy_prefix}_index < 0 || #{copy_prefix}_index >= #{vector_element_count(line.vector_type)}) {",
+          "            fprintf(stderr, \"pfc runtime error: LLVM vector index out of range\\n\");",
+          "            PF_ABORT();",
+          "        }",
           "        for (#{copy_prefix}_i = 0; #{copy_prefix}_i < #{aggregate.fetch(:size)}; #{copy_prefix}_i++) {",
           "            #{aggregate.fetch(:name)}[#{copy_prefix}_i] = #{source ? "#{source}[#{copy_prefix}_i]" : '0u'};",
           "        }",
-          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{offset}, (unsigned long long)(#{llvm_value(line.value)} & #{integer_mask_literal(line.bits)}), #{width});",
+          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{copy_prefix}_index * #{width}, (unsigned long long)(#{llvm_value(line.value)} & #{integer_mask_literal(line.bits)}), #{width});",
           "    }"
         ]
       end
@@ -1072,7 +1091,8 @@ module PFC
       def emit_i128_load(destination, pointer)
         address = memory_address(pointer)
         slot_lines(address, 16) + [
-          "    #{register(destination)} = pf_llvm_load(#{address.memory}, pf_slot_index, 8);"
+          "    #{register(destination)} = pf_llvm_load(#{address.memory}, pf_slot_index, 8);",
+          "    #{i128_high_register(destination)} = pf_llvm_load(#{address.memory}, pf_slot_index + 8, 8);"
         ]
       end
 
@@ -1080,9 +1100,10 @@ module PFC
         address = memory_address(pointer)
         ensure_writable_address!(address)
         low = i128_low64_value(value)
+        high = i128_high64_value(value)
         dynamic_writable_address_lines(address) + slot_lines(address, 16) + [
           "    pf_llvm_store(#{address.memory}, pf_slot_index, #{low}, 8);",
-          "    pf_llvm_store(#{address.memory}, pf_slot_index + 8, 0ull, 8);"
+          "    pf_llvm_store(#{address.memory}, pf_slot_index + 8, #{high}, 8);"
         ]
       end
 
@@ -1156,9 +1177,12 @@ module PFC
 
         target = context ? inline_register(context, destination) : register(destination)
         operator = predicate == "eq" ? "==" : "!="
+        connective = predicate == "eq" ? "&&" : "||"
         left_value = i128_low64_value(left, context:)
         right_value = i128_low64_value(right, context:)
-        ["    #{target} = ((#{left_value}) #{operator} (#{right_value})) ? 1u : 0u;"]
+        left_high = i128_high64_value(left, context:)
+        right_high = i128_high64_value(right, context:)
+        ["    #{target} = (((#{left_value}) #{operator} (#{right_value})) #{connective} ((#{left_high}) #{operator} (#{right_high}))) ? 1u : 0u;"]
       end
 
       def emit_pointer_icmp(destination, predicate, left, right, context: nil)
@@ -1990,6 +2014,17 @@ module PFC
         return register(token) if token.match?(/\A#{NAME}\z/)
 
         llvm_value(raw)
+      end
+
+      def i128_high64_value(raw, context: nil)
+        token = raw.to_s.strip.split(/\s+/).last
+        return "0ull" if token == "false" || token == "undef" || token == "poison" || token == "zeroinitializer"
+        return "#{(token.to_i >> 64) & integer_mask(64)}ull" if token.match?(/\A-?\d+\z/)
+        return "0ull" if context && context.fetch(:values).key?(token)
+        return i128_high_register(token) if token.match?(/\A#{NAME}\z/) && i128_high_registers.key?(token)
+        return "0ull" if token.match?(/\A#{NAME}\z/)
+
+        "0ull"
       end
 
       def inline_value(raw, context)
@@ -3110,6 +3145,17 @@ module PFC
 
       def register(name)
         registers.fetch(name) { raise Frontend::LLVMSubset::ParseError, "unknown register: #{name}" }
+      end
+
+      def i128_high_register(name)
+        i128_high_registers.fetch(name) { raise Frontend::LLVMSubset::ParseError, "unknown i128 register: #{name}" }
+      end
+
+      def vector_element_count(type)
+        match = type.to_s.match(/\A<(\d+)\s+x\s+i(?:1|8|16|32|64)>\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported vector type: #{type}" unless match
+
+        match[1].to_i
       end
 
       def alloca?(line)

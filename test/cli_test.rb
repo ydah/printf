@@ -139,9 +139,10 @@ class CLITest < Minitest::Test
 
       first_error = result.fetch("errors").first
       assert_equal "error", first_error.fetch("severity")
-      assert_equal %w[explanation hint line line_text message opcode severity], first_error.keys.sort
+      assert_equal %w[explanation fix_suggestions hint line line_text message opcode severity], first_error.keys.sort
       assert_includes first_error.fetch("hint"), "Lower floating-point"
       assert_includes first_error.fetch("explanation"), "floating-point semantics"
+      assert_includes first_error.fetch("fix_suggestions").join("\n"), "fixed-point"
     end
   end
 
@@ -165,6 +166,7 @@ class CLITest < Minitest::Test
       assert_includes out, "opcode: fadd"
       assert_includes out, "hint: Lower floating-point operations"
       assert_includes out, "explanation: The backend models integer operations"
+      assert_includes out, "fix: rewrite floating-point work"
     end
   end
 
