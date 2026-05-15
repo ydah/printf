@@ -2634,7 +2634,7 @@ module PFC
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
-          lines << "    #{prefix} ((#{value}) == #{case_value}#{integer_suffix(bits)}) {"
+          lines << "    #{prefix} ((#{value}) == #{switch_case_literal(case_value, bits)}) {"
           lines.concat(inline_phi_goto(context, label, case_label, indent: 2))
           lines << "    }"
         end
@@ -2785,7 +2785,7 @@ module PFC
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
-          lines << "    #{prefix} ((#{value}) == #{case_value}#{integer_suffix(bits)}) {"
+          lines << "    #{prefix} ((#{value}) == #{switch_case_literal(case_value, bits)}) {"
           lines.concat(phi_goto(label, case_label, indent: 2))
           lines << "    }"
         end
@@ -3072,7 +3072,13 @@ module PFC
 
       def constant_scalar_expression(raw, context:)
         stripped = strip_value_attributes(raw)
-        return nil unless stripped.match?(/\A(?:add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr|select|icmp|zext|sext|trunc)\b/)
+        return nil unless stripped.match?(/\A(?:add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr|select|icmp|zext|sext|trunc|ptrtoint)\b/)
+
+        if (match = stripped.match(/\Aptrtoint\s*\((?:ptr(?:\s+addrspace\(0\))?|.+?\*)\s+(.+?)\s+to\s+i(1|8|16|32|64)\)\z/))
+          bits = match[2].to_i
+          encoded = encoded_pointer_value(match[1], context:)
+          return "#{unsigned_cast(bits)}((#{encoded}) & #{integer_mask_literal(bits)})"
+        end
 
         if (match = stripped.match(/\A(select)\s*\((.*)\)\z/))
           operands = split_call_arguments(match[2])
@@ -4638,13 +4644,24 @@ module PFC
       end
 
       def constant_gep_pointer(raw, context:)
-        match = raw.match(/\Agetelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s*\((.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(#{POINTER_NAME}),\s+(.+)\)\z/)
+        match = raw.match(/\Agetelementptr(?:\s+(?:inbounds|nuw|nusw|inrange(?:\([^)]*\))?))*\s*\((.*)\)\z/)
         return nil unless match
 
-        source_type = match[1]
-        base = match[2]
-        index_arguments = Frontend::LLVMSubset::Parser::Instruction.split_arguments(match[3])
-        indices = index_arguments.map { |argument| argument.split(/\s+/, 2).last }
+        arguments = Frontend::LLVMSubset::Parser::Instruction.split_arguments(match[1])
+        return nil unless arguments.length >= 3
+
+        source_type = arguments.shift
+        base_argument = arguments.shift
+        base_match = base_argument.match(/\A(?:ptr(?:\s+addrspace\(0\))?|.+?\*)\s+(.+)\z/)
+        return nil unless base_match
+
+        base = base_match[1].strip
+        indices = arguments.map do |argument|
+          index_match = argument.match(/\Ai(?:1|8|16|32|64)\s+(.+)\z/)
+          return nil unless index_match
+
+          index_match[1]
+        end
         base_address = memory_address(base, context:)
         offset = gep_offset_expression(source_type, indices, base_address.offset, context:)
         pointer_from_address(base_address, offset)
@@ -4723,6 +4740,10 @@ module PFC
 
       def integer_suffix(bits)
         bits == 64 ? "ull" : "u"
+      end
+
+      def switch_case_literal(raw_value, bits)
+        "#{raw_value.to_i & integer_mask(bits)}#{integer_suffix(bits)}"
       end
 
       def unsigned_cast(bits)

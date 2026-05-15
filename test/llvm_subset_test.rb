@@ -73,6 +73,23 @@ class LLVMSubsetTest < Minitest::Test
     assert_equal [65, 0, 66, 0, 0, 1], parsed.fetch(:global_numeric_data).fetch("@.words")
   end
 
+  def test_parser_decodes_mutable_global_byte_string_data
+    source = <<~LLVM
+      @.buffer = global [4 x i8] c"AB\\00", align 1
+
+      define i32 @main() {
+      entry:
+        ret i32 0
+      }
+    LLVM
+
+    parsed = PFC::Frontend::LLVMSubset::Parser.parse(source)
+
+    assert_equal [65, 66, 0, 0], parsed.fetch(:global_numeric_data).fetch("@.buffer")
+    assert_equal true, parsed.fetch(:global_numeric_mutability).fetch("@.buffer")
+    refute parsed.fetch(:global_strings).key?("@.buffer")
+  end
+
   def test_parser_rejects_undefined_branch_label
     source = <<~LLVM
       define i32 @main() {

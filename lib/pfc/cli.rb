@@ -732,6 +732,7 @@ module PFC
       source.each_line.with_index(1).filter_map do |raw_line, line_number|
         line = raw_line.sub(/;.*/, "").strip
         next if line.empty? || line == "}" || line.match?(/\A[-A-Za-z$._0-9]+:\z/)
+        next if line == "]" || line.match?(/\Ai(?:1|8|16|32|64)\s+-?\d+,\s+label\s+%[-A-Za-z$._0-9]+\z/)
         next if line.match?(/\A(?:source_filename|target|attributes|![A-Za-z0-9_.-]+|declare|define)\b/)
         next if line.match?(/\A%[-A-Za-z$._0-9]+\s*=\s*type\b/)
         next if line.match?(/\A#dbg_[A-Za-z0-9_.]+\b/)
@@ -791,7 +792,7 @@ module PFC
       return "Lower floating-point operations to integer code before invoking pfc." if text.include?("floating-point")
       return "Use only supported i128 load/store, zeroinitializer, add/sub, bitwise and/or/xor, signed/unsigned comparisons, select, zext/sext, or truncation to a supported integer width." if text.include?("i128")
       return "blockaddress is outside the subset; use normal labels and branches." if text.include?("blockaddress")
-      return "Provide a definition for the global or replace it with a supported local/global pointer." if text.include?("external global")
+      return "Use a supported integer/pointer external-global stub, provide a definition, or replace it with supported local/global storage." if text.include?("external global")
       return "Only the default address space is supported." if text.include?("address space")
 
       "Run `pfc llvm-capabilities` for supported syntax and lower this construct before compiling."
@@ -803,7 +804,7 @@ module PFC
       return "The backend models integer operations with unsigned host scalars, so floating-point semantics are intentionally not lowered." if text.include?("floating-point")
       return "i128 is represented as low and high 64-bit halves for memory movement, add/sub, bitwise operations, signed/unsigned comparisons, selection, extension, and narrowing." if text.include?("i128")
       return "blockaddress exposes function-local control-flow addresses, which the generated C scheduler does not model." if text.include?("blockaddress")
-      return "Declaration-only globals would require linker/runtime storage that this standalone C emitter cannot allocate safely." if text.include?("external global")
+      return "Only integer, pointer, and integer-array external globals are materialized as zero-initialized standalone stubs; other declaration-only globals require target-specific storage." if text.include?("external global")
       return "Non-zero address spaces require target-specific pointer provenance that is outside the portable C backend." if text.include?("address space")
 
       "This instruction is outside the documented LLVM subset and must be lowered before pfc compiles it."
@@ -821,7 +822,7 @@ module PFC
       return ["rewrite floating-point work as integer or fixed-point operations before LLVM lowering"] if text.include?("floating-point")
       return ["truncate i128 to i64 before unsupported operations, or keep it limited to load/store, add/sub, and/or/xor, signed/unsigned comparisons, select, zext/sext, and trunc"] if text.include?("i128")
       return ["replace blockaddress with explicit labels and branch/switch control flow"] if text.include?("blockaddress")
-      return ["define the global in the module or pass the data through supported local/global storage"] if text.include?("external global")
+      return ["use an integer, pointer, or integer-array external-global stub, define the global in the module, or pass the data through supported storage"] if text.include?("external global")
       return ["lower non-zero address-space pointers to default address-space pointers before pfc"] if text.include?("address space")
 
       ["lower this construct to the documented scalar integer, pointer, aggregate, or libc subset"]
@@ -1097,13 +1098,13 @@ module PFC
         LLVM subset capabilities:
           memory:
             - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus i128 load/store with high 64-bit preservation
-            - byte-addressed numeric globals, with global writable, constant read-only, and zero-initialized integer external-global stub storage
+            - byte-addressed numeric globals and mutable byte-string globals, with global writable, constant read-only, and zero-initialized integer external-global stub storage
             - struct/array global initializers and aggregate load/store byte copies in main and internal functions
             - fixed-length integer vector alloca/load/store byte copies in main and internal functions
             - pointer load/store and pointer fields inside aggregates
             - read-only global string byte memory for load/getelementptr/ptrtoint
             - constant and dynamic getelementptr for integer, array, struct, vector, and compound aggregate element sizes
-            - constant-expression getelementptr/bitcast/inttoptr pointer operands and global initializer relocations
+            - constant-expression getelementptr/bitcast/inttoptr pointer operands, ptrtoint scalar operands, and global initializer relocations
             - llvm.memcpy.inline.* over local/global memory
             - named struct alloca and struct field getelementptr
             - constant-count alloca, with dynamic-count alloca reserving tape-size capacity
@@ -1130,7 +1131,7 @@ module PFC
             - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, arbitrary constant-mask shufflevector, pointer-vector shufflevector, vector icmp/select, extractelement, and insertelement with runtime index checks
             - fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns
           control:
-            - br, switch, scalar/pointer/i128/vector/aggregate phi, ret
+            - br, switch with bit-width-masked integer case comparisons, scalar/pointer/i128/vector/aggregate phi, ret
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
             - void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments
@@ -1169,13 +1170,13 @@ module PFC
       {
         memory: [
           "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus i128 load/store with high 64-bit preservation",
-          "byte-addressed numeric globals with global writable, constant read-only, and zero-initialized integer external-global stub semantics",
+          "byte-addressed numeric globals and mutable byte-string globals with global writable, constant read-only, and zero-initialized integer external-global stub semantics",
           "struct/array global initializers and aggregate load/store byte copies in main and internal functions",
           "fixed-length integer vector alloca/load/store byte copies in main and internal functions",
           "pointer load/store and pointer fields inside aggregates",
           "read-only global string byte memory for load/getelementptr/ptrtoint",
           "constant and dynamic getelementptr for integer, array, struct, vector, and compound aggregate element sizes",
-          "constant-expression getelementptr/bitcast/inttoptr pointer operands and global initializer relocations",
+          "constant-expression getelementptr/bitcast/inttoptr pointer operands, ptrtoint scalar operands, and global initializer relocations",
           "llvm.memcpy.inline.* over local/global memory",
           "named struct alloca and struct field getelementptr",
           "constant-count alloca, with dynamic-count alloca reserving tape-size capacity",
@@ -1204,7 +1205,7 @@ module PFC
           "fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns"
         ],
         control: [
-          "br, switch, scalar/pointer/i128/vector/aggregate phi, ret",
+          "br, switch with bit-width-masked integer case comparisons, scalar/pointer/i128/vector/aggregate phi, ret",
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
           "void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments",

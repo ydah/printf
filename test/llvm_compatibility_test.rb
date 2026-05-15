@@ -180,6 +180,72 @@ class LLVMCompatibilityTest < Minitest::Test
     assert_equal "B", compile_llvm_source_and_run(source)
   end
 
+  def test_constant_expression_ptrtoint_gep_scalar_argument
+    source = <<~LLVM
+      @.text = private unnamed_addr constant [3 x i8] c"AB\\00", align 1
+
+      declare i32 @putchar(i32)
+
+      define internal i64 @id64(i64 %value) {
+      entry:
+        ret i64 %value
+      }
+
+      define i32 @main() {
+      entry:
+        %encoded = call i64 @id64(i64 ptrtoint (ptr getelementptr ([3 x i8], ptr @.text, i64 0, i64 1) to i64))
+        %ptr = inttoptr i64 %encoded to ptr
+        %value = load i8, ptr %ptr, align 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_mutable_global_byte_string_initializer_can_be_updated
+    source = <<~LLVM
+      @.buffer = global [2 x i8] c"AB", align 1
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %first = getelementptr [2 x i8], ptr @.buffer, i64 0, i64 0
+        store i8 66, ptr %first, align 1
+        %value = load i8, ptr @.buffer, align 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_switch_masks_narrow_negative_case_values
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        switch i8 255, label %miss [
+          i8 -1, label %hit
+        ]
+      hit:
+        call i32 @putchar(i32 66)
+        ret i32 0
+      miss:
+        call i32 @putchar(i32 78)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
   def test_freeze_numeric_intrinsics_and_value_attributes
     source = <<~LLVM
       declare i32 @putchar(i32)

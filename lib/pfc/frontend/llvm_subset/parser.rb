@@ -846,12 +846,7 @@ module PFC
             match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\bconstant\s+\[(\d+)\s+x\s+i8\]\s+c"((?:[^"\\]|\\.)*)"(?:,\s+align\s+\d+)?(?:,\s+![A-Za-z0-9_.-]+\s+![A-Za-z0-9_.-]+)?\z/)
             next unless match
 
-            bytes = decode_llvm_string(match[3])
-            if bytes.length > match[2].to_i
-              raise parse_error("global string #{match[1]} exceeds declared width", stripped)
-            end
-
-            strings[match[1]] = bytes
+            strings[match[1]] = llvm_string_initializer_bytes(match[1], match[2].to_i, match[3], stripped)
           end
         end
 
@@ -894,6 +889,8 @@ module PFC
               globals[match[1]] = Array.new(byte_width(match[2].to_i), 0)
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+ptr\s+(.+?)(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = Array.new(pointer_size, 0)
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\bglobal\s+\[(\d+)\s+x\s+i8\]\s+c"((?:[^"\\]|\\.)*)"(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = llvm_string_initializer_bytes(match[1], match[2].to_i, match[3], stripped)
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\]\s+(zeroinitializer|\[(.*)\])(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = global_integer_array_bytes(match, stripped)
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+(.+?)\s+(\{.*\}|\[.*\]|<.*>|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
@@ -914,6 +911,8 @@ module PFC
               globals[match[1]] = match[2] == "global"
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+ptr\s+.+?(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = match[2] == "global"
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\bglobal\s+\[\d+\s+x\s+i8\]\s+c"(?:[^"\\]|\\.)*"(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = true
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+\[\d+\s+x\s+i(?:1|8|16|32|64)\]\s+(?:zeroinitializer|\[.*\])(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = match[2] == "global"
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+.+?\s+(?:\{.*\}|\[.*\]|<.*>|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
@@ -1091,6 +1090,15 @@ module PFC
           raise parse_error("unsupported aggregate element: #{element}", element) unless match
 
           [pointer_type?(match[1]) ? "ptr" : match[1], match[2]]
+        end
+
+        def llvm_string_initializer_bytes(name, declared_width, raw, line)
+          bytes = decode_llvm_string(raw)
+          if bytes.length > declared_width
+            raise parse_error("global string #{name} exceeds declared width", line)
+          end
+
+          bytes + Array.new(declared_width - bytes.length, 0)
         end
 
         def global_integer_array_bytes(match, line)
