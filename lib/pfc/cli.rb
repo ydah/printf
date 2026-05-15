@@ -373,8 +373,12 @@ module PFC
         {
           id: rule_id,
           name: rule_id,
+          helpUri: "https://github.com/ydah/printf#llvm-ir-subset",
           shortDescription: { text: diagnostic.fetch(:hint) },
-          fullDescription: { text: diagnostic.fetch(:explanation) }
+          fullDescription: { text: diagnostic.fetch(:explanation) },
+          properties: {
+            tags: ["llvm", "pfc", llvm_diagnostic_category(diagnostic)]
+          }
         }
       end.uniq { |rule| rule.fetch(:id) }
     end
@@ -410,6 +414,19 @@ module PFC
     def llvm_sarif_rule_id(diagnostic)
       opcode = diagnostic.fetch(:opcode) || "unknown"
       "pfc.llvm.#{diagnostic.fetch(:severity)}.#{opcode}"
+    end
+
+    def llvm_diagnostic_category(diagnostic)
+      text = [diagnostic.fetch(:message), diagnostic.fetch(:line_text)].compact.join("\n")
+      return "atomic" if text.include?("atomic")
+      return "exception-handling" if text.include?("exception handling")
+      return "vector" if text.include?("vector") || text.include?("shufflevector")
+      return "floating-point" if text.include?("floating-point")
+      return "varargs" if text.include?("varargs")
+      return "address-space" if text.include?("address space")
+      return "i128" if text.include?("i128")
+
+      "unsupported"
     end
 
     def llvm_lowering_strategy(error)
@@ -559,7 +576,7 @@ module PFC
     end
 
     def llvm_static_supported_line?(line)
-      line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?(?:(?:tail|musttail|notail)\s+)?(?:alloca|getelementptr|load|store|extractelement|insertelement|add|sub|mul|udiv|sdiv|urem|srem|and|or|xor|shl|lshr|ashr|zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast|freeze|icmp|select|phi|call|switch|br|ret|unreachable)\b/) ||
+      line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?(?:(?:tail|musttail|notail)\s+)?(?:alloca|getelementptr|load|store|extractelement|insertelement|extractvalue|insertvalue|add|sub|mul|udiv|sdiv|urem|srem|and|or|xor|shl|lshr|ashr|zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast|freeze|icmp|select|phi|call|switch|br|ret|unreachable)\b/) ||
         line.match?(/\A[@%][-A-Za-z$._0-9]+\s*=.*\b(?:global|constant|alias)\b/)
     end
 
@@ -567,6 +584,10 @@ module PFC
       type_message = llvm_static_unsupported_type_message(line)
       return type_message if type_message
       return "unsupported blockaddress constant expression" if line.include?("blockaddress")
+      return "unsupported atomic operation" if line.match?(/\b(?:fence|atomicrmw|cmpxchg)\b/)
+      return "unsupported exception handling instruction" if line.match?(/\b(?:invoke|landingpad|resume|catchswitch|catchpad|cleanuppad|cleanupret|catchret)\b/)
+      return "unsupported vector shuffle instruction" if line.match?(/\bshufflevector\b/)
+      return "unsupported varargs instruction" if line.match?(/\bva_arg\b/)
 
       opcode = line[/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
       "unsupported LLVM instruction #{opcode}. Nearest supported areas: integer scalar ops, pointer ops, aggregate memory, libc calls."
@@ -730,8 +751,8 @@ module PFC
           memory:
             - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus i128 load/store with high 64-bit preservation
             - byte-addressed numeric globals, with global writable and constant read-only
-            - struct/array global initializers and aggregate load/store byte copies
-            - fixed-length integer vector alloca/load/store byte copies
+            - struct/array global initializers and aggregate load/store byte copies in main and internal functions
+            - fixed-length integer vector alloca/load/store byte copies in main and internal functions
             - pointer load/store and pointer fields inside aggregates
             - read-only global string byte memory for load/getelementptr/ptrtoint
             - constant and dynamic getelementptr for integer, array, and struct element sizes
@@ -762,7 +783,7 @@ module PFC
             - br, switch, phi, ret
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
-            - void @main and nested non-recursive internal calls with integer/pointer/void returns plus i128/vector returns and integer/pointer/i128/vector arguments
+            - void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments
           tolerance:
             - common value attributes accepted as no-ops
             - trailing LLVM metadata attachments accepted as no-ops
@@ -775,7 +796,7 @@ module PFC
             - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode
             - llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on-warning, and SARIF output
             - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
-            - explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces
+            - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
             - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.expect.* accepted as identity intrinsic
           libc:
@@ -789,8 +810,8 @@ module PFC
         memory: [
           "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus i128 load/store with high 64-bit preservation",
           "byte-addressed numeric globals with global writable and constant read-only semantics",
-          "struct/array global initializers and aggregate load/store byte copies",
-          "fixed-length integer vector alloca/load/store byte copies",
+          "struct/array global initializers and aggregate load/store byte copies in main and internal functions",
+          "fixed-length integer vector alloca/load/store byte copies in main and internal functions",
           "pointer load/store and pointer fields inside aggregates",
           "read-only global string byte memory for load/getelementptr/ptrtoint",
           "constant and dynamic getelementptr for integer, array, and struct element sizes",
@@ -823,7 +844,7 @@ module PFC
           "br, switch, phi, ret",
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
-          "void @main and nested non-recursive internal calls with integer/pointer/void returns plus i128/vector returns and integer/pointer/i128/vector arguments"
+          "void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments"
         ],
         tolerance: [
           "common value attributes accepted as no-ops",
@@ -837,7 +858,7 @@ module PFC
           "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode",
           "llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on-warning, and SARIF output",
           "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
-          "explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces",
+          "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.expect.* accepted as identity intrinsic"
         ],

@@ -12,7 +12,8 @@ module PFC
         POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
         INTEGER_TYPE = /i(?:1|8|16|32|64)/
         VECTOR_TYPE = /<\d+\s+x\s+i(?:1|8|16|32|64)>/
-        RETURN_TYPE = /(?:#{INTEGER_TYPE}|i128|#{VECTOR_TYPE}|ptr|void)/
+        AGGREGATE_TYPE = /(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+(?:i(?:1|8|16|32|64|128)|ptr|#{VECTOR_TYPE}|%[-A-Za-z$._0-9]+)\])/
+        RETURN_TYPE = /(?:#{INTEGER_TYPE}|i128|#{VECTOR_TYPE}|#{AGGREGATE_TYPE}|ptr|void)/
         ATTRIBUTE_TOKEN = /[-\w]+(?:\([^)]*\))?/
 
         class Instruction
@@ -606,7 +607,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Aret\s+(void|ptr|i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>)(?:\s+(.+))?\z/)
+            match = text.match(/\Aret\s+(void|ptr|i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\])(?:\s+(.+))?\z/)
             return unless match
 
             @return_type = match[1]
@@ -1101,7 +1102,7 @@ module PFC
               next({ type: "...", name: nil })
             end
 
-            type_pattern = allow_pointer ? /i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|ptr(?:\s+addrspace\(\d+\))?|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
+            type_pattern = allow_pointer ? /i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+(?:i(?:1|8|16|32|64|128)|ptr|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+)\]|ptr(?:\s+addrspace\(\d+\))?|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
             match = stripped.match(/\A(#{type_pattern})(?:\s+(.+))?\z/)
             raise ParseError, "unsupported function parameter: #{parameter}" unless match
             name = match[2]&.match(/#{NAME}/)&.[](0)

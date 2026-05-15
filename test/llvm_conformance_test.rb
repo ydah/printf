@@ -14,6 +14,7 @@ class LLVMConformanceTest < Minitest::Test
     "i128_add_signed_cmp.ll" => "B",
     "i128_shift_phi.ll" => "B",
     "internal_aggregate_calls.ll" => "B",
+    "internal_memory_aggregate.ll" => "B",
     "vector_add.ll" => "B",
     "vector_scalarized_ops.ll" => "B",
     "vector_literal.ll" => "B",
@@ -134,6 +135,9 @@ class LLVMConformanceTest < Minitest::Test
     assert_equal "2.1.0", sarif.fetch("version")
     assert_equal "pfc llvm-capabilities", sarif.fetch("runs").first.fetch("tool").fetch("driver").fetch("name")
     assert sarif.fetch("runs").first.fetch("results").any? { |result| result.fetch("level") == "error" }
+    rule = sarif.fetch("runs").first.fetch("tool").fetch("driver").fetch("rules").first
+    assert_includes rule.fetch("properties").fetch("tags"), "llvm"
+    assert rule.key?("helpUri")
   end
 
   def test_capability_data_mentions_representative_lowered_features
@@ -215,6 +219,33 @@ class LLVMConformanceTest < Minitest::Test
         result = JSON.parse(out)
         refute result.fetch("supported")
         assert result.fetch("errors").all? { |entry| entry.fetch("message").include?("unsupported") }
+      end
+    end
+  end
+
+  def test_static_preflight_classifies_unsupported_feature_families
+    cases = {
+      "atomic.ll" => ["fence seq_cst", "unsupported atomic operation"],
+      "eh.ll" => ["landingpad { ptr, i32 } cleanup", "unsupported exception handling instruction"],
+      "shuffle.ll" => ["%x = shufflevector <2 x i32> <i32 1, i32 2>, <2 x i32> <i32 3, i32 4>, <2 x i32> <i32 0, i32 2>", "unsupported vector shuffle instruction"],
+      "varargs.ll" => ["%x = va_arg ptr null, i32", "unsupported varargs instruction"]
+    }
+    Dir.mktmpdir("pfc-feature-families") do |dir|
+      cases.each do |name, (line, expected)|
+        path = File.join(dir, name)
+        File.write(path, <<~LLVM)
+          define i32 @main() {
+          entry:
+            #{line}
+            ret i32 0
+          }
+        LLVM
+        out, err = capture_io do
+          assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check", "--json", path]).run
+        end
+        assert_empty err
+        messages = JSON.parse(out).fetch("diagnostics").map { |entry| entry.fetch("message") }.join("\n")
+        assert_includes messages, expected
       end
     end
   end
