@@ -15,11 +15,11 @@ module PFC
         ATTRIBUTE_TOKEN = /[-\w]+(?:\([^)]*\))?/
 
         class Instruction
-          attr_reader :kind, :text
+          attr_reader :kind, :source_line, :text
 
-          def self.build(text)
+          def self.build(text, source_line: nil)
             instruction = new(text)
-            case instruction.kind
+            built = case instruction.kind
             when :call then CallInstruction.new(text)
             when :branch then BranchInstruction.new(text)
             when :gep then GEPInstruction.new(text)
@@ -39,6 +39,8 @@ module PFC
             when :return then ReturnInstruction.new(text)
             else instruction
             end
+            built.instance_variable_set(:@source_line, source_line)
+            built
           end
 
           def initialize(text)
@@ -235,16 +237,43 @@ module PFC
         end
 
         class BinaryInstruction < Instruction
-          attr_reader :bits, :destination, :flags, :left, :operator, :right
+          attr_reader :bits, :destination, :flags, :left, :operator, :right, :value_type, :vector_type
 
           def initialize(text)
             super
+            if (match = text.match(/\A(#{NAME})\s*=\s*add((?:\s+(?:nuw|nsw|exact))*)\s+(<\d+\s+x\s+i(8|16|32|64)>)\s+(.+)\z/))
+              operands = Instruction.split_arguments(match[5])
+              return unless operands.length == 2
+
+              @destination = match[1]
+              @operator = "add"
+              @flags = match[2].split.freeze
+              @value_type = match[3]
+              @vector_type = match[3]
+              @bits = match[4].to_i
+              @left = operands.fetch(0)
+              @right = operands.fetch(1)
+              return
+            end
+
+            if (match = text.match(/\A(#{NAME})\s*=\s*(and|or|xor)\s+i128\s+(.+?),\s+(.+)\z/))
+              @destination = match[1]
+              @operator = match[2]
+              @flags = [].freeze
+              @value_type = "i128"
+              @bits = 128
+              @left = match[3]
+              @right = match[4]
+              return
+            end
+
             match = text.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact))*)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
             return unless match
 
             @destination = match[1]
             @operator = match[2]
             @flags = match[3].split.freeze
+            @value_type = "i#{match[4]}"
             @bits = match[4].to_i
             @left = match[5]
             @right = match[6]
@@ -256,7 +285,7 @@ module PFC
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne)\s+i128\s+(.+?),\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule)\s+i128\s+(.+?),\s+(.+)\z/))
               @destination = match[1]
               @predicate = match[2]
               @bits = 128
@@ -983,7 +1012,7 @@ module PFC
               order << current unless parsed.key?(current)
               parsed[current] ||= []
             else
-              parsed[current] << Instruction.build(stripped)
+              parsed[current] << Instruction.build(stripped, source_line: source_line_numbers[stripped])
             end
           end
 

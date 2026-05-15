@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "c_emitter"
+require_relative "llvm_c_emitter/source_locations"
 require_relative "printf_primitives"
 require_relative "../frontend/llvm_subset"
 require_relative "../frontend/llvm_subset/parser"
@@ -8,6 +9,8 @@ require_relative "../frontend/llvm_subset/parser"
 module PFC
   module Backend
     class LLVMCEmitter
+      include SourceLocations
+
       DEFAULT_TAPE_SIZE = CEmitter::DEFAULT_TAPE_SIZE
       NAME = /%[-A-Za-z$._0-9]+/
       GLOBAL_NAME = /@[-A-Za-z$._0-9]+/
@@ -270,6 +273,10 @@ module PFC
             next
           end
           if line.respond_to?(:destination) && line.respond_to?(:vector_type) && line.respond_to?(:value) && line.destination == lhs && aggregate_type?(line.vector_type)
+            aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(line.vector_type), type: line.vector_type }
+            next
+          end
+          if line.respond_to?(:destination) && line.respond_to?(:vector_type) && line.respond_to?(:operator) && line.destination == lhs && aggregate_type?(line.vector_type)
             aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(line.vector_type), type: line.vector_type }
             next
           end
@@ -855,6 +862,8 @@ module PFC
       end
 
       def emit_binary(line)
+        return emit_vector_binary(line) if line.respond_to?(:vector_type) && line.vector_type
+
         if line.respond_to?(:destination) && line.respond_to?(:operator) && line.respond_to?(:bits) && line.bits
           destination = line.destination
           operator = line.operator
@@ -871,8 +880,48 @@ module PFC
           left = match[4]
           right = match[5]
         end
+        return emit_i128_binary(destination, operator, left, right) if bits == 128
+
         expression = binary_expression(operator, bits, llvm_value(left), llvm_value(right))
         ["    #{register(destination)} = #{unsigned_cast(bits)}((#{expression}) & #{integer_mask_literal(bits)});"]
+      end
+
+      def emit_i128_binary(destination, operator, left, right, context: nil)
+        unless %w[and or xor].include?(operator)
+          raise Frontend::LLVMSubset::ParseError, "unsupported i128 binary operator: #{operator}"
+        end
+
+        target = context ? inline_register(context, destination) : register(destination)
+        high_target = context ? nil : i128_high_register(destination)
+        op = { "and" => "&", "or" => "|", "xor" => "^" }.fetch(operator)
+        low = "((#{i128_low64_value(left, context:)}) #{op} (#{i128_low64_value(right, context:)}))"
+        high = "((#{i128_high64_value(left, context:)}) #{op} (#{i128_high64_value(right, context:)}))"
+        lines = ["    #{target} = #{low};"]
+        lines << "    #{high_target} = #{high};" if high_target
+        lines
+      end
+
+      def emit_vector_binary(line)
+        unless line.operator == "add"
+          raise Frontend::LLVMSubset::ParseError, "unsupported vector binary operator: #{line.operator}"
+        end
+
+        aggregate = aggregate_register(line.destination)
+        left_source = aggregate_value_bytes(line.left, line.vector_type)
+        right_source = aggregate_value_bytes(line.right, line.vector_type)
+        width = byte_width(line.bits)
+        prefix = next_aggregate_copy_prefix
+        left_value = left_source ? "pf_llvm_load(#{left_source}, #{prefix}_i * #{width}, #{width})" : "0ull"
+        right_value = right_source ? "pf_llvm_load(#{right_source}, #{prefix}_i * #{width}, #{width})" : "0ull"
+        expression = binary_expression(line.operator, line.bits, left_value, right_value)
+        [
+          "    {",
+          "        int #{prefix}_i = 0;",
+          "        for (#{prefix}_i = 0; #{prefix}_i < #{vector_element_count(line.vector_type)}; #{prefix}_i++) {",
+          "            pf_llvm_store(#{aggregate.fetch(:name)}, #{prefix}_i * #{width}, (unsigned long long)((#{expression}) & #{integer_mask_literal(line.bits)}), #{width});",
+          "        }",
+          "    }"
+        ]
       end
 
       def emit_select(line)
@@ -1171,18 +1220,24 @@ module PFC
       end
 
       def emit_i128_icmp(destination, predicate, left, right, context: nil)
-        unless %w[eq ne].include?(predicate)
+        unless %w[eq ne ugt uge ult ule].include?(predicate)
           raise Frontend::LLVMSubset::ParseError, "unsupported i128 icmp predicate: #{predicate}"
         end
 
         target = context ? inline_register(context, destination) : register(destination)
-        operator = predicate == "eq" ? "==" : "!="
-        connective = predicate == "eq" ? "&&" : "||"
         left_value = i128_low64_value(left, context:)
         right_value = i128_low64_value(right, context:)
         left_high = i128_high64_value(left, context:)
         right_high = i128_high64_value(right, context:)
-        ["    #{target} = (((#{left_value}) #{operator} (#{right_value})) #{connective} ((#{left_high}) #{operator} (#{right_high}))) ? 1u : 0u;"]
+        expression = case predicate
+                     when "eq" then "(((#{left_value}) == (#{right_value})) && ((#{left_high}) == (#{right_high})))"
+                     when "ne" then "(((#{left_value}) != (#{right_value})) || ((#{left_high}) != (#{right_high})))"
+                     when "ugt" then "(((#{left_high}) > (#{right_high})) || (((#{left_high}) == (#{right_high})) && ((#{left_value}) > (#{right_value}))))"
+                     when "uge" then "(((#{left_high}) > (#{right_high})) || (((#{left_high}) == (#{right_high})) && ((#{left_value}) >= (#{right_value}))))"
+                     when "ult" then "(((#{left_high}) < (#{right_high})) || (((#{left_high}) == (#{right_high})) && ((#{left_value}) < (#{right_value}))))"
+                     when "ule" then "(((#{left_high}) < (#{right_high})) || (((#{left_high}) == (#{right_high})) && ((#{left_value}) <= (#{right_value}))))"
+                     end
+        ["    #{target} = (#{expression}) ? 1u : 0u;"]
       end
 
       def emit_pointer_icmp(destination, predicate, left, right, context: nil)
@@ -1505,6 +1560,8 @@ module PFC
       end
 
       def emit_inline_binary(line, context)
+        raise Frontend::LLVMSubset::ParseError, "unsupported vector binary in internal call: #{line}" if line.respond_to?(:vector_type) && line.vector_type
+
         if line.respond_to?(:destination) && line.respond_to?(:operator) && line.respond_to?(:bits) && line.bits
           destination = line.destination
           operator = line.operator
@@ -1521,6 +1578,8 @@ module PFC
           left = match[4]
           right = match[5]
         end
+        return emit_i128_binary(destination, operator, left, right, context:) if bits == 128
+
         local = inline_register(context, destination)
         expression = binary_expression(operator, bits, inline_value(left, context), inline_value(right, context))
         ["    #{local} = #{unsigned_cast(bits)}((#{expression}) & #{integer_mask_literal(bits)});"]
@@ -2919,28 +2978,6 @@ module PFC
         selected = bytes.drop(pointer.offset)
         terminator = selected.index(0)
         terminator ? selected.take(terminator) : selected
-      end
-
-      def with_statement_context(line)
-        yield
-      rescue Frontend::LLVMSubset::ParseError => e
-        raise e if e.message.start_with?("line ")
-
-        line_number = source_line_number(line)
-        prefix = line_number ? "line #{line_number}: " : ""
-        raise Frontend::LLVMSubset::ParseError, "#{prefix}#{e.message}"
-      end
-
-      def source_line_number(line)
-        @source_line_numbers.fetch(instruction_text(line), nil)
-      end
-
-      def instruction_text(instruction)
-        instruction.respond_to?(:text) ? instruction.text : instruction.to_s
-      end
-
-      def instruction_kind(instruction)
-        instruction.respond_to?(:kind) ? instruction.kind : nil
       end
 
       def inline_pointer_expr(context, name)

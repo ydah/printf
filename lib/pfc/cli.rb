@@ -133,6 +133,7 @@ module PFC
 
     def llvm_capabilities_command
       check = false
+      emit_lowering_plan = false
       explain = false
       fix_suggestions = false
       json = false
@@ -146,6 +147,9 @@ module PFC
         when "--fix-suggestions"
           check = true
           fix_suggestions = true
+        when "--emit-lowering-plan"
+          check = true
+          emit_lowering_plan = true
         when "--json"
           json = true
         else
@@ -160,7 +164,9 @@ module PFC
         raise ArgumentError, "llvm-capabilities --check only supports LLVM inputs" unless llvm_source?(path)
 
         result = llvm_check_result(path)
-        if json
+        if emit_lowering_plan
+          puts JSON.pretty_generate(llvm_lowering_plan(result))
+        elsif json
           puts JSON.pretty_generate(result)
         elsif result.fetch(:supported)
           puts "supported: #{path}"
@@ -204,6 +210,37 @@ module PFC
       { schema_version: 1, path:, supported: errors.empty?, errors: }
     end
 
+    def llvm_lowering_plan(result)
+      {
+        schema_version: 1,
+        path: result.fetch(:path),
+        supported: result.fetch(:supported),
+        operations: result.fetch(:errors).map.with_index(1) do |error, index|
+          {
+            id: "lower_#{index}",
+            line: error.fetch(:line),
+            opcode: error.fetch(:opcode),
+            line_text: error.fetch(:line_text),
+            reason: error.fetch(:message),
+            strategy: llvm_lowering_strategy(error),
+            steps: error.fetch(:fix_suggestions)
+          }
+        end
+      }
+    end
+
+    def llvm_lowering_strategy(error)
+      text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
+      return "scalarize_vector_arithmetic" if text.match?(/\b(add|sub|mul|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
+      return "rewrite_float_to_integer" if text.include?("floating-point")
+      return "narrow_or_restrict_i128" if text.include?("i128")
+      return "replace_blockaddress_control_flow" if text.include?("blockaddress")
+      return "materialize_external_global" if text.include?("external global")
+      return "lower_to_default_address_space" if text.include?("address space")
+
+      "manual_lowering_required"
+    end
+
     def llvm_static_check_errors(source)
       source.each_line.with_index(1).filter_map do |raw_line, line_number|
         line = raw_line.sub(/;.*/, "").strip
@@ -243,7 +280,7 @@ module PFC
       text = [message, line_text].compact.join("\n")
       return "Use supported fixed-length integer vector operations or explicitly lower vectors to scalar code." if text.include?("vector")
       return "Lower floating-point operations to integer code before invoking pfc." if text.include?("floating-point")
-      return "Use only i128 load/store, zeroinitializer, eq/ne, or truncation to a supported integer width." if text.include?("i128")
+      return "Use only i128 load/store, zeroinitializer, bitwise and/or/xor, unsigned comparisons, eq/ne, or truncation to a supported integer width." if text.include?("i128")
       return "blockaddress is outside the subset; use normal labels and branches." if text.include?("blockaddress")
       return "Provide a definition for the global or replace it with a supported local/global pointer." if text.include?("external global")
       return "Only the default address space is supported." if text.include?("address space")
@@ -255,7 +292,7 @@ module PFC
       text = [message, line_text].compact.join("\n")
       return "Scalable vectors and non-integer vector lanes do not have a stable byte layout in this subset." if text.include?("scalable vector") || text.include?("unsupported vector")
       return "The backend models integer operations with unsigned host scalars, so floating-point semantics are intentionally not lowered." if text.include?("floating-point")
-      return "i128 is represented only by its low 64 bits plus zero high storage for safe memory movement and narrowing." if text.include?("i128")
+      return "i128 is represented as low and high 64-bit halves for memory movement, bitwise operations, unsigned comparisons, and narrowing." if text.include?("i128")
       return "blockaddress exposes function-local control-flow addresses, which the generated C scheduler does not model." if text.include?("blockaddress")
       return "Declaration-only globals would require linker/runtime storage that this standalone C emitter cannot allocate safely." if text.include?("external global")
       return "Non-zero address spaces require target-specific pointer provenance that is outside the portable C backend." if text.include?("address space")
@@ -272,7 +309,7 @@ module PFC
         ]
       end
       return ["rewrite floating-point work as integer or fixed-point operations before LLVM lowering"] if text.include?("floating-point")
-      return ["truncate i128 to i64 before unsupported operations, or keep it limited to load/store, eq/ne, and trunc"] if text.include?("i128")
+      return ["truncate i128 to i64 before unsupported operations, or keep it limited to load/store, and/or/xor, unsigned comparisons, eq/ne, and trunc"] if text.include?("i128")
       return ["replace blockaddress with explicit labels and branch/switch control flow"] if text.include?("blockaddress")
       return ["define the global in the module or pass the data through supported local/global storage"] if text.include?("external global")
       return ["lower non-zero address-space pointers to default address-space pointers before pfc"] if text.include?("address space")
@@ -432,7 +469,7 @@ module PFC
           pfc dump-cfg INPUT
           pfc dump-c INPUT
           pfc llvm-capabilities [--json]
-          pfc llvm-capabilities --check [--json] [--fix-suggestions] INPUT.ll
+          pfc llvm-capabilities --check [--json] [--fix-suggestions] [--emit-lowering-plan] INPUT.ll
           pfc llvm-capabilities --explain INPUT.ll
 
         Options:
@@ -468,7 +505,7 @@ module PFC
             - add/sub/mul, signed/unsigned division and remainder
             - bitwise and/or/xor, shl/lshr/ashr
             - zext/sext/trunc, including trunc from i128 to supported integer widths
-            - limited i128 zeroinitializer and eq/ne comparisons with high 64-bit preservation
+            - limited i128 zeroinitializer, and/or/xor, eq/ne, and unsigned comparisons with high 64-bit preservation
             - ptrtoint and tagged inttoptr for local/global/string pointer values
             - bitcast ptr-to-ptr
             - addrspacecast for default address-space pointers
@@ -478,7 +515,7 @@ module PFC
             - freeze
             - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
             - extractvalue and insertvalue for scalar integer fields in aggregate values
-            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, extractelement, and insertelement with runtime index checks
+            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add scalarization, extractelement, and insertelement with runtime index checks
           control:
             - br, switch, phi, ret
             - unreachable as runtime abort
@@ -494,7 +531,7 @@ module PFC
             - common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops
             - llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals
             - llvm-capabilities --check reports schema_version plus multi-error diagnostics with severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode
-            - llvm-capabilities --explain and --fix-suggestions print lowering guidance
+            - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance
             - explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces
             - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.expect.* accepted as identity intrinsic
@@ -527,7 +564,7 @@ module PFC
           "add/sub/mul, signed/unsigned division and remainder",
           "bitwise and/or/xor, shl/lshr/ashr",
           "zext/sext/trunc, including trunc from i128 to supported integer widths",
-          "limited i128 zeroinitializer and eq/ne comparisons with high 64-bit preservation",
+          "limited i128 zeroinitializer, and/or/xor, eq/ne, and unsigned comparisons with high 64-bit preservation",
           "ptrtoint and tagged inttoptr for local/global/string pointer values",
           "bitcast ptr-to-ptr",
           "addrspacecast for default address-space pointers",
@@ -537,7 +574,7 @@ module PFC
           "freeze",
           "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
           "extractvalue and insertvalue for scalar integer fields in aggregate values",
-          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, extractelement, and insertelement with runtime index checks"
+          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add scalarization, extractelement, and insertelement with runtime index checks"
         ],
         control: [
           "br, switch, phi, ret",
@@ -555,7 +592,7 @@ module PFC
           "common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops",
           "llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals",
           "llvm-capabilities --check reports schema_version plus multi-error diagnostics with severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode",
-          "llvm-capabilities --explain and --fix-suggestions print lowering guidance",
+          "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance",
           "explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.expect.* accepted as identity intrinsic"
