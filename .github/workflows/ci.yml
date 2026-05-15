@@ -15,4 +15,18 @@ jobs:
       - name: Run tests
         run: make test
       - name: Check clang fixtures
-        run: make fixtures-check
+        run: |
+          if make fixtures-check; then
+            exit 0
+          fi
+          mkdir -p out/fixture-diagnostics
+          for fixture in samples/clang/*.ll; do
+            ruby -Ilib bin/pfc llvm-capabilities --check --json "$fixture" > "out/fixture-diagnostics/$(basename "$fixture").json" || true
+          done
+          exit 1
+      - name: Upload fixture diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixture-diagnostics
+          path: out/fixture-diagnostics

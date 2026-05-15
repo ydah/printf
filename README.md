@@ -29,7 +29,7 @@ Commands:
 - `dump-cfg INPUT`
 - `dump-c INPUT`
 - `llvm-capabilities [--json]`
-- `llvm-capabilities --check [--json] [--fix-suggestions] INPUT.ll`
+- `llvm-capabilities --check [--json] [--fix-suggestions] [--emit-lowering-plan] INPUT.ll`
 - `llvm-capabilities --explain INPUT.ll`
 
 Common examples:
@@ -56,6 +56,7 @@ bin/pfc llvm-capabilities --json
 bin/pfc llvm-capabilities --check samples/clang_smoke.ll
 bin/pfc llvm-capabilities --check --json samples/clang_smoke.ll
 bin/pfc llvm-capabilities --check --fix-suggestions samples/clang_smoke.ll
+bin/pfc llvm-capabilities --check --emit-lowering-plan samples/clang_smoke.ll
 bin/pfc llvm-capabilities --explain samples/clang_smoke.ll
 CLANG="clang" ruby script/generate_clang_fixture.rb samples/example.c samples/example.ll
 make fixtures
@@ -78,15 +79,15 @@ Options:
 
 `.ll` inputs are detected by extension and compiled through the experimental LLVM IR subset frontend.
 
-Use `bin/pfc llvm-capabilities` for the full supported subset, `bin/pfc llvm-capabilities --json` for machine-readable output, `bin/pfc llvm-capabilities --check [--json] [--fix-suggestions] FILE.ll` to preflight an LLVM file, or `bin/pfc llvm-capabilities --explain FILE.ll` for human-readable lowering guidance. At a high level, the subset supports:
+Use `bin/pfc llvm-capabilities` for the full supported subset, `bin/pfc llvm-capabilities --json` for machine-readable output, `bin/pfc llvm-capabilities --check [--json] [--fix-suggestions] [--emit-lowering-plan] FILE.ll` to preflight an LLVM file, or `bin/pfc llvm-capabilities --explain FILE.ll` for human-readable lowering guidance. At a high level, the subset supports:
 
 - Memory: byte-addressed local memory, integer/pointer/aggregate/vector `alloca`/`load`/`store`, `i128` load/store with high 64-bit preservation, numeric globals, string globals, nested struct/array initializers, pointer fields, global initializer relocations, `getelementptr`, and `llvm.memset.*` / `llvm.memcpy.*` / `llvm.memcpy.inline.*` / `llvm.memmove.*`.
-- Values: `i1`/`i8`/`i16`/`i32`/`i64`, limited `i128` zero/equality/truncation with high 64-bit preservation, fixed-length `<N x i8/i16/i32/i64>` literals / `zeroinitializer` / `extractelement` / `insertelement` with runtime index checks, integer arithmetic, bitwise and shift operations, casts, pointer tagging via `ptrtoint` / `inttoptr`, pointer `bitcast`, default-address-space `addrspacecast`, `icmp`, `select`, `phi`, constants, `freeze`, `extractvalue`, `insertvalue`, and scalar `llvm.smax` / `llvm.smin` / `llvm.umax` / `llvm.umin` / `llvm.abs` / `llvm.bswap` / `llvm.ctpop` / `llvm.ctlz` / `llvm.cttz`.
+- Values: `i1`/`i8`/`i16`/`i32`/`i64`, limited `i128` zero/bitwise/unsigned-compare/truncation with high 64-bit preservation, fixed-length `<N x i8/i16/i32/i64>` literals / `zeroinitializer` / `add` scalarization / `extractelement` / `insertelement` with runtime index checks, integer arithmetic, bitwise and shift operations, casts, pointer tagging via `ptrtoint` / `inttoptr`, pointer `bitcast`, default-address-space `addrspacecast`, `icmp`, `select`, `phi`, constants, `freeze`, `extractvalue`, `insertvalue`, and scalar `llvm.smax` / `llvm.smin` / `llvm.umax` / `llvm.umin` / `llvm.abs` / `llvm.bswap` / `llvm.ctpop` / `llvm.ctlz` / `llvm.cttz`.
 - Control flow: `br`, `switch`, scalar and pointer `phi`, `ret`, `unreachable`, and nested non-recursive internal calls with integer, pointer, and void returns.
 - Clang tolerance: typed-pointer-style syntax, common `noundef` / `nonnull` / `dereferenceable`-style value attributes, `getelementptr` no-op flags, trailing metadata, module-level metadata, attributes blocks, `target datalayout`, aliases, no-op `llvm.assume` / `llvm.dbg.*` / `#dbg_*`, identity `llvm.expect.*`, and no-op `llvm.global_ctors` / `llvm.global_dtors` metadata globals.
 - Libc surface: `putchar`, `getchar`, `puts`, and static `printf` formats for integer, character, string, pointer, width, precision, flags, and escaped percent cases.
 
-Out-of-scope LLVM features should fail with explicit diagnostics rather than silently compiling. This includes unsupported vector shapes, floating-point types, unsupported `i128` operations, `blockaddress`, declaration-only external globals, and non-zero address spaces. JSON preflight diagnostics include `schema_version`, `severity`, `opcode`, `hint`, `explanation`, `fix_suggestions`, and `line_text` fields.
+Out-of-scope LLVM features should fail with explicit diagnostics rather than silently compiling. This includes unsupported vector shapes, floating-point types, unsupported `i128` operations, `blockaddress`, declaration-only external globals, and non-zero address spaces. JSON preflight diagnostics include `schema_version`, `severity`, `opcode`, `hint`, `explanation`, `fix_suggestions`, and `line_text` fields. `--emit-lowering-plan` returns structured lowering operations for external tooling.
 
 `make fixtures-check` verifies committed clang `.ll` fixtures are fresh across the `O0`/`O1`/`O2`/`Oz` matrix and then preflights them with `llvm-capabilities --check`.
 
