@@ -30,6 +30,7 @@ Commands:
 - `dump-c INPUT`
 - `llvm-capabilities [--json]`
 - `llvm-capabilities --check [--json] [--fix-suggestions] [--emit-lowering-plan] INPUT.ll`
+- `llvm-capabilities --check-dir [--json] [--emit-lowering-plan] DIR`
 - `llvm-capabilities --explain INPUT.ll`
 
 Common examples:
@@ -55,6 +56,7 @@ bin/pfc llvm-capabilities
 bin/pfc llvm-capabilities --json
 bin/pfc llvm-capabilities --check samples/clang_smoke.ll
 bin/pfc llvm-capabilities --check --json samples/clang_smoke.ll
+bin/pfc llvm-capabilities --check-dir --json test/fixtures/llvm
 bin/pfc llvm-capabilities --check --fix-suggestions samples/clang_smoke.ll
 bin/pfc llvm-capabilities --check --emit-lowering-plan samples/clang_smoke.ll
 bin/pfc llvm-capabilities --explain samples/clang_smoke.ll
@@ -79,10 +81,10 @@ Options:
 
 `.ll` inputs are detected by extension and compiled through the experimental LLVM IR subset frontend.
 
-Use `bin/pfc llvm-capabilities` for the full supported subset, `bin/pfc llvm-capabilities --json` for machine-readable output, `bin/pfc llvm-capabilities --check [--json] [--fix-suggestions] [--emit-lowering-plan] FILE.ll` to preflight an LLVM file, or `bin/pfc llvm-capabilities --explain FILE.ll` for human-readable lowering guidance. At a high level, the subset supports:
+Use `bin/pfc llvm-capabilities` for the full supported subset, `bin/pfc llvm-capabilities --json` for machine-readable output, `bin/pfc llvm-capabilities --check [--json] [--fix-suggestions] [--emit-lowering-plan] FILE.ll` to preflight an LLVM file, `bin/pfc llvm-capabilities --check-dir [--json] [--emit-lowering-plan] DIR` to preflight a fixture tree, or `bin/pfc llvm-capabilities --explain FILE.ll` for human-readable lowering guidance. At a high level, the subset supports:
 
 - Memory: byte-addressed local memory, integer/pointer/aggregate/vector `alloca`/`load`/`store`, `i128` load/store with high 64-bit preservation, numeric globals, string globals, nested struct/array initializers, pointer fields, global initializer relocations, `getelementptr`, and `llvm.memset.*` / `llvm.memcpy.*` / `llvm.memcpy.inline.*` / `llvm.memmove.*`.
-- Values: `i1`/`i8`/`i16`/`i32`/`i64`, limited `i128` zero/bitwise/unsigned-compare/truncation with high 64-bit preservation, fixed-length `<N x i8/i16/i32/i64>` literals / `zeroinitializer` / `add` scalarization / `extractelement` / `insertelement` with runtime index checks, integer arithmetic, bitwise and shift operations, casts, pointer tagging via `ptrtoint` / `inttoptr`, pointer `bitcast`, default-address-space `addrspacecast`, `icmp`, `select`, `phi`, constants, `freeze`, `extractvalue`, `insertvalue`, and scalar `llvm.smax` / `llvm.smin` / `llvm.umax` / `llvm.umin` / `llvm.abs` / `llvm.bswap` / `llvm.ctpop` / `llvm.ctlz` / `llvm.cttz`.
+- Values: `i1`/`i8`/`i16`/`i32`/`i64`, limited `i128` zero/bitwise/unsigned-compare/truncation with high 64-bit preservation, fixed-length `<N x i8/i16/i32/i64>` literals / `zeroinitializer` / `add`/`sub`/`and`/`or`/`xor` scalarization / `extractelement` / `insertelement` with runtime index checks, integer arithmetic, bitwise and shift operations, casts, pointer tagging via `ptrtoint` / `inttoptr`, pointer `bitcast`, default-address-space `addrspacecast`, `icmp`, `select`, `phi`, constants, `freeze`, `extractvalue`, `insertvalue`, and scalar `llvm.smax` / `llvm.smin` / `llvm.umax` / `llvm.umin` / `llvm.abs` / `llvm.bswap` / `llvm.ctpop` / `llvm.ctlz` / `llvm.cttz`.
 - Control flow: `br`, `switch`, scalar and pointer `phi`, `ret`, `unreachable`, and nested non-recursive internal calls with integer, pointer, and void returns.
 - Clang tolerance: typed-pointer-style syntax, common `noundef` / `nonnull` / `dereferenceable`-style value attributes, `getelementptr` no-op flags, trailing metadata, module-level metadata, attributes blocks, `target datalayout`, aliases, no-op `llvm.assume` / `llvm.dbg.*` / `#dbg_*`, identity `llvm.expect.*`, and no-op `llvm.global_ctors` / `llvm.global_dtors` metadata globals.
 - Libc surface: `putchar`, `getchar`, `puts`, and static `printf` formats for integer, character, string, pointer, width, precision, flags, and escaped percent cases.
@@ -103,4 +105,5 @@ This is an educational compiler demo, not an exploit toolkit. Generated format s
 
 ```sh
 make test
+UPDATE_SNAPSHOTS=1 make test
 ```
