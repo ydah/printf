@@ -692,6 +692,24 @@ static inline unsigned long long PF_MAYBE_UNUSED pf_llvm_load(const unsigned cha
     return value;
 }
 
+static inline int PF_MAYBE_UNUSED pf_llvm_bytes_equal(const unsigned char *left, int left_index, const unsigned char *right, int right_index, int width) {
+    int offset;
+    for (offset = 0; offset < width; offset++) {
+        if (left[left_index + offset] != right[right_index + offset]) return 0;
+    }
+    return 1;
+}
+
+static inline int PF_MAYBE_UNUSED pf_llvm_bytes_compare(const unsigned char *left, int left_index, const unsigned char *right, int right_index, int width) {
+    int offset;
+    for (offset = 0; offset < width; offset++) {
+        unsigned char left_byte = left[left_index + offset];
+        unsigned char right_byte = right[right_index + offset];
+        if (left_byte != right_byte) return (int)left_byte - (int)right_byte;
+    }
+    return 0;
+}
+
 int main(void) {
     FILE *pf_sink = tmpfile();
     if (pf_sink == NULL) {

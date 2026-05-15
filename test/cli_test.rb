@@ -93,13 +93,17 @@ class CLITest < Minitest::Test
     assert_includes capabilities.fetch("values").join("\n"), "llvm.abs"
     assert_includes capabilities.fetch("values").join("\n"), "llvm.ctpop"
     assert_includes capabilities.fetch("values").join("\n"), "pointer phi"
+    assert_includes capabilities.fetch("values").join("\n"), "aggregate byte equality"
     assert_includes capabilities.fetch("control").join("\n"), "pointer/void returns"
+    assert_includes capabilities.fetch("control").join("\n"), "sret"
     assert_includes capabilities.fetch("tolerance").join("\n"), "metadata"
+    assert_includes capabilities.fetch("tolerance").join("\n"), "info"
     assert_includes capabilities.fetch("tolerance").join("\n"), "datalayout"
     assert_includes capabilities.fetch("tolerance").join("\n"), "inbounds/nuw/nusw"
     assert_includes capabilities.fetch("tolerance").join("\n"), "external globals"
     assert_includes capabilities.fetch("tolerance").join("\n"), "llvm.expect"
     assert_includes capabilities.fetch("libc").join("\n"), "%p"
+    assert_includes capabilities.fetch("libc").join("\n"), "memcmp"
   end
 
   def test_llvm_capabilities_check_reports_supported_file

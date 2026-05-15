@@ -118,7 +118,7 @@ module PFC
           aggregate = aggregate_register(line.destination, context:)
           left_source = aggregate_value_bytes(line.left, line.vector_type, context:)
           right_source = aggregate_value_bytes(line.right, line.vector_type, context:)
-          width = byte_width(line.bits)
+          width = vector_element_width(line.vector_type)
           prefix = next_aggregate_copy_prefix
           left_value = left_source ? "pf_llvm_load(#{left_source}, #{prefix}_i * #{width}, #{width})" : "0ull"
           right_value = right_source ? "pf_llvm_load(#{right_source}, #{prefix}_i * #{width}, #{width})" : "0ull"
@@ -138,7 +138,7 @@ module PFC
           condition_source = aggregate_value_bytes(line.condition, line.condition_type, context:)
           true_source = aggregate_value_bytes(line.true_value, line.vector_type, context:)
           false_source = aggregate_value_bytes(line.false_value, line.vector_type, context:)
-          width = byte_width(line.bits)
+          width = vector_element_width(line.vector_type)
           prefix = next_aggregate_copy_prefix
           condition = condition_source ? "pf_llvm_load(#{condition_source}, #{prefix}_i, 1)" : "0ull"
           true_lane = true_source ? "pf_llvm_load(#{true_source}, #{prefix}_i * #{width}, #{width})" : "0ull"

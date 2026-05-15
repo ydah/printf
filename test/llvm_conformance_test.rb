@@ -20,9 +20,11 @@ class LLVMConformanceTest < Minitest::Test
     "internal_memory_aggregate.ll" => "B",
     "internal_memory_intrinsics.ll" => "B",
     "libc_memory_strlen.ll" => "B",
+    "libc_string_compare.ll" => "B",
     "nested_aggregate_select.ll" => "B",
     "sret_byval_abi.ll" => "B",
     "vector_add.ll" => "B",
+    "vector_pointer_lanes.ll" => "B",
     "vector_scalarized_ops.ll" => "B",
     "vector_literal.ll" => "B",
     "i128_high_bits.ll" => "B"
@@ -101,7 +103,7 @@ class LLVMConformanceTest < Minitest::Test
     assert plan.fetch("operations").first.key?("blocking")
   end
 
-  def test_lowering_plan_includes_warning_advisories
+  def test_lowering_plan_ignores_info_advisories
     Dir.mktmpdir("pfc-warning-plan") do |dir|
       path = File.join(dir, "warn.ll")
       File.write(path, <<~LLVM)
@@ -119,7 +121,14 @@ class LLVMConformanceTest < Minitest::Test
       assert_empty err
       plan = JSON.parse(out)
       assert_empty plan.fetch("operations")
-      assert_equal "warning", plan.fetch("advisories").first.fetch("severity")
+      assert_empty plan.fetch("advisories")
+
+      out, err = capture_io do
+        assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check", "--json", path]).run
+      end
+      assert_empty err
+      diagnostic = JSON.parse(out).fetch("diagnostics").first
+      assert_equal "info", diagnostic.fetch("severity")
     end
   end
 
@@ -230,10 +239,10 @@ class LLVMConformanceTest < Minitest::Test
       result = JSON.parse(out)
       assert result.fetch("supported")
       assert_equal 1, result.fetch("summary").fetch("files")
-      assert_equal 2, result.fetch("summary").fetch("warnings")
+      assert_equal 0, result.fetch("summary").fetch("warnings")
 
       _out, err = capture_io do
-        assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--json", "--include=warn.ll", "--fail-on-warning", dir]).run
+        assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--json", "--include=warn.ll", "--fail-on-warning", dir]).run
       end
       assert_empty err
 
@@ -244,10 +253,52 @@ class LLVMConformanceTest < Minitest::Test
       assert_equal "none", JSON.parse(out).fetch("policy").fetch("fail_on")
 
       _out, err = capture_io do
-        assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--json", "--include=warn.ll", "--fail-on=none", "--max-warnings=1", dir]).run
+        assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--json", "--include=warn.ll", "--fail-on=none", "--max-warnings=1", dir]).run
       end
       assert_empty err
     end
+  end
+
+  def test_recursive_internal_call_diagnostic_includes_call_chain
+    Dir.mktmpdir("pfc-recursive-chain") do |dir|
+      path = File.join(dir, "recursive.ll")
+      File.write(path, <<~LLVM)
+        define i32 @a() {
+        entry:
+          %x = call i32 @b()
+          ret i32 %x
+        }
+
+        define i32 @b() {
+        entry:
+          %x = call i32 @a()
+          ret i32 %x
+        }
+
+        define i32 @main() {
+        entry:
+          %x = call i32 @a()
+          ret i32 %x
+        }
+      LLVM
+      out, err = capture_io do
+        assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check", "--json", path]).run
+      end
+      assert_empty err
+      message = JSON.parse(out).fetch("errors").first.fetch("message")
+      assert_includes message, "@a -> @b -> @a"
+    end
+  end
+
+  def test_lowering_plan_examples_cover_unsupported_families
+    path = unsupported_path("atomic.ll")
+    out, err = capture_io do
+      assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check", "--emit-lowering-plan", path]).run
+    end
+    assert_empty err
+    operation = JSON.parse(out).fetch("operations").first
+    assert_equal "remove_or_rewrite_atomic_operation", operation.fetch("strategy")
+    assert_includes operation.fetch("after_ir_example"), "load i32"
   end
 
   def test_static_preflight_fuzz_reports_explicit_diagnostics

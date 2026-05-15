@@ -33,9 +33,13 @@ module PFC
         "memcpy" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
         "memmove" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
         "memset" => { return_type: "ptr", parameter_types: %w[ptr i32 i64], varargs: false },
+        "memchr" => { return_type: "ptr", parameter_types: %w[ptr i32 i64], varargs: false },
+        "memcmp" => { return_type: "i32", parameter_types: %w[ptr ptr i64], varargs: false },
         "printf" => { return_type: "i32", parameter_types: ["ptr"], varargs: true },
         "putchar" => { return_type: "i32", parameter_types: ["i32"], varargs: false },
         "puts" => { return_type: "i32", parameter_types: ["ptr"], varargs: false },
+        "strcmp" => { return_type: "i32", parameter_types: %w[ptr ptr], varargs: false },
+        "strncmp" => { return_type: "i32", parameter_types: %w[ptr ptr i64], varargs: false },
         "strlen" => { return_type: "i64", parameter_types: ["ptr"], varargs: false }
       }.freeze
 
@@ -262,6 +266,12 @@ module PFC
               function.fetch(:allocations)[match[1]] = allocate_slots(byte_width(match[2].to_i))
             end
           end
+          function.fetch(:param_byval_types, []).each_with_index do |byval_type, index|
+            next unless byval_type
+
+            param = function.fetch(:params).fetch(index)
+            function.fetch(:byval_slots)[param] ||= allocate_slots(type_size(byval_type))
+          end
         end
       end
 
@@ -277,6 +287,7 @@ module PFC
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*select\s+i1\s+.+?,\s+ptr\b/)
           pointer_result = line.respond_to?(:value_type) && line.value_type == "ptr" && line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|extractvalue|freeze)\b/)
           pointer_result ||= line.respond_to?(:return_type) && line.return_type == "ptr"
+          pointer_result ||= line.respond_to?(:value_type) && line.value_type == "ptr" && line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*extractelement\b/)
           if (match = line.match(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|insertvalue|insertelement)\s+(.+?)(?:,|\s+)/)) && aggregate_type?(match[1])
             aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(match[1]), type: match[1] }
             next
@@ -357,7 +368,7 @@ module PFC
           element = Regexp.last_match(2)
           return type_size(element) * count
         end
-        if type.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
+        if type.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64)|ptr)>\z/)
           count = Regexp.last_match(1).to_i
           element = Regexp.last_match(2)
           return type_size(element) * count
@@ -469,7 +480,7 @@ module PFC
           element_size = type_size(element)
           return Array.new(count) { |index| index * element_size }
         end
-        if stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
+        if stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64)|ptr)>\z/)
           count = Regexp.last_match(1).to_i
           element_size = type_size(Regexp.last_match(2))
           return Array.new(count) { |index| index * element_size }
@@ -527,7 +538,7 @@ module PFC
 
       def aggregate_type?(type)
         stripped = type.to_s.strip
-        struct_type?(stripped) || stripped.match?(/\A\[\d+\s+x\s+.+\]\z/) || stripped.match?(/\A<\d+\s+x\s+i(?:1|8|16|32|64)>\z/)
+        struct_type?(stripped) || stripped.match?(/\A\[\d+\s+x\s+.+\]\z/) || stripped.match?(/\A<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>\z/)
       end
 
       def aggregate_fields(type)
@@ -535,7 +546,7 @@ module PFC
         if stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
           return Array.new(Regexp.last_match(1).to_i, Regexp.last_match(2))
         end
-        if stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
+        if stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64)|ptr)>\z/)
           return Array.new(Regexp.last_match(1).to_i, Regexp.last_match(2))
         end
 
@@ -584,6 +595,16 @@ module PFC
         stripped_value = value.to_s.strip
         stripped_type = value_type.to_s.strip
         return Array.new(type_size(stripped_type), 0) if %w[zeroinitializer undef poison].include?(stripped_value)
+        if stripped_type.match(/\A<(\d+)\s+x\s+ptr>\z/)
+          count = Regexp.last_match(1).to_i
+          return Array.new(count * pointer_size, 0) if stripped_value == "zeroinitializer"
+          return nil unless stripped_value.start_with?("<") && stripped_value.end_with?(">")
+
+          elements = Frontend::LLVMSubset::Parser::Instruction.split_arguments(stripped_value[1...-1])
+          return nil unless elements.length == count && elements.all? { |element| element.match?(/\Aptr\s+(?:null|zeroinitializer|undef|poison)\z/) }
+
+          return Array.new(count * pointer_size, 0)
+        end
         return nil unless stripped_type.match(/\A<(\d+)\s+x\s+i(1|8|16|32|64)>\z/)
         return nil unless stripped_value.start_with?("<") && stripped_value.end_with?(">")
 
@@ -648,6 +669,24 @@ module PFC
                   value |= ((unsigned long long)memory[index + offset]) << (offset * 8);
               }
               return value;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_llvm_bytes_equal(const unsigned char *left, int left_index, const unsigned char *right, int right_index, int width) {
+              int offset;
+              for (offset = 0; offset < width; offset++) {
+                  if (left[left_index + offset] != right[right_index + offset]) return 0;
+              }
+              return 1;
+          }
+
+          static inline int PF_MAYBE_UNUSED pf_llvm_bytes_compare(const unsigned char *left, int left_index, const unsigned char *right, int right_index, int width) {
+              int offset;
+              for (offset = 0; offset < width; offset++) {
+                  unsigned char left_byte = left[left_index + offset];
+                  unsigned char right_byte = right[right_index + offset];
+                  if (left_byte != right_byte) return (int)left_byte - (int)right_byte;
+              }
+              return 0;
           }
         C
       end
@@ -1070,11 +1109,25 @@ module PFC
       def emit_extractelement(line, context: nil)
         source = aggregate_value_bytes(line.vector, line.vector_type, context:)
         index = context ? inline_value(line.index, context) : llvm_value(line.index)
-        width = byte_width(line.bits)
+        width = vector_element_width(line.vector_type)
         destination = context ? inline_register(context, line.destination) : register(line.destination)
         return ["    #{destination} = 0u;"] if source.nil?
 
         prefix = next_aggregate_copy_prefix
+        if line.respond_to?(:value_type) && line.value_type == "ptr"
+          pointer_map = context ? context.fetch(:pointers) : pointers
+          pointer_map[line.destination] = EncodedPointer.new(value: destination)
+          return [
+            "    {",
+            "        long long #{prefix}_index = (long long)(#{index});",
+            "        if (#{prefix}_index < 0 || #{prefix}_index >= #{vector_element_count(line.vector_type)}) {",
+            "            fprintf(stderr, \"pfc runtime error: LLVM vector index out of range\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        #{destination} = pf_llvm_load(#{source}, #{prefix}_index * #{width}, #{width});",
+            "    }"
+          ]
+        end
         [
           "    {",
           "        long long #{prefix}_index = (long long)(#{index});",
@@ -1091,9 +1144,10 @@ module PFC
         aggregate = aggregate_register(line.destination, context:)
         source = aggregate_value_bytes(line.vector, line.vector_type, context:)
         index = context ? inline_value(line.index, context) : llvm_value(line.index)
-        value = context ? inline_value(line.value, context) : llvm_value(line.value)
-        width = byte_width(line.bits)
+        value = line.value_type == "ptr" ? encoded_pointer_value(line.value, context:) : (context ? inline_value(line.value, context) : llvm_value(line.value))
+        width = vector_element_width(line.vector_type)
         copy_prefix = next_aggregate_copy_prefix
+        stored_value = line.value_type == "ptr" ? value : "(unsigned long long)(#{value} & #{integer_mask_literal(line.bits)})"
         [
           "    {",
           "        int #{copy_prefix}_i = 0;",
@@ -1105,7 +1159,7 @@ module PFC
           "        for (#{copy_prefix}_i = 0; #{copy_prefix}_i < #{aggregate.fetch(:size)}; #{copy_prefix}_i++) {",
           "            #{aggregate.fetch(:name)}[#{copy_prefix}_i] = #{source ? "#{source}[#{copy_prefix}_i]" : '0u'};",
           "        }",
-          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{copy_prefix}_index * #{width}, (unsigned long long)(#{value} & #{integer_mask_literal(line.bits)}), #{width});",
+          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{copy_prefix}_index * #{width}, #{stored_value}, #{width});",
           "    }"
         ]
       end
@@ -1317,6 +1371,7 @@ module PFC
         return emit_memory_intrinsic_call(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
         return emit_numeric_intrinsic_call(call) if llvm_numeric_intrinsic?(call.fetch(:function_name))
         return emit_libc_memory_call(call) if libc_memory_function?(call.fetch(:function_name))
+        return emit_libc_string_memory_call(call) if libc_string_memory_function?(call.fetch(:function_name))
         return emit_strlen_call(call) if call.fetch(:function_name) == "strlen"
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
@@ -1375,7 +1430,8 @@ module PFC
         @inline_call_index += 1
         call_stack = caller_context ? caller_context.fetch(:call_stack) : []
         if call_stack.include?(function.fetch(:name))
-          raise Frontend::LLVMSubset::ParseError, "recursive internal call is unsupported: @#{function.fetch(:name)}"
+          chain = (call_stack + [function.fetch(:name)]).map { |name| "@#{name}" }.join(" -> ")
+          raise Frontend::LLVMSubset::ParseError, "recursive internal call is unsupported: #{chain}"
         end
 
         return_destination = if destination
@@ -1404,6 +1460,12 @@ module PFC
         function.fetch(:params).zip(arguments).each_with_index do |(param, argument), index|
           param_type = function.fetch(:param_types).fetch(index)
           if param_type == "ptr"
+            byval_type = function.fetch(:param_byval_types, []).fetch(index)
+            if byval_type
+              lines.concat(copy_byval_argument(function, param, argument, byval_type, caller_context:))
+              context.fetch(:pointers)[param] = function.fetch(:byval_slots).fetch(param)
+              next
+            end
             context.fetch(:pointers)[param] = pointer_binding(argument, context: caller_context)
             next
           end
@@ -1441,6 +1503,27 @@ module PFC
         lines << "#{context.fetch(:return_label)}:"
         lines << "    (void)0;"
         lines
+      end
+
+      def copy_byval_argument(function, param, argument, byval_type, caller_context:)
+        slot = function.fetch(:byval_slots).fetch(param)
+        source = memory_address(argument, context: caller_context)
+        size = type_size(byval_type)
+        prefix = next_memory_intrinsic_prefix
+        [
+          "    {",
+          "        long long #{prefix}_src = (long long)(#{source.offset});",
+          "        int #{prefix}_i = 0;",
+          *dynamic_valid_address_lines(source),
+          "        if (#{prefix}_src < 0 || #{prefix}_src + #{size} > #{source.limit}) {",
+          "            fprintf(stderr, \"pfc runtime error: byval argument copy out of range\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        for (#{prefix}_i = 0; #{prefix}_i < #{size}; #{prefix}_i++) {",
+          "            llvm_memory[#{slot} + #{prefix}_i] = #{source.memory}[#{prefix}_src + #{prefix}_i];",
+          "        }",
+          "    }"
+        ]
       end
 
       def inline_context(prefix, return_destination, function, call_stack)
@@ -1939,6 +2022,7 @@ module PFC
         return emit_memory_intrinsic_call(call, context:) if llvm_memory_intrinsic?(call.fetch(:function_name))
         return emit_numeric_intrinsic_call(call, context:) if llvm_numeric_intrinsic?(call.fetch(:function_name))
         return emit_libc_memory_call(call, context:) if libc_memory_function?(call.fetch(:function_name))
+        return emit_libc_string_memory_call(call, context:) if libc_string_memory_function?(call.fetch(:function_name))
         return emit_strlen_call(call, context:) if call.fetch(:function_name) == "strlen"
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
@@ -3027,6 +3111,10 @@ module PFC
         %w[memcpy memmove memset].include?(name)
       end
 
+      def libc_string_memory_function?(name)
+        %w[memchr memcmp strcmp strncmp].include?(name)
+      end
+
       def validate_noop_intrinsic_signature!(call)
         name = call.fetch(:function_name)
         unless call.fetch(:return_type) == "void"
@@ -3200,6 +3288,107 @@ module PFC
         end
         lines << "    }"
         lines
+      end
+
+      def emit_libc_string_memory_call(call, context: nil)
+        case call.fetch(:function_name)
+        when "memcmp" then emit_memcmp_call(call, context:)
+        when "memchr" then emit_memchr_call(call, context:)
+        when "strcmp" then emit_strcmp_call(call, nil, context:)
+        else emit_strcmp_call(call, parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(2), context:)
+        end
+      end
+
+      def emit_memcmp_call(call, context:)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        left = memory_address(arguments.fetch(0).fetch(:value), context:)
+        right = memory_address(arguments.fetch(1).fetch(:value), context:)
+        length = scalar_value(arguments.fetch(2).fetch(:value), context:)
+        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
+        prefix = next_memory_intrinsic_prefix
+        [
+          "    {",
+          "        long long #{prefix}_left = (long long)(#{left.offset});",
+          "        long long #{prefix}_right = (long long)(#{right.offset});",
+          "        int #{prefix}_len = (int)(#{length});",
+          *dynamic_valid_address_lines(left),
+          *dynamic_valid_address_lines(right),
+          "        if (#{prefix}_left < 0 || #{prefix}_right < 0 || #{prefix}_len < 0 || #{prefix}_left + #{prefix}_len > #{left.limit} || #{prefix}_right + #{prefix}_len > #{right.limit}) {",
+          "            fprintf(stderr, \"pfc runtime error: memcmp out of range\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        #{target} = (unsigned long long)(int)pf_llvm_bytes_compare(#{left.memory}, (int)#{prefix}_left, #{right.memory}, (int)#{prefix}_right, #{prefix}_len);",
+          "    }"
+        ]
+      end
+
+      def emit_memchr_call(call, context:)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        source = memory_address(arguments.fetch(0).fetch(:value), context:)
+        byte = scalar_value(arguments.fetch(1).fetch(:value), context:)
+        length = scalar_value(arguments.fetch(2).fetch(:value), context:)
+        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
+        pointer_map = context ? context.fetch(:pointers) : pointers
+        pointer_map[call.fetch(:destination)] = EncodedPointer.new(value: target) if call.fetch(:destination)
+        prefix = next_memory_intrinsic_prefix
+        [
+          "    {",
+          "        unsigned long long #{prefix}_base_encoded = #{encoded_pointer_value(arguments.fetch(0).fetch(:value), context:)};",
+          "        long long #{prefix}_base = (long long)(#{source.offset});",
+          "        long long #{prefix}_len = (long long)(#{length});",
+          "        long long #{prefix}_i = 0;",
+          "        unsigned char #{prefix}_needle = (unsigned char)(#{byte});",
+          *dynamic_valid_address_lines(source),
+          "        #{target} = 0ull;",
+          "        if (#{prefix}_base < 0 || #{prefix}_len < 0 || #{prefix}_base + #{prefix}_len > #{source.limit}) {",
+          "            fprintf(stderr, \"pfc runtime error: memchr out of range\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        for (#{prefix}_i = 0; #{prefix}_i < #{prefix}_len; #{prefix}_i++) {",
+          "            if (#{source.memory}[#{prefix}_base + #{prefix}_i] == #{prefix}_needle) {",
+          "                #{target} = (((#{prefix}_base_encoded) & (PF_LLVM_GLOBAL_POINTER_TAG | PF_LLVM_READONLY_POINTER_TAG | PF_LLVM_STRING_POINTER_TAG)) | ((unsigned long long)(#{prefix}_base + #{prefix}_i) & PF_LLVM_POINTER_OFFSET_MASK));",
+          "                break;",
+          "            }",
+          "        }",
+          "    }"
+        ]
+      end
+
+      def emit_strcmp_call(call, limit_argument, context:)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        left = memory_address(arguments.fetch(0).fetch(:value), context:)
+        right = memory_address(arguments.fetch(1).fetch(:value), context:)
+        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
+        prefix = next_memory_intrinsic_prefix
+        limit = limit_argument ? scalar_value(limit_argument.fetch(:value), context:) : "-1"
+        [
+          "    {",
+          "        long long #{prefix}_left = (long long)(#{left.offset});",
+          "        long long #{prefix}_right = (long long)(#{right.offset});",
+          "        long long #{prefix}_limit = (long long)(#{limit});",
+          "        long long #{prefix}_i = 0;",
+          *dynamic_valid_address_lines(left),
+          *dynamic_valid_address_lines(right),
+          "        #{target} = 0ull;",
+          "        if (#{prefix}_left < 0 || #{prefix}_right < 0 || #{prefix}_left >= #{left.limit} || #{prefix}_right >= #{right.limit}) {",
+          "            fprintf(stderr, \"pfc runtime error: strcmp pointer out of range\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        while ((#{prefix}_limit < 0 || #{prefix}_i < #{prefix}_limit) && #{prefix}_left + #{prefix}_i < #{left.limit} && #{prefix}_right + #{prefix}_i < #{right.limit}) {",
+          "            unsigned char #{prefix}_lb = #{left.memory}[#{prefix}_left + #{prefix}_i];",
+          "            unsigned char #{prefix}_rb = #{right.memory}[#{prefix}_right + #{prefix}_i];",
+          "            if (#{prefix}_lb != #{prefix}_rb || #{prefix}_lb == 0u || #{prefix}_rb == 0u) {",
+          "                #{target} = (unsigned long long)(int)((int)#{prefix}_lb - (int)#{prefix}_rb);",
+          "                break;",
+          "            }",
+          "            #{prefix}_i++;",
+          "        }",
+          "        if ((#{prefix}_limit < 0 || #{prefix}_i < #{prefix}_limit) && (#{prefix}_left + #{prefix}_i >= #{left.limit} || #{prefix}_right + #{prefix}_i >= #{right.limit})) {",
+          "            fprintf(stderr, \"pfc runtime error: strcmp missing null terminator\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "    }"
+        ]
       end
 
       def emit_memset_intrinsic(arguments, context:)

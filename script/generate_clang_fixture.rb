@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "fileutils"
+require "json"
 require "optparse"
 require "tmpdir"
 
@@ -60,6 +61,13 @@ module ClangFixtureGenerator
     "normalized fixture differs at line #{index + 1}:\n- #{expected_line}+ #{actual_line}"
   end
 
+  def write_diagnostic_json(path, payload)
+    return unless path
+
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, JSON.pretty_generate(payload))
+  end
+
   def generate_fixture(options, input, output)
     command = [
       options.fetch(:clang),
@@ -82,6 +90,7 @@ module ClangFixtureGenerator
     options = {
       check: false,
       clang: ENV.fetch("CLANG", "clang"),
+      diagnostic_json: nil,
       opt: "0"
     }
 
@@ -89,6 +98,7 @@ module ClangFixtureGenerator
       opts.banner = "Usage: ruby script/generate_clang_fixture.rb [options] INPUT.c OUTPUT.ll"
       opts.on("--check", "verify OUTPUT.ll is up to date without overwriting it") { options[:check] = true }
       opts.on("--clang=PATH", "clang executable path") { |value| options[:clang] = value }
+      opts.on("--diagnostic-json=PATH", "write stale-check diagnostics to PATH when --check fails") { |value| options[:diagnostic_json] = value }
       opts.on("-OLEVEL", "--opt=LEVEL", "Optimization level, default 0") { |value| options[:opt] = value }
     end
 
@@ -108,9 +118,22 @@ module ClangFixtureGenerator
         fixture_content = normalize_fixture_for_check(File.binread(output))
         next if generated_content == fixture_content
 
+        summary = fixture_difference_summary(fixture_content, generated_content)
         warn "fixture is stale: #{output}"
-        warn fixture_difference_summary(fixture_content, generated_content)
+        warn summary
         warn "regenerate with: #{options.fetch(:clang)} -S -emit-llvm -O#{options.fetch(:opt)} -g #{input} -o #{output}"
+        write_diagnostic_json(
+          options[:diagnostic_json],
+          {
+            schema_version: 1,
+            status: "stale",
+            source: input,
+            fixture: output,
+            opt: options.fetch(:opt),
+            clang: options.fetch(:clang),
+            summary:
+          }
+        )
         exit 1
       end
     else

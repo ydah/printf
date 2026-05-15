@@ -11,7 +11,7 @@ module PFC
         GLOBAL_NAME = /@[-A-Za-z$._0-9]+/
         POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
         INTEGER_TYPE = /i(?:1|8|16|32|64)/
-        VECTOR_TYPE = /<\d+\s+x\s+i(?:1|8|16|32|64)>/
+        VECTOR_TYPE = /<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>/
         AGGREGATE_TYPE = /(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\])/
         RETURN_TYPE = /(?:#{INTEGER_TYPE}|i128|#{VECTOR_TYPE}|#{AGGREGATE_TYPE}|ptr|void)/
         ATTRIBUTE_TOKEN = /[-\w]+(?:\([^)]*\))?/
@@ -287,7 +287,7 @@ module PFC
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+(<\d+\s+x\s+i(1|8|16|32|64)>)\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+(<\d+\s+x\s+(i(?:1|8|16|32|64)|ptr)>)\s+(.+)\z/))
               operands = Instruction.split_arguments(match[5])
               return unless operands.length == 2
 
@@ -341,17 +341,17 @@ module PFC
             if (match = text.match(/\A(#{NAME})\s*=\s*select\s+(<\d+\s+x\s+i1>)\s+(.+)\z/))
               operands = Instruction.split_arguments(match[3])
               return unless operands.length == 3
-              true_match = operands.fetch(1).match(/\A(<\d+\s+x\s+i(1|8|16|32|64)>)\s+(.+)\z/)
+              true_match = operands.fetch(1).match(/\A(<\d+\s+x\s+(i(1|8|16|32|64)|ptr)>)\s+(.+)\z/)
               false_match = operands.fetch(2).match(/\A#{Regexp.escape(true_match[1])}\s+(.+)\z/) if true_match
               return unless true_match && false_match
 
               @destination = match[1]
               @condition_type = match[2]
               @condition = operands.fetch(0)
-              @bits = true_match[2].to_i
+              @bits = true_match[3]&.to_i
               @value_type = true_match[1]
               @vector_type = true_match[1]
-              @true_value = true_match[3]
+              @true_value = true_match[4]
               @false_value = false_match[1]
               return
             end
@@ -481,11 +481,11 @@ module PFC
         end
 
         class ExtractElementInstruction < Instruction
-          attr_reader :bits, :destination, :index, :vector, :vector_type
+          attr_reader :bits, :destination, :index, :value_type, :vector, :vector_type
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*extractelement\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*extractelement\s+(#{VECTOR_TYPE})\s+(.+)\z/)
             return unless match
             operands = Instruction.split_arguments(match[3])
             return unless operands.length == 2
@@ -496,28 +496,30 @@ module PFC
             @vector_type = match[2]
             @vector = operands.fetch(0)
             @index = index_match[1]
-            @bits = vector_type[/i(1|8|16|32|64)>/, 1].to_i
+            @value_type = vector_type[/<\d+\s+x\s+(.+)>/, 1]
+            @bits = @value_type.delete_prefix("i").to_i if @value_type.start_with?("i")
           end
         end
 
         class InsertElementInstruction < Instruction
-          attr_reader :bits, :destination, :index, :value, :vector, :vector_type
+          attr_reader :bits, :destination, :index, :value, :value_type, :vector, :vector_type
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*insertelement\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*insertelement\s+(#{VECTOR_TYPE})\s+(.+)\z/)
             return unless match
             operands = Instruction.split_arguments(match[3])
             return unless operands.length == 3
-            value_match = operands.fetch(1).match(/\Ai(1|8|16|32|64)\s+(.+)\z/)
+            value_match = operands.fetch(1).match(/\A(i(1|8|16|32|64)|ptr)\s+(.+)\z/)
             index_match = operands.fetch(2).match(/\Ai(?:32|64)\s+(.+)\z/)
             return unless value_match && index_match
 
             @destination = match[1]
             @vector_type = match[2]
             @vector = operands.fetch(0)
-            @bits = value_match[1].to_i
-            @value = value_match[2]
+            @value_type = value_match[1]
+            @bits = value_match[2]&.to_i
+            @value = value_match[3]
             @index = index_match[1]
           end
         end
@@ -546,7 +548,7 @@ module PFC
             return unless match
             operands = Instruction.split_arguments(match[4])
             return if operands.length < 2
-            insert_match = operands.fetch(0).match(/\A(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(.+)\z/) ||
+            insert_match = operands.fetch(0).match(/\A(<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>)\s+(.+)\z/) ||
                            operands.fetch(0).match(/\A(\[\d+\s+x\s+.+\])\s+(.+)\z/) ||
                            operands.fetch(0).match(/\A(%[-A-Za-z$._0-9]+|ptr|i(?:1|8|16|32|64|128))\s+(.+)\z/)
             return unless insert_match
@@ -582,7 +584,7 @@ module PFC
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*phi\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*phi\s+(<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>)\s+(.+)\z/))
               @destination = match[1]
               @bits = match[2][/i(1|8|16|32|64)>/, 1].to_i
               @value_type = match[2]
@@ -638,7 +640,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Aret\s+(void|ptr|i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\])(?:\s+(.+))?\z/)
+            match = text.match(/\Aret\s+(void|ptr|i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\])(?:\s+(.+))?\z/)
             return unless match
 
             @return_type = match[1]
@@ -715,10 +717,13 @@ module PFC
                 allocations: {},
                 blocks:,
                 block_order: order,
+                byval_slots: {},
                 name:,
+                param_byval_types: parameter_declarations.map { |parameter| parameter.fetch(:byval_type) },
                 param_types: parameter_declarations.map { |parameter| parameter.fetch(:type) },
                 params: parameter_declarations.map { |parameter| parameter.fetch(:name) },
-                return_type:
+                return_type:,
+                sret_type: parameter_declarations.first&.fetch(:sret_type)
               }
             end
             index += 1
@@ -846,7 +851,7 @@ module PFC
         end
 
         def aggregate_type?(type)
-          type.strip.match?(/\A(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|<\d+\s+x\s+i(?:1|8|16|32|64)>|(?:<)?\{.*\}(?:>)?)\z/)
+          type.strip.match?(/\A(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|(?:<)?\{.*\}(?:>)?)\z/)
         end
 
         def aggregate_fields(type)
@@ -1133,7 +1138,7 @@ module PFC
               next({ type: "...", name: nil })
             end
 
-            type_pattern = allow_pointer ? /i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+(?:i(?:1|8|16|32|64|128)|ptr|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+)\]|ptr(?:\s+addrspace\(\d+\))?|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
+            type_pattern = allow_pointer ? /i(?:1|8|16|32|64|128)|#{VECTOR_TYPE}|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|ptr(?:\s+addrspace\(\d+\))?|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
             match = stripped.match(/\A(#{type_pattern})(?:\s+(.+))?\z/)
             raise ParseError, "unsupported function parameter: #{parameter}" unless match
             name = match[2]&.scan(/#{NAME}/)&.last
@@ -1141,8 +1146,12 @@ module PFC
               raise ParseError, "unsupported function parameter: #{parameter}"
             end
 
-            { type: pointer_type?(match[1]) ? "ptr" : match[1], name: }
+            { type: pointer_type?(match[1]) ? "ptr" : match[1], name:, sret_type: parameter_attribute_type(match[2], "sret"), byval_type: parameter_attribute_type(match[2], "byval") }
           end
+        end
+
+        def parameter_attribute_type(raw, attribute)
+          raw.to_s.match(/\b#{attribute}\(([^)]*)\)/)&.[](1)
         end
 
         def pointer_type?(type)

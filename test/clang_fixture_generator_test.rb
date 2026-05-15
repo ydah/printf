@@ -64,6 +64,14 @@ class ClangFixtureGeneratorTest < Minitest::Test
     refute_equal expected, actual
   end
 
+  def test_fixture_difference_summary_reports_first_normalized_difference
+    summary = ClangFixtureGenerator.fixture_difference_summary("ret i32 0\n", "ret i32 1\n")
+
+    assert_includes summary, "line 1"
+    assert_includes summary, "ret i32 0"
+    assert_includes summary, "ret i32 1"
+  end
+
   private
 
   def normalize_fixture(content)

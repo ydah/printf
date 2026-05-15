@@ -343,7 +343,7 @@ class LLVMSubsetTest < Minitest::Test
     error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
       PFC::Backend::LLVMCEmitter.new(source).emit
     end
-    assert_equal "line 3: recursive internal call is unsupported: @loop", error.message
+    assert_equal "line 3: recursive internal call is unsupported: @loop -> @loop", error.message
   end
 
   def test_supports_i1_memory_and_comparison

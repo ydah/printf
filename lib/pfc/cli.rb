@@ -460,6 +460,9 @@ module PFC
       return "rewrite_float_to_integer" if text.include?("floating-point")
       return "narrow_or_restrict_i128" if text.include?("i128")
       return "replace_blockaddress_control_flow" if text.include?("blockaddress")
+      return "remove_or_rewrite_atomic_operation" if text.include?("atomic")
+      return "lower_exception_handling_to_explicit_status_flow" if text.include?("exception handling")
+      return "replace_varargs_with_fixed_signature" if text.include?("varargs")
       return "materialize_external_global" if text.include?("external global")
       return "lower_to_default_address_space" if text.include?("address space")
 
@@ -483,6 +486,11 @@ module PFC
       return "%lane = extractelement <N x iM> %vector, i32 0\n%sum = add iM %lane, %other_lane\n%next = insertelement <N x iM> %acc, iM %sum, i32 0" if text.match?(/\b(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
       return "%fixed = call i32 @fixed_point_lowered(...)" if text.include?("floating-point")
       return "%narrow = trunc i128 %wide to i64" if text.include?("i128")
+      return "%old = load i32, ptr %slot\n%new = add i32 %old, 1\nstore i32 %new, ptr %slot" if text.include?("atomic")
+      return "%status = call i32 @may_fail(...)\n%ok = icmp eq i32 %status, 0\nbr i1 %ok, label %cont, label %error" if text.include?("exception handling")
+      return "define i32 @fixed_args(i32 %a, i32 %b) { ... }" if text.include?("varargs")
+      return "@external = global i32 0" if text.include?("external global")
+      return "%default = addrspacecast ptr addrspace(0) %ptr to ptr" if text.include?("address space")
       return "br label %target" if text.include?("blockaddress")
 
       nil
@@ -558,7 +566,8 @@ module PFC
 
     def llvm_diagnostic_severity(message, line_text)
       text = [message, line_text].compact.join("\n")
-      return "warning" if text.include?("backend-equivalent") || text.match?(/\bvolatile\b/)
+      return "info" if text.include?("backend-equivalent")
+      return "warning" if text.match?(/\bvolatile\b/)
 
       "error"
     end
@@ -614,29 +623,84 @@ module PFC
     end
 
     def llvm_validate_result_schema!(result)
-      if result.key?(:files)
-        llvm_validate_common_result_keys!(result, %i[schema_version path policy supported summary files])
-        result.fetch(:files).each { |file| llvm_validate_result_schema!(file) }
-        return true
-      end
-
-      llvm_validate_common_result_keys!(result, %i[schema_version path policy supported summary diagnostics errors])
-      result.fetch(:diagnostics).each { |diagnostic| llvm_validate_diagnostic_schema!(diagnostic) }
-      result.fetch(:errors).each { |diagnostic| llvm_validate_diagnostic_schema!(diagnostic) }
+      schema = JSON.parse(File.read(File.expand_path("../../docs/llvm-capabilities.schema.json", __dir__)))
+      llvm_validate_json_schema!(result, schema, schema, "$")
       true
     end
 
-    def llvm_validate_common_result_keys!(result, required_keys)
-      required_keys.each do |key|
-        raise ArgumentError, "llvm-capabilities schema validation failed: missing #{key}" unless result.key?(key)
+    def llvm_validate_json_schema!(value, schema, root_schema, path)
+      if schema.key?("$ref")
+        return llvm_validate_json_schema!(value, llvm_schema_ref(root_schema, schema.fetch("$ref")), root_schema, path)
       end
-      raise ArgumentError, "llvm-capabilities schema validation failed: schema_version must be 1" unless result.fetch(:schema_version) == 1
+      if schema.key?("oneOf")
+        matches = schema.fetch("oneOf").count do |candidate|
+          begin
+            llvm_validate_json_schema!(value, candidate, root_schema, path)
+            true
+          rescue ArgumentError
+            false
+          end
+        end
+        raise ArgumentError, "llvm-capabilities schema validation failed: #{path} matched #{matches} schema variants" unless matches == 1
+
+        return true
+      end
+      if schema.key?("const") && value != schema.fetch("const")
+        raise ArgumentError, "llvm-capabilities schema validation failed: #{path} expected #{schema.fetch('const').inspect}"
+      end
+      if schema.key?("enum") && !schema.fetch("enum").include?(value)
+        raise ArgumentError, "llvm-capabilities schema validation failed: #{path} has unsupported value #{value.inspect}"
+      end
+      llvm_validate_json_type!(value, schema.fetch("type", nil), path) if schema.key?("type")
+      case schema["type"]
+      when "object"
+        required = schema.fetch("required", [])
+        required.each do |key|
+          raise ArgumentError, "llvm-capabilities schema validation failed: missing #{path}.#{key}" unless llvm_json_object_key?(value, key)
+        end
+        properties = schema.fetch("properties", {})
+        if schema.fetch("additionalProperties", true) == false
+          extra = value.keys.map(&:to_s) - properties.keys
+          raise ArgumentError, "llvm-capabilities schema validation failed: unexpected keys at #{path}: #{extra.join(', ')}" unless extra.empty?
+        end
+        properties.each do |key, child_schema|
+          llvm_validate_json_schema!(llvm_json_object_fetch(value, key), child_schema, root_schema, "#{path}.#{key}") if llvm_json_object_key?(value, key)
+        end
+      when "array"
+        value.each_with_index do |entry, index|
+          llvm_validate_json_schema!(entry, schema.fetch("items"), root_schema, "#{path}[#{index}]")
+        end
+      end
     end
 
-    def llvm_validate_diagnostic_schema!(diagnostic)
-      %i[severity line opcode message hint explanation suggestion fix_suggestions docs_url minimal_repro_hint line_text].each do |key|
-        raise ArgumentError, "llvm-capabilities schema validation failed: missing diagnostic #{key}" unless diagnostic.key?(key)
+    def llvm_schema_ref(root_schema, ref)
+      ref.delete_prefix("#/").split("/").reduce(root_schema) { |node, key| node.fetch(key) }
+    end
+
+    def llvm_json_object_key?(value, key)
+      value.key?(key) || value.key?(key.to_sym)
+    end
+
+    def llvm_json_object_fetch(value, key)
+      return value.fetch(key) if value.key?(key)
+
+      value.fetch(key.to_sym)
+    end
+
+    def llvm_validate_json_type!(value, type, path)
+      types = Array(type)
+      valid = types.any? do |candidate|
+        case candidate
+        when "object" then value.is_a?(Hash)
+        when "array" then value.is_a?(Array)
+        when "string" then value.is_a?(String)
+        when "integer" then value.is_a?(Integer)
+        when "boolean" then value == true || value == false
+        when "null" then value.nil?
+        else true
+        end
       end
+      raise ArgumentError, "llvm-capabilities schema validation failed: #{path} expected #{types.join(' or ')}" unless valid
     end
 
     def llvm_static_supported_line?(line)
@@ -659,7 +723,7 @@ module PFC
 
     def llvm_static_unsupported_type_message(line)
       return "unsupported scalable vector type" if line.match?(/(?:^|\s)<vscale\s+x\s+/)
-      return "unsupported vector type" if line.match?(/(?:^|\s)<\d+\s+x\s+(?!i(?:1|8|16|32|64)\b)[^>]+>/)
+      return "unsupported vector type" if line.match?(/(?:^|\s)<\d+\s+x\s+(?!(?:i(?:1|8|16|32|64)|ptr)\b)[^>]+>/)
       return "unsupported floating-point type" if line.match?(/\b(?:half|float|double|fp128|x86_fp80|ppc_fp128)\b/)
       nil
     end
@@ -841,13 +905,16 @@ module PFC
             - pointer phi
             - freeze
             - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
+            - aggregate byte equality/compare helpers for libc and future aggregate lowering
             - extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values
             - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks
+            - fixed-length <N x ptr> zeroinitializer, insert/extractelement, and vector select
           control:
             - br, switch, scalar/pointer/i128/vector/aggregate phi, ret
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
             - void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments
+            - sret-style aggregate returns through the first pointer parameter and byval pointer arguments with callee-local copies
           tolerance:
             - common value attributes accepted as no-ops
             - trailing LLVM metadata attachments accepted as no-ops
@@ -862,11 +929,12 @@ module PFC
             - llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning
             - docs/llvm-capabilities.schema.json publishes the check JSON contract
             - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
+            - info-level diagnostics distinguish accepted backend-equivalent constructs from warnings and errors
             - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
             - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.expect.* accepted as identity intrinsic
           libc:
-            - putchar, getchar, puts, strlen, memcpy, memmove, memset
+            - putchar, getchar, puts, strlen, strcmp, strncmp, memcpy, memmove, memset, memcmp, memchr
             - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags
       TEXT
     end
@@ -903,14 +971,17 @@ module PFC
           "pointer phi",
           "freeze",
           "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
+          "aggregate byte equality/compare helpers for libc and future aggregate lowering",
           "extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values",
-          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks"
+          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks",
+          "fixed-length <N x ptr> zeroinitializer, insert/extractelement, and vector select"
         ],
         control: [
           "br, switch, scalar/pointer/i128/vector/aggregate phi, ret",
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
-          "void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments"
+          "void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments",
+          "sret-style aggregate returns through the first pointer parameter and byval pointer arguments with callee-local copies"
         ],
         tolerance: [
           "common value attributes accepted as no-ops",
@@ -926,12 +997,13 @@ module PFC
           "llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning",
           "docs/llvm-capabilities.schema.json publishes the check JSON contract",
           "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
+          "info-level diagnostics distinguish accepted backend-equivalent constructs from warnings and errors",
           "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [
-          "putchar, getchar, puts, strlen, memcpy, memmove, memset",
+          "putchar, getchar, puts, strlen, strcmp, strncmp, memcpy, memmove, memset, memcmp, memchr",
           "static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags"
         ]
       }
