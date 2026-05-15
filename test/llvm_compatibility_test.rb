@@ -517,7 +517,19 @@ class LLVMCompatibilityTest < Minitest::Test
       "samples/clang/optimized_smoke_O0.ll",
       "samples/clang/optimized_smoke_O1.ll",
       "samples/clang/optimized_smoke_O2.ll",
-      "samples/clang/optimized_smoke_Oz.ll"
+      "samples/clang/optimized_smoke_Oz.ll",
+      "samples/clang/branch_loop_O0.ll",
+      "samples/clang/branch_loop_O2.ll",
+      "samples/clang/struct_array_O0.ll",
+      "samples/clang/struct_array_O2.ll",
+      "samples/clang/pointer_alias_O0.ll",
+      "samples/clang/pointer_alias_O2.ll",
+      "samples/clang/memory_intrinsics_O0.ll",
+      "samples/clang/memory_intrinsics_O2.ll",
+      "samples/clang/printf_formats_O0.ll",
+      "samples/clang/printf_formats_O2.ll",
+      "samples/clang/internal_call_O0.ll",
+      "samples/clang/internal_call_O2.ll"
     ].each do |fixture|
       assert_equal native, compile_llvm_and_run(fixture)
     end

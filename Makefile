@@ -1,31 +1,49 @@
 RUBY ?= ruby
 CLANG ?= clang
-CLANG_FIXTURE_SOURCE := samples/clang/optimized_smoke.c
-CLANG_FIXTURES := \
-	samples/clang/optimized_smoke.ll \
-	samples/clang/optimized_smoke_O0.ll \
-	samples/clang/optimized_smoke_O1.ll \
-	samples/clang/optimized_smoke_O2.ll \
-	samples/clang/optimized_smoke_Oz.ll
+CLANG_FIXTURE_SPECS := \
+	2:samples/clang/optimized_smoke.c:samples/clang/optimized_smoke.ll \
+	0:samples/clang/optimized_smoke.c:samples/clang/optimized_smoke_O0.ll \
+	1:samples/clang/optimized_smoke.c:samples/clang/optimized_smoke_O1.ll \
+	2:samples/clang/optimized_smoke.c:samples/clang/optimized_smoke_O2.ll \
+	z:samples/clang/optimized_smoke.c:samples/clang/optimized_smoke_Oz.ll \
+	0:samples/clang/branch_loop.c:samples/clang/branch_loop_O0.ll \
+	2:samples/clang/branch_loop.c:samples/clang/branch_loop_O2.ll \
+	0:samples/clang/struct_array.c:samples/clang/struct_array_O0.ll \
+	2:samples/clang/struct_array.c:samples/clang/struct_array_O2.ll \
+	0:samples/clang/pointer_alias.c:samples/clang/pointer_alias_O0.ll \
+	2:samples/clang/pointer_alias.c:samples/clang/pointer_alias_O2.ll \
+	0:samples/clang/memory_intrinsics.c:samples/clang/memory_intrinsics_O0.ll \
+	2:samples/clang/memory_intrinsics.c:samples/clang/memory_intrinsics_O2.ll \
+	0:samples/clang/printf_formats.c:samples/clang/printf_formats_O0.ll \
+	2:samples/clang/printf_formats.c:samples/clang/printf_formats_O2.ll \
+	0:samples/clang/internal_call.c:samples/clang/internal_call_O0.ll \
+	2:samples/clang/internal_call.c:samples/clang/internal_call_O2.ll
 
 .PHONY: test fixtures fixtures-check
 test:
 	$(RUBY) -Ilib:test test/all_test.rb
 
-fixtures: $(CLANG_FIXTURES)
-
-samples/clang/optimized_smoke.ll: $(CLANG_FIXTURE_SOURCE) script/generate_clang_fixture.rb
-	CLANG="$(CLANG)" $(RUBY) script/generate_clang_fixture.rb --opt=2 $< $@
-
-samples/clang/optimized_smoke_O%.ll: $(CLANG_FIXTURE_SOURCE) script/generate_clang_fixture.rb
-	CLANG="$(CLANG)" $(RUBY) script/generate_clang_fixture.rb --opt=$* $< $@
+fixtures:
+	@if command -v "$(CLANG)" >/dev/null 2>&1; then \
+		for spec in $(CLANG_FIXTURE_SPECS); do \
+			opt="$${spec%%:*}"; \
+			rest="$${spec#*:}"; \
+			source="$${rest%%:*}"; \
+			fixture="$${rest#*:}"; \
+			CLANG="$(CLANG)" $(RUBY) script/generate_clang_fixture.rb --opt="$$opt" "$$source" "$$fixture" || exit $$?; \
+		done; \
+	else \
+		echo "skip fixtures: $(CLANG) not found"; \
+	fi
 
 fixtures-check:
 	@if command -v "$(CLANG)" >/dev/null 2>&1; then \
-		for spec in "2 samples/clang/optimized_smoke.ll" "0 samples/clang/optimized_smoke_O0.ll" "1 samples/clang/optimized_smoke_O1.ll" "2 samples/clang/optimized_smoke_O2.ll" "z samples/clang/optimized_smoke_Oz.ll"; do \
-			opt="$${spec%% *}"; \
-			fixture="$${spec#* }"; \
-			CLANG="$(CLANG)" $(RUBY) script/generate_clang_fixture.rb --check --opt="$$opt" "$(CLANG_FIXTURE_SOURCE)" "$$fixture" || exit $$?; \
+		for spec in $(CLANG_FIXTURE_SPECS); do \
+			opt="$${spec%%:*}"; \
+			rest="$${spec#*:}"; \
+			source="$${rest%%:*}"; \
+			fixture="$${rest#*:}"; \
+			CLANG="$(CLANG)" $(RUBY) script/generate_clang_fixture.rb --check --opt="$$opt" "$$source" "$$fixture" || exit $$?; \
 			$(RUBY) -Ilib bin/pfc llvm-capabilities --check "$$fixture" >/dev/null || exit $$?; \
 		done; \
 	else \
