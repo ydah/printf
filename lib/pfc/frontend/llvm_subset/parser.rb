@@ -97,10 +97,10 @@ module PFC
 
             raw.each_char do |char|
               case char
-              when "(", "["
+              when "(", "[", "<"
                 depth += 1
                 current << char
-              when ")", "]"
+              when ")", "]", ">"
                 depth -= 1
                 current << char
               when ","
@@ -255,6 +255,16 @@ module PFC
 
           def initialize(text)
             super
+            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne)\s+i128\s+(.+?),\s+(.+)\z/))
+              @destination = match[1]
+              @predicate = match[2]
+              @bits = 128
+              @operand_type = "i128"
+              @left = match[3]
+              @right = match[4]
+              return
+            end
+
             if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/))
               @destination = match[1]
               @predicate = match[2]
@@ -384,13 +394,17 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*extractelement\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(#{NAME}),\s+i(?:32|64)\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*extractelement\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(.+)\z/)
             return unless match
+            operands = Instruction.split_arguments(match[3])
+            return unless operands.length == 2
+            index_match = operands.fetch(1).match(/\Ai(?:32|64)\s+(.+)\z/)
+            return unless index_match
 
             @destination = match[1]
             @vector_type = match[2]
-            @vector = match[3]
-            @index = match[4]
+            @vector = operands.fetch(0)
+            @index = index_match[1]
             @bits = vector_type[/i(1|8|16|32|64)>/, 1].to_i
           end
         end
@@ -400,15 +414,20 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*insertelement\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(#{NAME}|zeroinitializer|undef|poison),\s+i(1|8|16|32|64)\s+(.+?),\s+i(?:32|64)\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*insertelement\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(.+)\z/)
             return unless match
+            operands = Instruction.split_arguments(match[3])
+            return unless operands.length == 3
+            value_match = operands.fetch(1).match(/\Ai(1|8|16|32|64)\s+(.+)\z/)
+            index_match = operands.fetch(2).match(/\Ai(?:32|64)\s+(.+)\z/)
+            return unless value_match && index_match
 
             @destination = match[1]
             @vector_type = match[2]
-            @vector = match[3]
-            @bits = match[4].to_i
-            @value = match[5]
-            @index = match[6]
+            @vector = operands.fetch(0)
+            @bits = value_match[1].to_i
+            @value = value_match[2]
+            @index = index_match[1]
           end
         end
 
@@ -637,7 +656,7 @@ module PFC
               globals[match[1]] = Array.new(pointer_size, 0)
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\]\s+(zeroinitializer|\[(.*)\])(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = global_integer_array_bytes(match, stripped)
-            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+(.+?)\s+(\{.*\}|\[.*\]|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+(.+?)\s+(\{.*\}|\[.*\]|<.*>|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = aggregate_initializer_bytes(match[2], match[3], stripped)
             end
           end
@@ -657,7 +676,7 @@ module PFC
               globals[match[1]] = match[2] == "global"
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+\[\d+\s+x\s+i(?:1|8|16|32|64)\]\s+(?:zeroinitializer|\[.*\])(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = match[2] == "global"
-            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+.+?\s+(?:\{.*\}|\[.*\]|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+.+?\s+(?:\{.*\}|\[.*\]|<.*>|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = match[2] == "global"
             end
           end
@@ -666,7 +685,10 @@ module PFC
         def aggregate_initializer_bytes(type, initializer, line)
           return Array.new(type_size(type), 0) if initializer == "zeroinitializer"
 
-          values = initializer.delete_prefix("{").delete_prefix("[").delete_suffix("}").delete_suffix("]")
+          values = initializer.strip
+          if (values.start_with?("{") && values.end_with?("}")) || (values.start_with?("[") && values.end_with?("]")) || (values.start_with?("<") && values.end_with?(">"))
+            values = values[1...-1]
+          end
           elements = Instruction.split_arguments(values)
           fields = aggregate_fields(type)
           if elements.length != fields.length
@@ -751,6 +773,7 @@ module PFC
           return integer_align(Regexp.last_match(1).to_i) if stripped.match(/\Ai(1|8|16|32|64|128)\z/)
           return pointer_align if pointer_type?(stripped)
           return type_align(Regexp.last_match(2)) if stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+          return type_align(Regexp.last_match(2)) if stripped.match(/\A<(\d+)\s+x\s+(.+)>\z/)
           return struct_layout(stripped).fetch(:align) if struct_type?(stripped)
 
           1
@@ -1030,6 +1053,7 @@ module PFC
 
             normalized = stripped
           end
+          normalized = normalized.sub(/\s+#\d+\z/, "")
           normalized
         end
 

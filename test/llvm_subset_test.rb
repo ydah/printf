@@ -735,6 +735,50 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes float_error.message, "unsupported floating-point type"
   end
 
+  def test_reports_golden_unsupported_diagnostics
+    cases = {
+      "blockaddress" => [
+        <<~LLVM,
+          define i32 @main() {
+          entry:
+            %x = ptrtoint ptr blockaddress(@main, %entry) to i64
+            ret i32 0
+          }
+        LLVM
+        "unsupported blockaddress constant expression"
+      ],
+      "external global" => [
+        <<~LLVM,
+          @external = external global i8
+
+          define i32 @main() {
+          entry:
+            %x = load i8, ptr @external, align 1
+            ret i32 0
+          }
+        LLVM
+        "unsupported external global reference"
+      ],
+      "addrspace" => [
+        <<~LLVM,
+          define i32 @main(ptr addrspace(1) %p) {
+          entry:
+            %casted = addrspacecast ptr addrspace(1) %p to ptr
+            ret i32 0
+          }
+        LLVM
+        "unsupported non-zero address space cast"
+      ]
+    }
+
+    cases.each_value do |source, expected|
+      error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
+        PFC::Backend::LLVMCEmitter.new(source).emit
+      end
+      assert_includes error.message, expected
+    end
+  end
+
   def test_rejects_non_zero_addrspace_and_external_globals
     addrspace_source = <<~LLVM
       define i32 @main(ptr addrspace(1) %p) {

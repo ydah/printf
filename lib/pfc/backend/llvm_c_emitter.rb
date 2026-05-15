@@ -349,6 +349,7 @@ module PFC
         return integer_align(Regexp.last_match(1).to_i) if type.match(/\Ai(1|8|16|32|64|128)\z/)
         return pointer_align if pointer_type_name?(type)
         return type_align(Regexp.last_match(2)) if type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+        return type_align(Regexp.last_match(2)) if type.match(/\A<(\d+)\s+x\s+(.+)>\z/)
         return struct_layout(type).fetch(:align) if struct_type?(type)
         1
       end
@@ -529,9 +530,45 @@ module PFC
 
       def aggregate_value_bytes(value, _value_type)
         return aggregate_register(value).fetch(:name) if aggregate_registers.key?(value)
+        constant = aggregate_constant_bytes(value, _value_type)
+        return byte_array_literal(constant) if constant
         return nil if %w[zeroinitializer undef poison].include?(value)
 
         raise Frontend::LLVMSubset::ParseError, "unsupported aggregate value: #{value}"
+      end
+
+      def aggregate_constant_bytes(value, value_type)
+        stripped_value = value.to_s.strip
+        stripped_type = value_type.to_s.strip
+        return Array.new(type_size(stripped_type), 0) if %w[zeroinitializer undef poison].include?(stripped_value)
+        return nil unless stripped_type.match(/\A<(\d+)\s+x\s+i(1|8|16|32|64)>\z/)
+        return nil unless stripped_value.start_with?("<") && stripped_value.end_with?(">")
+
+        count = Regexp.last_match(1).to_i
+        bits = Regexp.last_match(2).to_i
+        elements = Frontend::LLVMSubset::Parser::Instruction.split_arguments(stripped_value[1...-1])
+        if elements.length != count
+          raise Frontend::LLVMSubset::ParseError, "vector literal has #{elements.length} elements, expected #{count}"
+        end
+
+        elements.flat_map do |element|
+          match = element.match(/\Ai#{bits}\s+(-?\d+|zeroinitializer|undef|poison)\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported vector literal element: #{element}" unless match
+
+          integer_literal_bytes(match[1], bits)
+        end
+      end
+
+      def integer_literal_bytes(raw_value, bits)
+        value = %w[zeroinitializer undef poison].include?(raw_value) ? 0 : raw_value.to_i
+        unsigned_value = value & integer_mask(bits)
+        Array.new(byte_width(bits)) do |offset|
+          (unsigned_value >> (offset * 8)) & 255
+        end
+      end
+
+      def byte_array_literal(bytes)
+        "(unsigned char[]){#{bytes.map { |byte| "#{byte}u" }.join(', ')}}"
       end
 
       def next_aggregate_copy_prefix
@@ -932,12 +969,14 @@ module PFC
       end
 
       def emit_extractelement(line)
-        vector = aggregate_register(line.vector)
+        source = aggregate_value_bytes(line.vector, line.vector_type)
         index = llvm_value(line.index)
         width = byte_width(line.bits)
         offset = "((#{index}) * #{width})"
+        return ["    #{register(line.destination)} = 0u;"] if source.nil?
+
         [
-          "    #{register(line.destination)} = #{unsigned_cast(line.bits)}(pf_llvm_load(#{vector.fetch(:name)}, #{offset}, #{width}) & #{integer_mask_literal(line.bits)});"
+          "    #{register(line.destination)} = #{unsigned_cast(line.bits)}(pf_llvm_load(#{source}, #{offset}, #{width}) & #{integer_mask_literal(line.bits)});"
         ]
       end
 
@@ -1086,8 +1125,8 @@ module PFC
           destination = line.destination
           predicate = line.predicate
           bits = line.bits
-          left = llvm_value(line.left)
-          right = llvm_value(line.right)
+          left = bits == 128 ? line.left : llvm_value(line.left)
+          right = bits == 128 ? line.right : llvm_value(line.right)
         elsif (match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne)\s+ptr\s+(.+?),\s+(.+)\z/))
           return emit_pointer_icmp(match[1], match[2], match[3], match[4])
         else
@@ -1100,12 +1139,26 @@ module PFC
           left = llvm_value(match[4])
           right = llvm_value(match[5])
         end
+        return emit_i128_icmp(destination, predicate, left, right) if bits == 128
+
         operator = icmp_operator(predicate)
         if predicate.start_with?("s")
           left = signed_expression(left, bits)
           right = signed_expression(right, bits)
         end
         ["    #{register(destination)} = ((#{left}) #{operator} (#{right})) ? 1u : 0u;"]
+      end
+
+      def emit_i128_icmp(destination, predicate, left, right, context: nil)
+        unless %w[eq ne].include?(predicate)
+          raise Frontend::LLVMSubset::ParseError, "unsupported i128 icmp predicate: #{predicate}"
+        end
+
+        target = context ? inline_register(context, destination) : register(destination)
+        operator = predicate == "eq" ? "==" : "!="
+        left_value = i128_low64_value(left, context:)
+        right_value = i128_low64_value(right, context:)
+        ["    #{target} = ((#{left_value}) #{operator} (#{right_value})) ? 1u : 0u;"]
       end
 
       def emit_pointer_icmp(destination, predicate, left, right, context: nil)
@@ -1551,8 +1604,8 @@ module PFC
           destination = line.destination
           predicate = line.predicate
           bits = line.bits
-          left = inline_value(line.left, context)
-          right = inline_value(line.right, context)
+          left = bits == 128 ? line.left : inline_value(line.left, context)
+          right = bits == 128 ? line.right : inline_value(line.right, context)
         elsif (match = line.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne)\s+ptr\s+(.+?),\s+(.+)\z/))
           return emit_pointer_icmp(match[1], match[2], match[3], match[4], context:)
         else
@@ -1565,6 +1618,8 @@ module PFC
           left = inline_value(match[4], context)
           right = inline_value(match[5], context)
         end
+        return emit_i128_icmp(destination, predicate, left, right, context:) if bits == 128
+
         if predicate.start_with?("s")
           left = signed_expression(left, bits)
           right = signed_expression(right, bits)
@@ -1927,9 +1982,11 @@ module PFC
         raise Frontend::LLVMSubset::ParseError, "unsupported value: #{raw}"
       end
 
-      def i128_low64_value(raw)
+      def i128_low64_value(raw, context: nil)
         token = raw.to_s.strip.split(/\s+/).last
+        return "0ull" if token == "false" || token == "undef" || token == "poison" || token == "zeroinitializer"
         return "#{token.to_i & integer_mask(64)}ull" if token.match?(/\A-?\d+\z/)
+        return context.fetch(:values).fetch(token) if context && context.fetch(:values).key?(token)
         return register(token) if token.match?(/\A#{NAME}\z/)
 
         llvm_value(raw)
@@ -2860,10 +2917,10 @@ module PFC
       end
 
       def memory_address(name, context: nil)
-        stripped = name.to_s.strip
+        stripped = strip_value_attributes(name.to_s.strip)
         return encoded_memory_address("0ull") if stripped == "null"
 
-        constant = constant_gep_pointer(strip_value_attributes(stripped), context:)
+        constant = constant_gep_pointer(stripped, context:)
         if constant
           return encoded_memory_address(constant.value) if constant.is_a?(EncodedPointer)
           return MemoryAddress.new(limit: "PF_LLVM_GLOBAL_MEMORY_SIZE", memory: "llvm_global_memory", name: constant.name, readonly: !global_numeric_mutability.fetch(constant.name, false), readonly_expression: nil, offset: constant.offset) if constant.is_a?(GlobalMemoryPointer)

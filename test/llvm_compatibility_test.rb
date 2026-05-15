@@ -400,6 +400,31 @@ class LLVMCompatibilityTest < Minitest::Test
     assert_equal "B", compile_llvm_source_and_run(source)
   end
 
+  def test_integer_vector_literal_load_store_and_extractelement
+    source = <<~LLVM
+      @vec = constant <2 x i8> <i8 65, i8 66>, align 1
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %global_vec = load <2 x i8>, ptr @vec, align 1
+        %slot = alloca <2 x i8>, align 1
+        store <2 x i8> <i8 65, i8 66>, ptr %slot, align 1
+        %local_vec = load <2 x i8>, ptr %slot, align 1
+        %from_global = extractelement <2 x i8> %global_vec, i32 1
+        %from_literal = extractelement <2 x i8> <i8 65, i8 66>, i32 1
+        %same = icmp eq i8 %from_global, %from_literal
+        %out = select i1 %same, i8 %from_global, i8 78
+        %wide = zext i8 %out to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
   def test_i128_load_store_and_trunc_to_low_bits
     source = <<~LLVM
       @wide = global i128 66, align 16
@@ -414,6 +439,31 @@ class LLVMCompatibilityTest < Minitest::Test
         %again = load i128, ptr %slot, align 16
         %narrow = trunc i128 %again to i32
         call i32 @putchar(i32 %narrow)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_i128_zero_initializer_and_eq_ne
+    source = <<~LLVM
+      @wide_zero = global i128 zeroinitializer, align 16
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %slot = alloca i128, align 16
+        store i128 zeroinitializer, ptr %slot, align 16
+        %global = load i128, ptr @wide_zero, align 16
+        %local = load i128, ptr %slot, align 16
+        %same = icmp eq i128 %global, %local
+        %nonzero = icmp ne i128 %local, 0
+        %first = select i1 %same, i8 66, i8 78
+        %out = select i1 %nonzero, i8 78, i8 %first
+        %wide = zext i8 %out to i32
+        call i32 @putchar(i32 %wide)
         ret i32 0
       }
     LLVM
@@ -460,7 +510,31 @@ class LLVMCompatibilityTest < Minitest::Test
     assert_equal "B", compile_llvm_and_run("samples/clang_attrs_intrinsics_smoke.ll")
   end
 
-  def test_clang_optimized_smoke_fixture
-    assert_equal "B", compile_llvm_and_run("samples/clang/optimized_smoke.ll")
+  def test_clang_optimization_matrix_matches_native_output
+    native = compile_native_c_and_run("samples/clang/optimized_smoke.c")
+    [
+      "samples/clang/optimized_smoke.ll",
+      "samples/clang/optimized_smoke_O0.ll",
+      "samples/clang/optimized_smoke_O1.ll",
+      "samples/clang/optimized_smoke_O2.ll",
+      "samples/clang/optimized_smoke_Oz.ll"
+    ].each do |fixture|
+      assert_equal native, compile_llvm_and_run(fixture)
+    end
+  end
+
+  private
+
+  def compile_native_c_and_run(path)
+    Dir.mktmpdir("pfc-native-test") do |dir|
+      source_path = File.expand_path("../#{path}", __dir__)
+      exe_path = File.join(dir, "native")
+      compile_out, compile_status = Open3.capture2e("cc", "-std=c11", "-Wall", "-Wextra", "-O0", source_path, "-o", exe_path)
+      assert compile_status.success?, compile_out
+
+      stdout, stderr, status = Open3.capture3(exe_path)
+      assert status.success?, stderr
+      stdout
+    end
   end
 end
