@@ -139,6 +139,7 @@ module PFC
       exclude_patterns = []
       fail_on_warning = false
       fix_suggestions = false
+      format = nil
       include_patterns = []
       json = false
       while @argv.first&.start_with?("--")
@@ -160,6 +161,9 @@ module PFC
         when "--fail-on-warning"
           check = true
           fail_on_warning = true
+        when /\A--format=(json|sarif)\z/
+          check = true
+          format = Regexp.last_match(1)
         when /\A--include=(.+)\z/
           check = true
           include_patterns << Regexp.last_match(1)
@@ -186,9 +190,11 @@ module PFC
           result = llvm_check_result(path, fail_on_warning:)
         end
 
-        if emit_lowering_plan
+        if format == "sarif"
+          puts JSON.pretty_generate(llvm_sarif(result))
+        elsif emit_lowering_plan
           puts JSON.pretty_generate(llvm_lowering_plan(result))
-        elsif json
+        elsif json || format == "json"
           puts JSON.pretty_generate(result)
         elsif result.fetch(:supported)
           puts "supported: #{path}"
@@ -304,6 +310,9 @@ module PFC
         schema_version: 1,
         path: result.fetch(:path),
         supported: result.fetch(:supported),
+        advisories: result.fetch(:diagnostics, []).select { |diagnostic| diagnostic.fetch(:severity) == "warning" }.map.with_index(1) do |diagnostic, index|
+          llvm_lowering_advisory(diagnostic, index)
+        end,
         operations: result.fetch(:errors).map.with_index(1) do |error, index|
           {
             id: "lower_#{index}",
@@ -323,6 +332,84 @@ module PFC
           }
         end
       }
+    end
+
+    def llvm_lowering_advisory(diagnostic, index)
+      {
+        id: "advise_#{index}",
+        severity: diagnostic.fetch(:severity),
+        line: diagnostic.fetch(:line),
+        opcode: diagnostic.fetch(:opcode),
+        line_text: diagnostic.fetch(:line_text),
+        reason: diagnostic.fetch(:message),
+        hint: diagnostic.fetch(:hint),
+        explanation: diagnostic.fetch(:explanation),
+        steps: diagnostic.fetch(:fix_suggestions)
+      }
+    end
+
+    def llvm_sarif(result)
+      {
+        version: "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        runs: [
+          {
+            tool: {
+              driver: {
+                name: "pfc llvm-capabilities",
+                informationUri: "https://github.com/ydah/printf",
+                rules: llvm_sarif_rules(result)
+              }
+            },
+            results: llvm_sarif_results(result)
+          }
+        ]
+      }
+    end
+
+    def llvm_sarif_rules(result)
+      llvm_sarif_diagnostics(result).map do |diagnostic|
+        rule_id = llvm_sarif_rule_id(diagnostic)
+        {
+          id: rule_id,
+          name: rule_id,
+          shortDescription: { text: diagnostic.fetch(:hint) },
+          fullDescription: { text: diagnostic.fetch(:explanation) }
+        }
+      end.uniq { |rule| rule.fetch(:id) }
+    end
+
+    def llvm_sarif_results(result)
+      llvm_sarif_diagnostics(result).map do |diagnostic|
+        {
+          ruleId: llvm_sarif_rule_id(diagnostic),
+          level: diagnostic.fetch(:severity) == "warning" ? "warning" : "error",
+          message: { text: diagnostic.fetch(:message) },
+          locations: [
+            {
+              physicalLocation: {
+                artifactLocation: { uri: diagnostic.fetch(:path) },
+                region: { startLine: diagnostic.fetch(:line) || 1 }
+              }
+            }
+          ]
+        }
+      end
+    end
+
+    def llvm_sarif_diagnostics(result)
+      if result.key?(:files)
+        return result.fetch(:files).flat_map { |file| llvm_sarif_diagnostics(file) }
+      end
+
+      result.fetch(:diagnostics, []).map do |diagnostic|
+        diagnostic.merge(path: result.fetch(:path))
+      end
+    end
+
+    def llvm_sarif_rule_id(diagnostic)
+      opcode = diagnostic.fetch(:opcode) || "unknown"
+      "pfc.llvm.#{diagnostic.fetch(:severity)}.#{opcode}"
     end
 
     def llvm_lowering_strategy(error)
@@ -623,8 +710,8 @@ module PFC
           pfc dump-cfg INPUT
           pfc dump-c INPUT
           pfc llvm-capabilities [--json]
-          pfc llvm-capabilities --check [--json] [--fix-suggestions] [--emit-lowering-plan] INPUT.ll
-          pfc llvm-capabilities --check-dir [--json] [--emit-lowering-plan] [--include=GLOB] [--exclude=GLOB] [--fail-on-warning] DIR
+          pfc llvm-capabilities --check [--json] [--format=json|sarif] [--fix-suggestions] [--emit-lowering-plan] INPUT.ll
+          pfc llvm-capabilities --check-dir [--json] [--format=json|sarif] [--emit-lowering-plan] [--include=GLOB] [--exclude=GLOB] [--fail-on-warning] DIR
           pfc llvm-capabilities --explain INPUT.ll
 
         Options:
@@ -660,7 +747,7 @@ module PFC
             - add/sub/mul, signed/unsigned division and remainder
             - bitwise and/or/xor, shl/lshr/ashr
             - zext/sext/trunc, including trunc from i128 to supported integer widths
-            - limited i128 zeroinitializer, add/sub, and/or/xor, eq/ne, signed/unsigned comparisons, select, zext/sext, and truncation with high 64-bit preservation
+            - limited i128 zeroinitializer, add/sub, shl/lshr/ashr, and/or/xor, eq/ne, signed/unsigned comparisons, phi, select, zext/sext, and truncation with high 64-bit preservation
             - ptrtoint and tagged inttoptr for local/global/string pointer values
             - bitcast ptr-to-ptr
             - addrspacecast for default address-space pointers
@@ -670,12 +757,12 @@ module PFC
             - freeze
             - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
             - extractvalue and insertvalue for scalar integer fields in aggregate values
-            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks
+            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks
           control:
             - br, switch, phi, ret
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
-            - void @main and nested non-recursive internal calls with integer/pointer/void returns and integer/pointer arguments
+            - void @main and nested non-recursive internal calls with integer/pointer/void returns plus i128/vector returns and integer/pointer/i128/vector arguments
           tolerance:
             - common value attributes accepted as no-ops
             - trailing LLVM metadata attachments accepted as no-ops
@@ -686,7 +773,7 @@ module PFC
             - common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops
             - llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals
             - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode
-            - llvm-capabilities --check-dir supports summary counts, include/exclude globs, and fail-on-warning
+            - llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on-warning, and SARIF output
             - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
             - explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces
             - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
@@ -720,7 +807,7 @@ module PFC
           "add/sub/mul, signed/unsigned division and remainder",
           "bitwise and/or/xor, shl/lshr/ashr",
           "zext/sext/trunc, including trunc from i128 to supported integer widths",
-          "limited i128 zeroinitializer, add/sub, and/or/xor, eq/ne, signed/unsigned comparisons, select, zext/sext, and truncation with high 64-bit preservation",
+          "limited i128 zeroinitializer, add/sub, shl/lshr/ashr, and/or/xor, eq/ne, signed/unsigned comparisons, phi, select, zext/sext, and truncation with high 64-bit preservation",
           "ptrtoint and tagged inttoptr for local/global/string pointer values",
           "bitcast ptr-to-ptr",
           "addrspacecast for default address-space pointers",
@@ -730,13 +817,13 @@ module PFC
           "freeze",
           "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
           "extractvalue and insertvalue for scalar integer fields in aggregate values",
-          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks"
+          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks"
         ],
         control: [
           "br, switch, phi, ret",
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
-          "void @main and nested non-recursive internal calls with integer/pointer/void returns and integer/pointer arguments"
+          "void @main and nested non-recursive internal calls with integer/pointer/void returns plus i128/vector returns and integer/pointer/i128/vector arguments"
         ],
         tolerance: [
           "common value attributes accepted as no-ops",
@@ -748,7 +835,7 @@ module PFC
           "common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops",
           "llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals",
           "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode",
-          "llvm-capabilities --check-dir supports summary counts, include/exclude globs, and fail-on-warning",
+          "llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on-warning, and SARIF output",
           "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
           "explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",

@@ -12,6 +12,8 @@ class LLVMConformanceTest < Minitest::Test
   SUPPORTED_FIXTURES = {
     "minimal_return.ll" => "",
     "i128_add_signed_cmp.ll" => "B",
+    "i128_shift_phi.ll" => "B",
+    "internal_aggregate_calls.ll" => "B",
     "vector_add.ll" => "B",
     "vector_scalarized_ops.ll" => "B",
     "vector_literal.ll" => "B",
@@ -23,7 +25,7 @@ class LLVMConformanceTest < Minitest::Test
     "blockaddress.ll" => "unsupported blockaddress constant expression",
     "external_global.ll" => "unsupported external global reference",
     "float_add.ll" => "unsupported floating-point type",
-    "vector_add.ll" => "unsupported LLVM instruction udiv"
+    "vector_add.ll" => "unsupported LLVM instruction shufflevector"
   }.freeze
 
   def test_supported_conformance_fixtures_compile_and_pass_preflight
@@ -57,14 +59,14 @@ class LLVMConformanceTest < Minitest::Test
     end
   end
 
-  def test_fix_suggestions_for_vector_arithmetic_are_concrete
+  def test_fix_suggestions_for_unsupported_constructs_are_concrete
     path = unsupported_path("vector_add.ll")
     out, err = capture_io do
       assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check", "--fix-suggestions", path]).run
     end
 
     assert_empty err
-    assert_includes out, "fix: replace vector arithmetic with extractelement per lane"
+    assert_includes out, "fix: lower this construct"
   end
 
   def test_lowering_plan_is_structured_json
@@ -85,6 +87,67 @@ class LLVMConformanceTest < Minitest::Test
     assert plan.fetch("operations").first.key?("replacement_strategy")
     assert plan.fetch("operations").first.key?("requires_runtime_support")
     assert plan.fetch("operations").first.key?("blocking")
+  end
+
+  def test_lowering_plan_includes_warning_advisories
+    Dir.mktmpdir("pfc-warning-plan") do |dir|
+      path = File.join(dir, "warn.ll")
+      File.write(path, <<~LLVM)
+        define i32 @main() {
+        entry:
+          %slot = alloca i32, align 4
+          store volatile i32 0, ptr %slot, align 4
+          ret i32 0
+        }
+      LLVM
+
+      out, err = capture_io do
+        assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check", "--emit-lowering-plan", path]).run
+      end
+      assert_empty err
+      plan = JSON.parse(out)
+      assert_empty plan.fetch("operations")
+      assert_equal "warning", plan.fetch("advisories").first.fetch("severity")
+    end
+  end
+
+  def test_check_result_schema_keys_are_stable
+    path = unsupported_path("float_add.ll")
+    out, err = capture_io do
+      assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check", "--json", path]).run
+    end
+    assert_empty err
+    result = JSON.parse(out)
+    expected = JSON.parse(File.read(File.join(FIXTURE_ROOT, "schema", "check_result_keys.json")))
+    assert_equal expected.fetch("root"), result.keys.sort
+    assert_equal expected.fetch("summary"), result.fetch("summary").keys.sort
+    assert_equal expected.fetch("diagnostic"), result.fetch("diagnostics").first.keys.sort
+  end
+
+  def test_check_dir_can_emit_sarif
+    out, err = capture_io do
+      assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--format=sarif", File.join(FIXTURE_ROOT, "unsupported")]).run
+    end
+
+    assert_empty err
+    sarif = JSON.parse(out)
+    assert_equal "2.1.0", sarif.fetch("version")
+    assert_equal "pfc llvm-capabilities", sarif.fetch("runs").first.fetch("tool").fetch("driver").fetch("name")
+    assert sarif.fetch("runs").first.fetch("results").any? { |result| result.fetch("level") == "error" }
+  end
+
+  def test_capability_data_mentions_representative_lowered_features
+    out, err = capture_io do
+      assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--json"]).run
+    end
+
+    assert_empty err
+    values = JSON.parse(out).fetch("values").join("\n")
+    tolerance = JSON.parse(out).fetch("tolerance").join("\n")
+    %w[add/sub shl/lshr/ashr signed/unsigned vector].each do |feature|
+      assert_includes values, feature
+    end
+    assert_includes tolerance, "SARIF"
   end
 
   def test_check_dir_reports_nested_llvm_files

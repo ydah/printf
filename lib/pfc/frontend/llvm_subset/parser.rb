@@ -11,7 +11,8 @@ module PFC
         GLOBAL_NAME = /@[-A-Za-z$._0-9]+/
         POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
         INTEGER_TYPE = /i(?:1|8|16|32|64)/
-        RETURN_TYPE = /(?:#{INTEGER_TYPE}|ptr|void)/
+        VECTOR_TYPE = /<\d+\s+x\s+i(?:1|8|16|32|64)>/
+        RETURN_TYPE = /(?:#{INTEGER_TYPE}|i128|#{VECTOR_TYPE}|ptr|void)/
         ATTRIBUTE_TOKEN = /[-\w]+(?:\([^)]*\))?/
 
         class Instruction
@@ -241,7 +242,7 @@ module PFC
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|mul|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact))*)\s+(<\d+\s+x\s+i(8|16|32|64)>)\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact))*)\s+(<\d+\s+x\s+i(8|16|32|64)>)\s+(.+)\z/))
               operands = Instruction.split_arguments(match[6])
               return unless operands.length == 2
 
@@ -256,7 +257,7 @@ module PFC
               return
             end
 
-            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|and|or|xor)\s+i128\s+(.+?),\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|and|or|xor|shl|lshr|ashr)\s+i128\s+(.+?),\s+(.+)\z/))
               @destination = match[1]
               @operator = match[2]
               @flags = [].freeze
@@ -554,10 +555,31 @@ module PFC
         end
 
         class PhiInstruction < Instruction
-          attr_reader :bits, :destination, :incoming, :value_type
+          attr_reader :bits, :destination, :incoming, :value_type, :vector_type
 
           def initialize(text)
             super
+            if (match = text.match(/\A(#{NAME})\s*=\s*phi\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(.+)\z/))
+              @destination = match[1]
+              @bits = match[2][/i(1|8|16|32|64)>/, 1].to_i
+              @value_type = match[2]
+              @vector_type = match[2]
+              @incoming = match[3].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/).map do |value, label|
+                [value, label]
+              end.freeze
+              return
+            end
+
+            if (match = text.match(/\A(#{NAME})\s*=\s*phi\s+i128\s+(.+)\z/))
+              @destination = match[1]
+              @bits = 128
+              @value_type = "i128"
+              @incoming = match[2].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/).map do |value, label|
+                [value, label]
+              end.freeze
+              return
+            end
+
             if (match = text.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/))
               @destination = match[1]
               @bits = match[2].to_i
@@ -584,7 +606,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Aret\s+(void|ptr|i(?:1|8|16|32|64))(?:\s+(.+))?\z/)
+            match = text.match(/\Aret\s+(void|ptr|i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>)(?:\s+(.+))?\z/)
             return unless match
 
             @return_type = match[1]
@@ -1079,7 +1101,7 @@ module PFC
               next({ type: "...", name: nil })
             end
 
-            type_pattern = allow_pointer ? /i(?:1|8|16|32|64)|ptr(?:\s+addrspace\(\d+\))?|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
+            type_pattern = allow_pointer ? /i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|ptr(?:\s+addrspace\(\d+\))?|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
             match = stripped.match(/\A(#{type_pattern})(?:\s+(.+))?\z/)
             raise ParseError, "unsupported function parameter: #{parameter}" unless match
             name = match[2]&.match(/#{NAME}/)&.[](0)

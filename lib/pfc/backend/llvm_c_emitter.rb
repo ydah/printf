@@ -286,8 +286,13 @@ module PFC
             next
           end
 
+          if line.respond_to?(:destination) && line.respond_to?(:return_type) && line.destination == lhs && aggregate_type?(line.return_type)
+            aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(line.return_type), type: line.return_type }
+            next
+          end
+
           registers[lhs] = c_value_name(lhs)
-          i128_high_registers[lhs] = "#{c_value_name(lhs)}_hi" if (line.respond_to?(:bits) && line.bits == 128) || (line.respond_to?(:to_bits) && line.to_bits == 128)
+          i128_high_registers[lhs] = "#{c_value_name(lhs)}_hi" if (line.respond_to?(:bits) && line.bits == 128) || (line.respond_to?(:to_bits) && line.to_bits == 128) || (line.respond_to?(:return_type) && line.return_type == "i128")
           pointers[lhs] = EncodedPointer.new(value: registers.fetch(lhs)) if pointer_result || line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*phi\s+(?:ptr|.+?\*)\b/)
         end
       end
@@ -515,8 +520,9 @@ module PFC
         struct_fields(stripped)
       end
 
-      def aggregate_register(name)
-        aggregate_registers.fetch(name) do
+      def aggregate_register(name, context: nil)
+        aggregate_map = context ? context.fetch(:aggregates) : aggregate_registers
+        aggregate_map.fetch(name) do
           raise Frontend::LLVMSubset::ParseError, "unknown aggregate register: #{name}"
         end
       end
@@ -542,9 +548,10 @@ module PFC
         [offset, current_type]
       end
 
-      def aggregate_value_bytes(value, _value_type)
-        return aggregate_register(value).fetch(:name) if aggregate_registers.key?(value)
-        constant = aggregate_constant_bytes(value, _value_type)
+      def aggregate_value_bytes(value, value_type, context: nil)
+        aggregate_map = context ? context.fetch(:aggregates) : aggregate_registers
+        return aggregate_register(value, context:).fetch(:name) if aggregate_map.key?(value)
+        constant = aggregate_constant_bytes(value, value_type)
         return byte_array_literal(constant) if constant
         return nil if %w[zeroinitializer undef poison].include?(value)
 
@@ -997,11 +1004,12 @@ module PFC
         ]
       end
 
-      def emit_extractelement(line)
-        source = aggregate_value_bytes(line.vector, line.vector_type)
-        index = llvm_value(line.index)
+      def emit_extractelement(line, context: nil)
+        source = aggregate_value_bytes(line.vector, line.vector_type, context:)
+        index = context ? inline_value(line.index, context) : llvm_value(line.index)
         width = byte_width(line.bits)
-        return ["    #{register(line.destination)} = 0u;"] if source.nil?
+        destination = context ? inline_register(context, line.destination) : register(line.destination)
+        return ["    #{destination} = 0u;"] if source.nil?
 
         prefix = next_aggregate_copy_prefix
         [
@@ -1011,15 +1019,16 @@ module PFC
           "            fprintf(stderr, \"pfc runtime error: LLVM vector index out of range\\n\");",
           "            PF_ABORT();",
           "        }",
-          "        #{register(line.destination)} = #{unsigned_cast(line.bits)}(pf_llvm_load(#{source}, #{prefix}_index * #{width}, #{width}) & #{integer_mask_literal(line.bits)});",
+          "        #{destination} = #{unsigned_cast(line.bits)}(pf_llvm_load(#{source}, #{prefix}_index * #{width}, #{width}) & #{integer_mask_literal(line.bits)});",
           "    }"
         ]
       end
 
-      def emit_insertelement(line)
-        aggregate = aggregate_register(line.destination)
-        source = aggregate_value_bytes(line.vector, line.vector_type)
-        index = llvm_value(line.index)
+      def emit_insertelement(line, context: nil)
+        aggregate = aggregate_register(line.destination, context:)
+        source = aggregate_value_bytes(line.vector, line.vector_type, context:)
+        index = context ? inline_value(line.index, context) : llvm_value(line.index)
+        value = context ? inline_value(line.value, context) : llvm_value(line.value)
         width = byte_width(line.bits)
         copy_prefix = next_aggregate_copy_prefix
         [
@@ -1033,7 +1042,7 @@ module PFC
           "        for (#{copy_prefix}_i = 0; #{copy_prefix}_i < #{aggregate.fetch(:size)}; #{copy_prefix}_i++) {",
           "            #{aggregate.fetch(:name)}[#{copy_prefix}_i] = #{source ? "#{source}[#{copy_prefix}_i]" : '0u'};",
           "        }",
-          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{copy_prefix}_index * #{width}, (unsigned long long)(#{llvm_value(line.value)} & #{integer_mask_literal(line.bits)}), #{width});",
+          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{copy_prefix}_index * #{width}, (unsigned long long)(#{value} & #{integer_mask_literal(line.bits)}), #{width});",
           "    }"
         ]
       end
@@ -1237,7 +1246,7 @@ module PFC
       end
 
       def emit_internal_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         destination = match[1]
@@ -1273,7 +1282,7 @@ module PFC
         end
 
         return_destination = if destination
-                               caller_context ? inline_register(caller_context, destination) : register(destination)
+                               caller_context ? inline_value_storage(caller_context, destination, function.fetch(:return_type)) : value_storage(destination, function.fetch(:return_type))
                              else
                                "#{prefix}_ignored_return"
                              end
@@ -1282,10 +1291,44 @@ module PFC
           pointer_map = caller_context ? caller_context.fetch(:pointers) : pointers
           pointer_map[destination] = EncodedPointer.new(value: return_destination)
         end
+        if function.fetch(:return_type) == "i128"
+          context[:return_high_destination] = if destination
+                                                caller_context ? i128_high_register(destination, context: caller_context) : i128_high_register(destination)
+                                              else
+                                                "#{prefix}_ignored_return_hi"
+                                              end
+        end
+        if destination && aggregate_type?(function.fetch(:return_type))
+          context[:return_aggregate_destination] = caller_context ? aggregate_register(destination, context: caller_context) : aggregate_register(destination)
+        elsif aggregate_type?(function.fetch(:return_type))
+          context[:return_aggregate_destination] = { name: "#{prefix}_ignored_return_agg", size: type_size(function.fetch(:return_type)), type: function.fetch(:return_type) }
+        end
         lines = inline_declarations(context, function)
         function.fetch(:params).zip(arguments).each_with_index do |(param, argument), index|
-          if function.fetch(:param_types).fetch(index) == "ptr"
+          param_type = function.fetch(:param_types).fetch(index)
+          if param_type == "ptr"
             context.fetch(:pointers)[param] = pointer_binding(argument, context: caller_context)
+            next
+          end
+          if param_type == "i128"
+            local = context.fetch(:values).fetch(param)
+            high = context.fetch(:i128_high_values).fetch(param)
+            lines << "    #{local} = #{i128_low64_value(argument, context: caller_context)};"
+            lines << "    #{high} = #{i128_high64_value(argument, context: caller_context)};"
+            next
+          end
+          if aggregate_type?(param_type)
+            aggregate = context.fetch(:aggregates).fetch(param)
+            source = aggregate_value_bytes(argument, param_type, context: caller_context)
+            prefix_copy = next_aggregate_copy_prefix
+            lines.concat([
+              "    {",
+              "        int #{prefix_copy}_i = 0;",
+              "        for (#{prefix_copy}_i = 0; #{prefix_copy}_i < #{aggregate.fetch(:size)}; #{prefix_copy}_i++) {",
+              "            #{aggregate.fetch(:name)}[#{prefix_copy}_i] = #{source ? "#{source}[#{prefix_copy}_i]" : '0u'};",
+              "        }",
+              "    }"
+            ])
             next
           end
 
@@ -1305,14 +1348,36 @@ module PFC
 
       def inline_context(prefix, return_destination, function, call_stack)
         values = {}
+        i128_high_values = {}
+        aggregates = {}
         pointers = function.fetch(:allocations).dup
         function.fetch(:params).each_with_index do |param, index|
-          next if function.fetch(:param_types).fetch(index) == "ptr"
+          param_type = function.fetch(:param_types).fetch(index)
+          next if param_type == "ptr"
 
           values[param] = "#{prefix}_arg#{index}"
+          i128_high_values[param] = "#{prefix}_arg#{index}_hi" if param_type == "i128"
+          aggregates[param] = { name: "#{prefix}_arg#{index}_agg", size: type_size(param_type), type: param_type } if aggregate_type?(param_type)
         end
         inline_register_names(function).each do |name|
           values[name] ||= "#{prefix}_#{name.delete_prefix('%').gsub(/[^A-Za-z0-9_]/, '_')}"
+        end
+        function.fetch(:blocks).values.flatten.each do |line|
+          lhs = line[/\A(#{NAME})\s*=/, 1]
+          lhs = line.destination if lhs.nil? && line.respond_to?(:destination)
+          next unless lhs
+          if (line.respond_to?(:bits) && line.bits == 128) || (line.respond_to?(:to_bits) && line.to_bits == 128) || (line.respond_to?(:return_type) && line.return_type == "i128")
+            i128_high_values[lhs] ||= "#{values.fetch(lhs)}_hi"
+          end
+          type = if line.respond_to?(:return_type) && aggregate_type?(line.return_type)
+                   line.return_type
+                 elsif line.respond_to?(:value_type) && aggregate_type?(line.value_type)
+                   line.value_type
+                 elsif line.respond_to?(:vector_type) && aggregate_type?(line.vector_type) &&
+                       (line.respond_to?(:value) || line.respond_to?(:operator) || line.respond_to?(:predicate) || line.respond_to?(:true_value))
+                   line.vector_type
+                 end
+          aggregates[lhs] ||= { name: "#{prefix}_#{c_aggregate_name(lhs)}", size: type_size(type), type: } if type
         end
         function.fetch(:blocks).values.flatten.each do |line|
           lhs = line[/\A(#{NAME})\s*=\s*phi\s+(?:ptr|.+?\*)\b/, 1]
@@ -1322,7 +1387,9 @@ module PFC
           call_stack:,
           declare_return_destination: function.fetch(:return_type) != "void" &&
             return_destination.start_with?("#{prefix}_ignored_return"),
+          aggregates:,
           function:,
+          i128_high_values:,
           pointers:,
           prefix:,
           return_destination:,
@@ -1349,11 +1416,22 @@ module PFC
         declared = []
         lines = []
         function.fetch(:params).each_with_index do |param, index|
-          next if function.fetch(:param_types).fetch(index) == "ptr"
+          param_type = function.fetch(:param_types).fetch(index)
+          next if param_type == "ptr"
 
           name = context.fetch(:values).fetch(param)
           lines << "    unsigned long long #{name} = 0;"
           declared << name
+          if param_type == "i128"
+            high = context.fetch(:i128_high_values).fetch(param)
+            lines << "    unsigned long long #{high} = 0;"
+            declared << high
+          end
+          if aggregate_type?(param_type)
+            aggregate = context.fetch(:aggregates).fetch(param)
+            lines << "    unsigned char #{aggregate.fetch(:name)}[#{aggregate.fetch(:size)}] = {0};"
+            declared << aggregate.fetch(:name)
+          end
         end
         inline_register_names(function).each do |register_name|
           name = context.fetch(:values).fetch(register_name)
@@ -1361,8 +1439,25 @@ module PFC
 
           lines << "    unsigned long long #{name} = 0;"
           declared << name
+          if context.fetch(:i128_high_values).key?(register_name)
+            high = context.fetch(:i128_high_values).fetch(register_name)
+            lines << "    unsigned long long #{high} = 0;" unless declared.include?(high)
+            declared << high
+          end
+          if context.fetch(:aggregates).key?(register_name)
+            aggregate = context.fetch(:aggregates).fetch(register_name)
+            lines << "    unsigned char #{aggregate.fetch(:name)}[#{aggregate.fetch(:size)}] = {0};" unless declared.include?(aggregate.fetch(:name))
+            declared << aggregate.fetch(:name)
+          end
         end
         lines << "    unsigned long long #{context.fetch(:return_destination)} = 0;" if context.fetch(:declare_return_destination)
+        if context.fetch(:declare_return_destination) && context.key?(:return_high_destination)
+          lines << "    unsigned long long #{context.fetch(:return_high_destination)} = 0;"
+        end
+        if context.key?(:return_aggregate_destination) && context.fetch(:return_aggregate_destination).fetch(:name).start_with?("#{context.fetch(:prefix)}_ignored_return_agg")
+          aggregate = context.fetch(:return_aggregate_destination)
+          lines << "    unsigned char #{aggregate.fetch(:name)}[#{aggregate.fetch(:size)}] = {0};"
+        end
         lines
       end
 
@@ -1385,8 +1480,8 @@ module PFC
           when :select then return emit_inline_select(line, context)
           when :cast then return emit_inline_cast(line, context)
           when :freeze then return emit_inline_freeze(line, context)
-          when :extractelement then return emit_extractelement(line)
-          when :insertelement then return emit_insertelement(line)
+          when :extractelement then return emit_extractelement(line, context:)
+          when :insertelement then return emit_insertelement(line, context:)
           when :icmp then return emit_inline_icmp(line, context)
           when :call then return emit_inline_call(line, context)
           when :switch then return emit_inline_switch(line, context, label)
@@ -1513,7 +1608,7 @@ module PFC
       end
 
       def emit_inline_binary(line, context)
-        raise Frontend::LLVMSubset::ParseError, "unsupported vector binary in internal call: #{line}" if line.respond_to?(:vector_type) && line.vector_type
+        return emit_vector_binary(line, context:) if line.respond_to?(:vector_type) && line.vector_type
 
         if line.respond_to?(:destination) && line.respond_to?(:operator) && line.respond_to?(:bits) && line.bits
           destination = line.destination
@@ -1539,7 +1634,7 @@ module PFC
       end
 
       def emit_inline_select(line, context)
-        raise Frontend::LLVMSubset::ParseError, "unsupported inline vector select" if line.respond_to?(:vector_type) && line.vector_type
+        return emit_vector_select(line, context:) if line.respond_to?(:vector_type) && line.vector_type
 
         if line.respond_to?(:value_type) && line.value_type == "ptr"
           condition = inline_value(line.condition, context)
@@ -1637,7 +1732,7 @@ module PFC
       end
 
       def emit_inline_icmp(line, context)
-        raise Frontend::LLVMSubset::ParseError, "unsupported inline vector icmp" if line.respond_to?(:vector_type) && line.vector_type
+        return emit_vector_icmp(line, context:) if line.respond_to?(:vector_type) && line.vector_type
 
         if line.respond_to?(:operand_type) && line.operand_type == "ptr"
           return emit_pointer_icmp(line.destination, line.predicate, line.left, line.right, context:)
@@ -1695,7 +1790,7 @@ module PFC
 
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@putchar\(i32\s+(.+)\)\z/)
         unless match
-          match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64)|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+          match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported internal call: #{line}" unless match
 
           raise Frontend::LLVMSubset::ParseError, "void call cannot assign a result: #{line}" if match[1] && match[2] == "void"
@@ -1787,6 +1882,28 @@ module PFC
             raise Frontend::LLVMSubset::ParseError, "unsupported internal return: #{line}"
           end
 
+          if line.return_type == "i128"
+            return [
+              "    #{context.fetch(:return_destination)} = #{i128_low64_value(line.value, context:)};",
+              "    #{context.fetch(:return_high_destination)} = #{i128_high64_value(line.value, context:)};",
+              "    goto #{context.fetch(:return_label)};"
+            ]
+          end
+          if aggregate_type?(line.return_type)
+            source = aggregate_value_bytes(line.value, line.return_type, context:)
+            aggregate = context.fetch(:return_aggregate_destination)
+            prefix = next_aggregate_copy_prefix
+            return [
+              "    {",
+              "        int #{prefix}_i = 0;",
+              "        for (#{prefix}_i = 0; #{prefix}_i < #{aggregate.fetch(:size)}; #{prefix}_i++) {",
+              "            #{aggregate.fetch(:name)}[#{prefix}_i] = #{source ? "#{source}[#{prefix}_i]" : '0u'};",
+              "        }",
+              "    }",
+              "    goto #{context.fetch(:return_label)};"
+            ]
+          end
+
           return [
             "    #{context.fetch(:return_destination)} = (unsigned long long)(#{line.return_type == 'ptr' ? encoded_pointer_value(line.value, context:) : inline_value(line.value, context)});",
             "    goto #{context.fetch(:return_label)};"
@@ -1876,6 +1993,9 @@ module PFC
         if line.respond_to?(:return_type) && line.return_type
           return ["    goto pf_done;"] if line.return_type == "void"
           raise Frontend::LLVMSubset::ParseError, "main cannot return ptr" if line.return_type == "ptr"
+          unless line.return_type.match?(/\Ai(?:1|8|16|32|64)\z/)
+            raise Frontend::LLVMSubset::ParseError, "main cannot return #{line.return_type}"
+          end
 
           return [
             "    pf_return_code = (int)(#{llvm_value(line.value)});",
@@ -1903,7 +2023,7 @@ module PFC
         spaces = "    " * indent
         assignments = phi_lines(to_label).filter_map do |line|
           phi_assignment(line, from_label)
-        end
+        end.flatten
         lines = simultaneous_phi_assignment_lines(assignments, spaces)
         lines << "#{spaces}goto #{c_label(to_label)};"
         lines
@@ -1927,6 +2047,25 @@ module PFC
         if line.respond_to?(:incoming) && line.incoming && line.bits
           value = line.incoming.find { |_value, label| label == from_label }&.first
           return nil if value.nil?
+          if line.bits == 128
+            return [
+              {
+                expression: i128_low64_value(value),
+                target: register(line.destination)
+              },
+              {
+                expression: i128_high64_value(value),
+                target: i128_high_register(line.destination)
+              }
+            ]
+          end
+          if line.respond_to?(:vector_type) && line.vector_type
+            return {
+              source: aggregate_value_bytes(value, line.vector_type),
+              size: type_size(line.vector_type),
+              target_aggregate: aggregate_register(line.destination)
+            }
+          end
 
           return {
             expression: "#{unsigned_cast(line.bits)}((#{llvm_value(value)}) & #{integer_mask_literal(line.bits)})",
@@ -1951,7 +2090,7 @@ module PFC
         spaces = "    " * indent
         assignments = inline_phi_lines(context, to_label).filter_map do |line|
           inline_phi_assignment(context, line, from_label)
-        end
+        end.flatten
         lines = simultaneous_phi_assignment_lines(assignments, spaces)
         lines << "#{spaces}goto #{inline_label(context, to_label)};"
         lines
@@ -1975,6 +2114,25 @@ module PFC
         if line.respond_to?(:incoming) && line.incoming && line.bits
           value = line.incoming.find { |_value, label| label == from_label }&.first
           return nil if value.nil?
+          if line.bits == 128
+            return [
+              {
+                expression: i128_low64_value(value, context:),
+                target: inline_register(context, line.destination)
+              },
+              {
+                expression: i128_high64_value(value, context:),
+                target: i128_high_register(line.destination, context:)
+              }
+            ]
+          end
+          if line.respond_to?(:vector_type) && line.vector_type
+            return {
+              source: aggregate_value_bytes(value, line.vector_type, context:),
+              size: type_size(line.vector_type),
+              target_aggregate: aggregate_register(line.destination, context:)
+            }
+          end
 
           return {
             expression: "#{unsigned_cast(line.bits)}((#{inline_value(value, context)}) & #{integer_mask_literal(line.bits)})",
@@ -2000,11 +2158,37 @@ module PFC
 
         temp_names = assignments.map { next_phi_temp_name }
         temp_lines = assignments.zip(temp_names).map do |assignment, temp_name|
-          "#{spaces}unsigned long long #{temp_name} = #{assignment.fetch(:expression)};"
-        end
+          if assignment.key?(:target_aggregate)
+            size = assignment.fetch(:size)
+            source = assignment.fetch(:source)
+            [
+              "#{spaces}unsigned char #{temp_name}[#{size}] = {0};",
+              "#{spaces}{",
+              "#{spaces}    int #{temp_name}_i = 0;",
+              "#{spaces}    for (#{temp_name}_i = 0; #{temp_name}_i < #{size}; #{temp_name}_i++) {",
+              "#{spaces}        #{temp_name}[#{temp_name}_i] = #{source ? "#{source}[#{temp_name}_i]" : '0u'};",
+              "#{spaces}    }",
+              "#{spaces}}"
+            ]
+          else
+            "#{spaces}unsigned long long #{temp_name} = #{assignment.fetch(:expression)};"
+          end
+        end.flatten
         assignment_lines = assignments.zip(temp_names).map do |assignment, temp_name|
+          if assignment.key?(:target_aggregate)
+            target = assignment.fetch(:target_aggregate)
+            size = assignment.fetch(:size)
+            next [
+              "#{spaces}{",
+              "#{spaces}    int #{temp_name}_i = 0;",
+              "#{spaces}    for (#{temp_name}_i = 0; #{temp_name}_i < #{size}; #{temp_name}_i++) {",
+              "#{spaces}        #{target.fetch(:name)}[#{temp_name}_i] = #{temp_name}[#{temp_name}_i];",
+              "#{spaces}    }",
+              "#{spaces}}"
+            ]
+          end
           "#{spaces}#{assignment.fetch(:target)} = #{temp_name};"
-        end
+        end.flatten
         temp_lines + assignment_lines
       end
 
@@ -2044,6 +2228,18 @@ module PFC
         context.fetch(:values).fetch(name) do
           raise Frontend::LLVMSubset::ParseError, "unknown internal register: #{name}"
         end
+      end
+
+      def value_storage(name, value_type)
+        return aggregate_register(name).fetch(:name) if aggregate_type?(value_type)
+
+        register(name)
+      end
+
+      def inline_value_storage(context, name, value_type)
+        return aggregate_register(name, context:).fetch(:name) if aggregate_type?(value_type)
+
+        inline_register(context, name)
       end
 
       def emit_puts_call(destination, raw_pointer, context: nil)
@@ -2480,10 +2676,10 @@ module PFC
 
         raw_arguments.each_char do |char|
           case char
-          when "(", "["
+          when "(", "[", "<"
             depth += 1
             current << char
-          when ")", "]"
+          when ")", "]", ">"
             depth -= 1
             current << char
           when ","
@@ -2503,7 +2699,7 @@ module PFC
       end
 
       def parsed_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64)|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         {
@@ -2517,7 +2713,7 @@ module PFC
       def parse_typed_call_arguments(raw)
         split_call_arguments(raw).map do |argument|
           stripped = argument.strip
-          if (match = stripped.match(/\A(i(?:1|8|16|32|64))\s+(.+)\z/))
+          if (match = stripped.match(/\A(i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(.+)\z/))
             next({ type: match[1], value: match[2] })
           end
           if stripped.start_with?("ptr ") || stripped.match?(/\A.+?\*\s+/)
@@ -3123,8 +3319,9 @@ module PFC
         registers.fetch(name) { raise Frontend::LLVMSubset::ParseError, "unknown register: #{name}" }
       end
 
-      def i128_high_register(name)
-        i128_high_registers.fetch(name) { raise Frontend::LLVMSubset::ParseError, "unknown i128 register: #{name}" }
+      def i128_high_register(name, context: nil)
+        high_registers = context ? context.fetch(:i128_high_values) : i128_high_registers
+        high_registers.fetch(name) { raise Frontend::LLVMSubset::ParseError, "unknown i128 register: #{name}" }
       end
 
       def alloca?(line)
