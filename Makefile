@@ -14,8 +14,9 @@ samples/clang/%.ll: samples/clang/%.c script/generate_clang_fixture.rb
 
 fixtures-check:
 	@if command -v "$(CLANG)" >/dev/null 2>&1; then \
-		$(MAKE) fixtures CLANG="$(CLANG)" RUBY="$(RUBY)"; \
-		for fixture in $(CLANG_FIXTURES); do \
+		for source in $(CLANG_FIXTURE_SOURCES); do \
+			fixture="$${source%.c}.ll"; \
+			CLANG="$(CLANG)" $(RUBY) script/generate_clang_fixture.rb --check --opt=2 "$$source" "$$fixture" || exit $$?; \
 			$(RUBY) -Ilib bin/pfc llvm-capabilities --check "$$fixture" >/dev/null || exit $$?; \
 		done; \
 	else \
