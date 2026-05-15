@@ -3,6 +3,7 @@
 require_relative "c_emitter"
 require_relative "llvm_c_emitter/aggregate_values"
 require_relative "llvm_c_emitter/intrinsics"
+require_relative "llvm_c_emitter/libc_string_functions"
 require_relative "llvm_c_emitter/pointer_memory"
 require_relative "llvm_c_emitter/source_locations"
 require_relative "llvm_c_emitter/type_layout"
@@ -15,6 +16,7 @@ module PFC
     class LLVMCEmitter
       include AggregateValues
       include Intrinsics
+      include LibCStringFunctions
       include PointerMemory
       include SourceLocations
       include TypeLayout
@@ -38,8 +40,13 @@ module PFC
         "printf" => { return_type: "i32", parameter_types: ["ptr"], varargs: true },
         "putchar" => { return_type: "i32", parameter_types: ["i32"], varargs: false },
         "puts" => { return_type: "i32", parameter_types: ["ptr"], varargs: false },
+        "strchr" => { return_type: "ptr", parameter_types: %w[ptr i32], varargs: false },
         "strcmp" => { return_type: "i32", parameter_types: %w[ptr ptr], varargs: false },
+        "strcspn" => { return_type: "i64", parameter_types: %w[ptr ptr], varargs: false },
+        "strpbrk" => { return_type: "ptr", parameter_types: %w[ptr ptr], varargs: false },
+        "strrchr" => { return_type: "ptr", parameter_types: %w[ptr i32], varargs: false },
         "strncmp" => { return_type: "i32", parameter_types: %w[ptr ptr i64], varargs: false },
+        "strspn" => { return_type: "i64", parameter_types: %w[ptr ptr], varargs: false },
         "strlen" => { return_type: "i64", parameter_types: ["ptr"], varargs: false }
       }.freeze
 
@@ -1318,6 +1325,7 @@ module PFC
 
       def emit_icmp(line)
         return emit_vector_icmp(line) if line.respond_to?(:vector_type) && line.vector_type
+        return emit_aggregate_icmp(line) if line.respond_to?(:operand_type) && aggregate_type?(line.operand_type)
 
         if line.respond_to?(:operand_type) && line.operand_type == "ptr"
           return emit_pointer_icmp(line.destination, line.predicate, line.left, line.right)
@@ -1363,6 +1371,24 @@ module PFC
         ["    #{target} = ((#{left_value}) #{operator} (#{right_value})) ? 1u : 0u;"]
       end
 
+      def emit_aggregate_icmp(line, context: nil)
+        unless %w[eq ne].include?(line.predicate)
+          raise Frontend::LLVMSubset::ParseError, "unsupported aggregate icmp predicate: #{line.predicate}"
+        end
+
+        target = context ? inline_register(context, line.destination) : register(line.destination)
+        size = type_size(line.operand_type)
+        left = aggregate_value_bytes(line.left, line.operand_type, context:) || aggregate_zero_bytes_literal(size)
+        right = aggregate_value_bytes(line.right, line.operand_type, context:) || aggregate_zero_bytes_literal(size)
+        equality = "pf_llvm_bytes_equal(#{left}, 0, #{right}, 0, #{size})"
+        expression = line.predicate == "eq" ? equality : "!(#{equality})"
+        ["    #{target} = (#{expression}) ? 1u : 0u;"]
+      end
+
+      def aggregate_zero_bytes_literal(size)
+        "(unsigned char[]){#{Array.new(size, '0u').join(', ')}}"
+      end
+
       def emit_call(line)
         call = parsed_call(line)
         validate_call_signature!(call, line)
@@ -1398,7 +1424,7 @@ module PFC
       end
 
       def emit_internal_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         destination = match[1]
@@ -1981,6 +2007,7 @@ module PFC
 
       def emit_inline_icmp(line, context)
         return emit_vector_icmp(line, context:) if line.respond_to?(:vector_type) && line.vector_type
+        return emit_aggregate_icmp(line, context:) if line.respond_to?(:operand_type) && aggregate_type?(line.operand_type)
 
         if line.respond_to?(:operand_type) && line.operand_type == "ptr"
           return emit_pointer_icmp(line.destination, line.predicate, line.left, line.right, context:)
@@ -2981,7 +3008,7 @@ module PFC
       end
 
       def parsed_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         {
@@ -2995,7 +3022,7 @@ module PFC
       def parse_typed_call_arguments(raw)
         split_call_arguments(raw).map do |argument|
           stripped = argument.strip
-          if (match = stripped.match(/\A(i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\])\s+(.+)\z/))
+          if (match = stripped.match(/\A(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\])\s+(.+)\z/))
             next({ type: match[1], value: match[2] })
           end
           if stripped.start_with?("ptr ") || stripped.match?(/\A.+?\*\s+/)
@@ -3112,7 +3139,7 @@ module PFC
       end
 
       def libc_string_memory_function?(name)
-        %w[memchr memcmp strcmp strncmp].include?(name)
+        %w[memchr memcmp strchr strcmp strcspn strpbrk strrchr strncmp strspn].include?(name)
       end
 
       def validate_noop_intrinsic_signature!(call)
@@ -3288,107 +3315,6 @@ module PFC
         end
         lines << "    }"
         lines
-      end
-
-      def emit_libc_string_memory_call(call, context: nil)
-        case call.fetch(:function_name)
-        when "memcmp" then emit_memcmp_call(call, context:)
-        when "memchr" then emit_memchr_call(call, context:)
-        when "strcmp" then emit_strcmp_call(call, nil, context:)
-        else emit_strcmp_call(call, parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(2), context:)
-        end
-      end
-
-      def emit_memcmp_call(call, context:)
-        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
-        left = memory_address(arguments.fetch(0).fetch(:value), context:)
-        right = memory_address(arguments.fetch(1).fetch(:value), context:)
-        length = scalar_value(arguments.fetch(2).fetch(:value), context:)
-        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
-        prefix = next_memory_intrinsic_prefix
-        [
-          "    {",
-          "        long long #{prefix}_left = (long long)(#{left.offset});",
-          "        long long #{prefix}_right = (long long)(#{right.offset});",
-          "        int #{prefix}_len = (int)(#{length});",
-          *dynamic_valid_address_lines(left),
-          *dynamic_valid_address_lines(right),
-          "        if (#{prefix}_left < 0 || #{prefix}_right < 0 || #{prefix}_len < 0 || #{prefix}_left + #{prefix}_len > #{left.limit} || #{prefix}_right + #{prefix}_len > #{right.limit}) {",
-          "            fprintf(stderr, \"pfc runtime error: memcmp out of range\\n\");",
-          "            PF_ABORT();",
-          "        }",
-          "        #{target} = (unsigned long long)(int)pf_llvm_bytes_compare(#{left.memory}, (int)#{prefix}_left, #{right.memory}, (int)#{prefix}_right, #{prefix}_len);",
-          "    }"
-        ]
-      end
-
-      def emit_memchr_call(call, context:)
-        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
-        source = memory_address(arguments.fetch(0).fetch(:value), context:)
-        byte = scalar_value(arguments.fetch(1).fetch(:value), context:)
-        length = scalar_value(arguments.fetch(2).fetch(:value), context:)
-        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
-        pointer_map = context ? context.fetch(:pointers) : pointers
-        pointer_map[call.fetch(:destination)] = EncodedPointer.new(value: target) if call.fetch(:destination)
-        prefix = next_memory_intrinsic_prefix
-        [
-          "    {",
-          "        unsigned long long #{prefix}_base_encoded = #{encoded_pointer_value(arguments.fetch(0).fetch(:value), context:)};",
-          "        long long #{prefix}_base = (long long)(#{source.offset});",
-          "        long long #{prefix}_len = (long long)(#{length});",
-          "        long long #{prefix}_i = 0;",
-          "        unsigned char #{prefix}_needle = (unsigned char)(#{byte});",
-          *dynamic_valid_address_lines(source),
-          "        #{target} = 0ull;",
-          "        if (#{prefix}_base < 0 || #{prefix}_len < 0 || #{prefix}_base + #{prefix}_len > #{source.limit}) {",
-          "            fprintf(stderr, \"pfc runtime error: memchr out of range\\n\");",
-          "            PF_ABORT();",
-          "        }",
-          "        for (#{prefix}_i = 0; #{prefix}_i < #{prefix}_len; #{prefix}_i++) {",
-          "            if (#{source.memory}[#{prefix}_base + #{prefix}_i] == #{prefix}_needle) {",
-          "                #{target} = (((#{prefix}_base_encoded) & (PF_LLVM_GLOBAL_POINTER_TAG | PF_LLVM_READONLY_POINTER_TAG | PF_LLVM_STRING_POINTER_TAG)) | ((unsigned long long)(#{prefix}_base + #{prefix}_i) & PF_LLVM_POINTER_OFFSET_MASK));",
-          "                break;",
-          "            }",
-          "        }",
-          "    }"
-        ]
-      end
-
-      def emit_strcmp_call(call, limit_argument, context:)
-        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
-        left = memory_address(arguments.fetch(0).fetch(:value), context:)
-        right = memory_address(arguments.fetch(1).fetch(:value), context:)
-        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
-        prefix = next_memory_intrinsic_prefix
-        limit = limit_argument ? scalar_value(limit_argument.fetch(:value), context:) : "-1"
-        [
-          "    {",
-          "        long long #{prefix}_left = (long long)(#{left.offset});",
-          "        long long #{prefix}_right = (long long)(#{right.offset});",
-          "        long long #{prefix}_limit = (long long)(#{limit});",
-          "        long long #{prefix}_i = 0;",
-          *dynamic_valid_address_lines(left),
-          *dynamic_valid_address_lines(right),
-          "        #{target} = 0ull;",
-          "        if (#{prefix}_left < 0 || #{prefix}_right < 0 || #{prefix}_left >= #{left.limit} || #{prefix}_right >= #{right.limit}) {",
-          "            fprintf(stderr, \"pfc runtime error: strcmp pointer out of range\\n\");",
-          "            PF_ABORT();",
-          "        }",
-          "        while ((#{prefix}_limit < 0 || #{prefix}_i < #{prefix}_limit) && #{prefix}_left + #{prefix}_i < #{left.limit} && #{prefix}_right + #{prefix}_i < #{right.limit}) {",
-          "            unsigned char #{prefix}_lb = #{left.memory}[#{prefix}_left + #{prefix}_i];",
-          "            unsigned char #{prefix}_rb = #{right.memory}[#{prefix}_right + #{prefix}_i];",
-          "            if (#{prefix}_lb != #{prefix}_rb || #{prefix}_lb == 0u || #{prefix}_rb == 0u) {",
-          "                #{target} = (unsigned long long)(int)((int)#{prefix}_lb - (int)#{prefix}_rb);",
-          "                break;",
-          "            }",
-          "            #{prefix}_i++;",
-          "        }",
-          "        if ((#{prefix}_limit < 0 || #{prefix}_i < #{prefix}_limit) && (#{prefix}_left + #{prefix}_i >= #{left.limit} || #{prefix}_right + #{prefix}_i >= #{right.limit})) {",
-          "            fprintf(stderr, \"pfc runtime error: strcmp missing null terminator\\n\");",
-          "            PF_ABORT();",
-          "        }",
-          "    }"
-        ]
       end
 
       def emit_memset_intrinsic(arguments, context:)

@@ -341,6 +341,7 @@ module PFC
             opcode: error.fetch(:opcode),
             line_text: error.fetch(:line_text),
             before_ir: error.fetch(:line_text),
+            before_ir_example: llvm_before_ir_example(error),
             after_ir_example: llvm_after_ir_example(error),
             reason: error.fetch(:message),
             strategy: llvm_lowering_strategy(error),
@@ -475,10 +476,28 @@ module PFC
       return "fixed_point_or_integer_domain_rewrite" if text.include?("floating-point")
       return "split_high_low_halves_or_narrow" if text.include?("i128")
       return "structured_branch_rewrite" if text.include?("blockaddress")
+      return "explicit_load_modify_store_sequence" if text.include?("atomic")
+      return "status_code_and_error_block_rewrite" if text.include?("exception handling")
+      return "fixed_signature_adapter" if text.include?("varargs")
       return "explicit_storage_materialization" if text.include?("external global")
       return "target_independent_pointer_lowering" if text.include?("address space")
 
       "manual_ir_rewrite"
+    end
+
+    def llvm_before_ir_example(error)
+      text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
+      return "%sum = add <4 x i32> %left, %right" if text.match?(/\b(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
+      return "%x = fadd float %a, %b" if text.include?("floating-point")
+      return "%wide = mul i128 %a, %b" if text.include?("i128")
+      return "%target = blockaddress(@fn, %label)" if text.include?("blockaddress")
+      return "%old = atomicrmw add ptr %slot, i32 1 monotonic" if text.include?("atomic")
+      return "%value = invoke i32 @may_fail() to label %ok unwind label %landing" if text.include?("exception handling")
+      return "%arg = va_arg ptr %ap, i32" if text.include?("varargs")
+      return "@external = external global i32" if text.include?("external global")
+      return "%cast = addrspacecast ptr addrspace(1) %device to ptr" if text.include?("address space")
+
+      error.fetch(:line_text)
     end
 
     def llvm_after_ir_example(error)
@@ -499,23 +518,23 @@ module PFC
     def llvm_lowering_confidence(error)
       text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
       return "high" if text.include?("floating-point") || text.include?("i128") || text.include?("vector") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
-      return "medium" if text.include?("blockaddress") || text.include?("address space")
+      return "medium" if text.include?("blockaddress") || text.include?("address space") || text.include?("atomic") || text.include?("exception handling") || text.include?("varargs")
 
       "low"
     end
 
     def llvm_lowering_estimated_risk(error)
       text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
-      return "high" if text.include?("floating-point") || text.include?("blockaddress") || text.include?("address space")
+      return "high" if text.include?("floating-point") || text.include?("blockaddress") || text.include?("address space") || text.include?("exception handling")
       return "medium" if text.include?("i128") || text.include?("external global")
-      return "low" if text.include?("vector") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
+      return "low" if text.include?("vector") || text.include?("atomic") || text.include?("varargs") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
 
       "medium"
     end
 
     def llvm_lowering_requires_runtime_support(error)
       text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
-      text.include?("external global") || text.include?("address space") || text.include?("blockaddress")
+      text.include?("external global") || text.include?("address space") || text.include?("blockaddress") || text.include?("exception handling")
     end
 
     def llvm_lowering_blocking(error)
@@ -900,7 +919,7 @@ module PFC
             - ptrtoint and tagged inttoptr for local/global/string pointer values
             - bitcast ptr-to-ptr
             - addrspacecast for default address-space pointers
-            - integer and pointer icmp, including null pointer equality
+            - integer, pointer, and aggregate-byte icmp equality, including null pointer equality
             - integer, pointer, and aggregate select
             - pointer phi
             - freeze
@@ -908,7 +927,7 @@ module PFC
             - aggregate byte equality/compare helpers for libc and future aggregate lowering
             - extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values
             - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks
-            - fixed-length <N x ptr> zeroinitializer, insert/extractelement, and vector select
+            - fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns
           control:
             - br, switch, scalar/pointer/i128/vector/aggregate phi, ret
             - unreachable as runtime abort
@@ -934,7 +953,7 @@ module PFC
             - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.expect.* accepted as identity intrinsic
           libc:
-            - putchar, getchar, puts, strlen, strcmp, strncmp, memcpy, memmove, memset, memcmp, memchr
+            - putchar, getchar, puts, strlen, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, memcpy, memmove, memset, memcmp, memchr
             - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags
       TEXT
     end
@@ -966,7 +985,7 @@ module PFC
           "ptrtoint and tagged inttoptr for local/global/string pointer values",
           "bitcast ptr-to-ptr",
           "addrspacecast for default address-space pointers",
-          "integer and pointer icmp, including null pointer equality",
+          "integer, pointer, and aggregate-byte icmp equality, including null pointer equality",
           "integer, pointer, and aggregate select",
           "pointer phi",
           "freeze",
@@ -974,7 +993,7 @@ module PFC
           "aggregate byte equality/compare helpers for libc and future aggregate lowering",
           "extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values",
           "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks",
-          "fixed-length <N x ptr> zeroinitializer, insert/extractelement, and vector select"
+          "fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns"
         ],
         control: [
           "br, switch, scalar/pointer/i128/vector/aggregate phi, ret",
@@ -1003,7 +1022,7 @@ module PFC
           "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [
-          "putchar, getchar, puts, strlen, strcmp, strncmp, memcpy, memmove, memset, memcmp, memchr",
+          "putchar, getchar, puts, strlen, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, memcpy, memmove, memset, memcmp, memchr",
           "static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags"
         ]
       }

@@ -19,11 +19,15 @@ class LLVMConformanceTest < Minitest::Test
     "internal_aggregate_calls.ll" => "B",
     "internal_memory_aggregate.ll" => "B",
     "internal_memory_intrinsics.ll" => "B",
+    "libc_string_search.ll" => "B",
     "libc_memory_strlen.ll" => "B",
     "libc_string_compare.ll" => "B",
     "nested_aggregate_select.ll" => "B",
+    "aggregate_icmp.ll" => "B",
+    "sret_multiple_byval_abi.ll" => "B",
     "sret_byval_abi.ll" => "B",
     "vector_add.ll" => "B",
+    "vector_pointer_abi.ll" => "B",
     "vector_pointer_lanes.ll" => "B",
     "vector_scalarized_ops.ll" => "B",
     "vector_literal.ll" => "B",
@@ -95,6 +99,7 @@ class LLVMConformanceTest < Minitest::Test
     assert_equal "rewrite_float_to_integer", plan.fetch("operations").first.fetch("strategy")
     assert_includes plan.fetch("operations").first.fetch("steps").join("\n"), "fixed-point"
     assert plan.fetch("operations").first.key?("before_ir")
+    assert plan.fetch("operations").first.key?("before_ir_example")
     assert plan.fetch("operations").first.key?("after_ir_example")
     assert plan.fetch("operations").first.key?("confidence")
     assert plan.fetch("operations").first.key?("estimated_risk")
@@ -291,14 +296,25 @@ class LLVMConformanceTest < Minitest::Test
   end
 
   def test_lowering_plan_examples_cover_unsupported_families
-    path = unsupported_path("atomic.ll")
-    out, err = capture_io do
-      assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check", "--emit-lowering-plan", path]).run
+    expected = {
+      "atomic.ll" => ["remove_or_rewrite_atomic_operation", "atomicrmw", "load i32"],
+      "exception_handling.ll" => ["lower_exception_handling_to_explicit_status_flow", "invoke", "%status"],
+      "varargs.ll" => ["replace_varargs_with_fixed_signature", "va_arg", "fixed_args"],
+      "blockaddress.ll" => ["replace_blockaddress_control_flow", "blockaddress", "br label"],
+      "external_global.ll" => ["materialize_external_global", "external global", "@external = global"],
+      "addrspace.ll" => ["lower_to_default_address_space", "addrspacecast", "addrspacecast"]
+    }
+    expected.each do |fixture, (strategy, before, after)|
+      path = unsupported_path(fixture)
+      out, err = capture_io do
+        assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check", "--emit-lowering-plan", path]).run
+      end
+      assert_empty err
+      operation = JSON.parse(out).fetch("operations").first
+      assert_equal strategy, operation.fetch("strategy")
+      assert_includes operation.fetch("before_ir_example"), before
+      assert_includes operation.fetch("after_ir_example"), after
     end
-    assert_empty err
-    operation = JSON.parse(out).fetch("operations").first
-    assert_equal "remove_or_rewrite_atomic_operation", operation.fetch("strategy")
-    assert_includes operation.fetch("after_ir_example"), "load i32"
   end
 
   def test_static_preflight_fuzz_reports_explicit_diagnostics

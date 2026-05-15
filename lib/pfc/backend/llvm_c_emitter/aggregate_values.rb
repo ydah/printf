@@ -158,14 +158,18 @@ module PFC
             raise Frontend::LLVMSubset::ParseError, "unsupported vector icmp predicate: #{line.predicate}"
           end
 
+          if vector_element_type(line.operand_vector_type) == "ptr" && !%w[eq ne].include?(line.predicate)
+            raise Frontend::LLVMSubset::ParseError, "unsupported vector pointer icmp predicate: #{line.predicate}"
+          end
+
           aggregate = aggregate_register(line.destination, context:)
           left_source = aggregate_value_bytes(line.left, line.operand_vector_type, context:)
           right_source = aggregate_value_bytes(line.right, line.operand_vector_type, context:)
-          width = byte_width(line.bits)
+          width = vector_element_width(line.operand_vector_type)
           prefix = next_aggregate_copy_prefix
           left_value = left_source ? "pf_llvm_load(#{left_source}, #{prefix}_i * #{width}, #{width})" : "0ull"
           right_value = right_source ? "pf_llvm_load(#{right_source}, #{prefix}_i * #{width}, #{width})" : "0ull"
-          if line.predicate.start_with?("s")
+          if line.bits && line.predicate.start_with?("s")
             left_value = signed_expression(left_value, line.bits)
             right_value = signed_expression(right_value, line.bits)
           end

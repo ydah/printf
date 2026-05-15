@@ -293,10 +293,22 @@ module PFC
 
               @destination = match[1]
               @predicate = match[2]
-              @bits = match[4].to_i
+              @bits = match[4].delete_prefix("i").to_i if match[4].start_with?("i")
               @operand_type = match[3]
               @operand_vector_type = match[3]
-              @vector_type = match[3].sub(/i(?:1|8|16|32|64)>\z/, "i1>")
+              @vector_type = match[3].sub(/(?:i(?:1|8|16|32|64)|ptr)>\z/, "i1>")
+              @left = operands.fetch(0)
+              @right = operands.fetch(1)
+              return
+            end
+
+            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne)\s+(#{AGGREGATE_TYPE})\s+(.+)\z/))
+              operands = Instruction.split_arguments(match[4])
+              return unless operands.length == 2
+
+              @destination = match[1]
+              @predicate = match[2]
+              @operand_type = match[3]
               @left = operands.fetch(0)
               @right = operands.fetch(1)
               return
@@ -859,7 +871,7 @@ module PFC
           if (match = stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/))
             return Array.new(match[1].to_i, match[2])
           end
-          if (match = stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/))
+          if (match = stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64)|ptr)>\z/))
             return Array.new(match[1].to_i, match[2])
           end
           return parse_struct_types.fetch(stripped) if parse_struct_types.key?(stripped)
@@ -890,7 +902,7 @@ module PFC
             element = Regexp.last_match(2)
             return type_size(element) * count
           end
-          if stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
+          if stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64)|ptr)>\z/)
             count = Regexp.last_match(1).to_i
             element = Regexp.last_match(2)
             return type_size(element) * count
