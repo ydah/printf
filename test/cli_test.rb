@@ -69,6 +69,8 @@ class CLITest < Minitest::Test
     assert_includes out, "ptrtoint"
     assert_includes out, "extractvalue"
     assert_includes out, "llvm.smax"
+    assert_includes out, "llvm.bswap"
+    assert_includes out, "addrspacecast"
     assert_includes out, "freeze"
     assert_includes out, "target datalayout"
     assert_includes out, "static printf"
@@ -88,10 +90,13 @@ class CLITest < Minitest::Test
     assert_includes capabilities.fetch("values").join("\n"), "bitcast ptr-to-ptr"
     assert_includes capabilities.fetch("values").join("\n"), "insertvalue"
     assert_includes capabilities.fetch("values").join("\n"), "llvm.abs"
+    assert_includes capabilities.fetch("values").join("\n"), "llvm.ctpop"
     assert_includes capabilities.fetch("values").join("\n"), "pointer phi"
     assert_includes capabilities.fetch("control").join("\n"), "pointer/void returns"
     assert_includes capabilities.fetch("tolerance").join("\n"), "metadata"
     assert_includes capabilities.fetch("tolerance").join("\n"), "datalayout"
+    assert_includes capabilities.fetch("tolerance").join("\n"), "inbounds/nuw/nusw"
+    assert_includes capabilities.fetch("tolerance").join("\n"), "external globals"
     assert_includes capabilities.fetch("tolerance").join("\n"), "llvm.expect"
     assert_includes capabilities.fetch("libc").join("\n"), "%p"
   end
@@ -104,6 +109,31 @@ class CLITest < Minitest::Test
 
       assert_empty err
       assert_includes out, "supported: #{path}"
+    end
+  end
+
+  def test_llvm_capabilities_check_json_reports_multiple_errors
+    Dir.mktmpdir("pfc-cli-test") do |dir|
+      path = File.join(dir, "bad.ll")
+      File.write(path, <<~LLVM)
+        define i32 @main() {
+        entry:
+          %x = fadd float 1.0, 2.0
+          %y = add <2 x i32> <i32 1, i32 2>, <i32 3, i32 4>
+          ret i32 0
+        }
+      LLVM
+
+      out, err = capture_io do
+        assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check", "--json", path]).run
+      end
+
+      assert_empty err
+      result = JSON.parse(out)
+      refute result.fetch("supported")
+      messages = result.fetch("errors").map { |error| error.fetch("message") }.join("\n")
+      assert_includes messages, "unsupported floating-point type"
+      assert_includes messages, "unsupported vector type"
     end
   end
 

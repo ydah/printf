@@ -134,13 +134,25 @@ module PFC
     def llvm_capabilities_command
       if @argv.first == "--check"
         @argv.shift
+        json = @argv.first == "--json"
+        @argv.shift if json
         path = require_input_path!
         raise ArgumentError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
         raise ArgumentError, "llvm-capabilities --check only supports LLVM inputs" unless llvm_source?(path)
 
-        Backend::LLVMCEmitter.new(File.read(path)).emit
-        puts "supported: #{path}"
-        return 0
+        result = llvm_check_result(path)
+        if json
+          puts JSON.pretty_generate(result)
+        elsif result.fetch(:supported)
+          puts "supported: #{path}"
+        else
+          puts "unsupported: #{path}"
+          result.fetch(:errors).each do |error|
+            location = error.fetch(:line) ? "#{path}:#{error.fetch(:line)}" : path
+            puts "  #{location}: #{error.fetch(:message)}"
+          end
+        end
+        return result.fetch(:supported) ? 0 : 1
       end
 
       json = @argv.first == "--json"
@@ -149,6 +161,54 @@ module PFC
 
       puts(json ? JSON.pretty_generate(llvm_capabilities_data) : llvm_capabilities)
       0
+    end
+
+    def llvm_check_result(path)
+      source = File.read(path)
+      errors = llvm_static_check_errors(source)
+      begin
+        Backend::LLVMCEmitter.new(source).emit
+      rescue Frontend::LLVMSubset::ParseError, ArgumentError => e
+        errors << { line: e.message[/\Aline (\d+):/, 1]&.to_i, message: e.message }
+      end
+      errors = errors.uniq { |error| [error.fetch(:line), error.fetch(:message)] }
+      { path:, supported: errors.empty?, errors: }
+    end
+
+    def llvm_static_check_errors(source)
+      source.each_line.with_index(1).filter_map do |raw_line, line_number|
+        line = raw_line.sub(/;.*/, "").strip
+        next if line.empty? || line == "}" || line.match?(/\A[-A-Za-z$._0-9]+:\z/)
+        next if line.match?(/\A(?:source_filename|target|attributes|![A-Za-z0-9_.-]+|declare|define)\b/)
+        next if line.match?(/\A[@%][-A-Za-z$._0-9]+\s*=/) && !line.include?(" = ")
+        message = llvm_static_unsupported_type_message(line)
+        next({ line: line_number, message: }) if message
+        next if llvm_static_supported_line?(line)
+
+        { line: line_number, message: llvm_static_check_message(line) }
+      end
+    end
+
+    def llvm_static_supported_line?(line)
+      line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?(?:alloca|getelementptr|load|store|add|sub|mul|udiv|sdiv|urem|srem|and|or|xor|shl|lshr|ashr|zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast|freeze|icmp|select|phi|call|switch|br|ret|unreachable)\b/) ||
+        line.match?(/\A[@%][-A-Za-z$._0-9]+\s*=.*\b(?:global|constant|alias)\b/)
+    end
+
+    def llvm_static_check_message(line)
+      type_message = llvm_static_unsupported_type_message(line)
+      return type_message if type_message
+      return "unsupported blockaddress constant expression" if line.include?("blockaddress")
+
+      opcode = line[/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
+      "unsupported LLVM instruction #{opcode}. Nearest supported areas: integer scalar ops, pointer ops, aggregate memory, libc calls."
+    end
+
+    def llvm_static_unsupported_type_message(line)
+      return "unsupported vector type" if line.match?(/(?:^|\s)<(?:vscale\s+x\s+)?\d+\s+x\s+[^>]+>/)
+      return "unsupported floating-point type" if line.match?(/\b(?:half|float|double|fp128|x86_fp80|ppc_fp128)\b/)
+      return "unsupported i128 type" if line.match?(/\bi128\b/)
+
+      nil
     end
 
     def parse_options
@@ -282,7 +342,7 @@ module PFC
           pfc dump-cfg INPUT
           pfc dump-c INPUT
           pfc llvm-capabilities [--json]
-          pfc llvm-capabilities --check INPUT.ll
+          pfc llvm-capabilities --check [--json] INPUT.ll
 
         Options:
           --backend=printf-c-scheduler|printf-threaded
@@ -304,7 +364,8 @@ module PFC
             - pointer load/store and pointer fields inside aggregates
             - read-only global string byte memory for load/getelementptr/ptrtoint
             - constant and dynamic getelementptr for integer, array, and struct element sizes
-            - constant-expression getelementptr pointer operands and global initializer relocations
+            - constant-expression getelementptr/bitcast/inttoptr pointer operands and global initializer relocations
+            - llvm.memcpy.inline.* over local/global memory
             - named struct alloca and struct field getelementptr
             - constant-count alloca, with dynamic-count alloca reserving tape-size capacity
             - volatile load/store accepted as backend-equivalent memory access
@@ -317,11 +378,12 @@ module PFC
             - zext/sext/trunc
             - ptrtoint and tagged inttoptr for local/global/string pointer values
             - bitcast ptr-to-ptr
+            - addrspacecast for default address-space pointers
             - integer and pointer icmp, including null pointer equality
             - integer and pointer select
             - pointer phi
             - freeze
-            - llvm.smax/smin/umax/umin and llvm.abs scalar intrinsics
+            - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
             - extractvalue and insertvalue for scalar integer fields in aggregate values
           control:
             - br, switch, phi, ret
@@ -332,9 +394,11 @@ module PFC
             - common value attributes accepted as no-ops
             - trailing LLVM metadata attachments accepted as no-ops
             - typed-pointer-style syntax accepted as ptr
+            - getelementptr inbounds/nuw/nusw/inrange flags accepted as no-op subset flags
             - target datalayout used for pointer width and struct layout
             - module-level metadata and attributes blocks accepted as no-ops
             - common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops
+            - explicit diagnostics for vector, floating-point, i128, blockaddress, external globals, and non-zero address spaces
             - llvm.assume and llvm.dbg.* accepted as no-op intrinsics
             - llvm.expect.* accepted as identity intrinsic
           libc:
@@ -352,7 +416,8 @@ module PFC
           "pointer load/store and pointer fields inside aggregates",
           "read-only global string byte memory for load/getelementptr/ptrtoint",
           "constant and dynamic getelementptr for integer, array, and struct element sizes",
-          "constant-expression getelementptr pointer operands and global initializer relocations",
+          "constant-expression getelementptr/bitcast/inttoptr pointer operands and global initializer relocations",
+          "llvm.memcpy.inline.* over local/global memory",
           "named struct alloca and struct field getelementptr",
           "constant-count alloca, with dynamic-count alloca reserving tape-size capacity",
           "volatile load/store accepted as backend-equivalent memory access",
@@ -366,11 +431,12 @@ module PFC
           "zext/sext/trunc",
           "ptrtoint and tagged inttoptr for local/global/string pointer values",
           "bitcast ptr-to-ptr",
+          "addrspacecast for default address-space pointers",
           "integer and pointer icmp, including null pointer equality",
           "integer and pointer select",
           "pointer phi",
           "freeze",
-          "llvm.smax/smin/umax/umin and llvm.abs scalar intrinsics",
+          "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
           "extractvalue and insertvalue for scalar integer fields in aggregate values"
         ],
         control: [
@@ -383,9 +449,11 @@ module PFC
           "common value attributes accepted as no-ops",
           "trailing LLVM metadata attachments accepted as no-ops",
           "typed-pointer-style syntax accepted as ptr",
+          "getelementptr inbounds/nuw/nusw/inrange flags accepted as no-op subset flags",
           "target datalayout used for pointer width and struct layout",
           "module-level metadata and attributes blocks accepted as no-ops",
           "common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops",
+          "explicit diagnostics for vector, floating-point, i128, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume and llvm.dbg.* accepted as no-op intrinsics",
           "llvm.expect.* accepted as identity intrinsic"
         ],
