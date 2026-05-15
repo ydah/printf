@@ -136,7 +136,10 @@ module PFC
       check_dir = false
       emit_lowering_plan = false
       explain = false
+      exclude_patterns = []
+      fail_on_warning = false
       fix_suggestions = false
+      include_patterns = []
       json = false
       while @argv.first&.start_with?("--")
         case @argv.first
@@ -154,6 +157,15 @@ module PFC
         when "--emit-lowering-plan"
           check = true
           emit_lowering_plan = true
+        when "--fail-on-warning"
+          check = true
+          fail_on_warning = true
+        when /\A--include=(.+)\z/
+          check = true
+          include_patterns << Regexp.last_match(1)
+        when /\A--exclude=(.+)\z/
+          check = true
+          exclude_patterns << Regexp.last_match(1)
         when "--json"
           json = true
         else
@@ -165,12 +177,13 @@ module PFC
       if check
         path = require_input_path!
         raise ArgumentError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
+        raise ArgumentError, "--include/--exclude are only supported with --check-dir" if !check_dir && (!include_patterns.empty? || !exclude_patterns.empty?)
         if check_dir
           raise ArgumentError, "llvm-capabilities --check-dir requires a directory" unless File.directory?(path)
-          result = llvm_check_directory_result(path)
+          result = llvm_check_directory_result(path, include_patterns:, exclude_patterns:, fail_on_warning:)
         else
           raise ArgumentError, "llvm-capabilities --check only supports LLVM inputs" unless llvm_source?(path)
-          result = llvm_check_result(path)
+          result = llvm_check_result(path, fail_on_warning:)
         end
 
         if emit_lowering_plan
@@ -179,19 +192,21 @@ module PFC
           puts JSON.pretty_generate(result)
         elsif result.fetch(:supported)
           puts "supported: #{path}"
+          print_llvm_check_summary(result) if result.key?(:summary)
         elsif result.key?(:files)
           puts "unsupported: #{path}"
+          print_llvm_check_summary(result)
           result.fetch(:files).reject { |file| file.fetch(:supported) }.each do |file|
             file.fetch(:errors).each do |error|
               location = error.fetch(:line) ? "#{file.fetch(:path)}:#{error.fetch(:line)}" : file.fetch(:path)
-              puts "  #{location}: #{error.fetch(:message)}"
+              puts "  #{location}: [#{error.fetch(:severity)}] #{error.fetch(:message)}"
             end
           end
         else
           puts "unsupported: #{path}"
           result.fetch(:errors).each do |error|
             location = error.fetch(:line) ? "#{path}:#{error.fetch(:line)}" : path
-            puts "  #{location}: #{error.fetch(:message)}"
+            puts "  #{location}: [#{error.fetch(:severity)}] #{error.fetch(:message)}"
             if explain
               puts "    opcode: #{error.fetch(:opcode) || 'unknown'}"
               puts "    hint: #{error.fetch(:hint)}"
@@ -213,23 +228,65 @@ module PFC
       0
     end
 
-    def llvm_check_result(path)
+    def llvm_check_result(path, fail_on_warning: false)
       source = File.read(path)
-      errors = llvm_static_check_errors(source)
+      diagnostics = llvm_static_check_errors(source)
       begin
         Backend::LLVMCEmitter.new(source).emit
       rescue Frontend::LLVMSubset::ParseError, ArgumentError => e
         line = e.message[/\Aline (\d+):/, 1]&.to_i
         line_text = line ? source.lines.fetch(line - 1, "").strip : nil
-        errors << llvm_check_diagnostic(line:, line_text:, message: e.message)
+        diagnostics << llvm_check_diagnostic(line:, line_text:, message: e.message)
       end
-      errors = errors.uniq { |error| [error.fetch(:line), error.fetch(:message)] }
-      { schema_version: 1, path:, supported: errors.empty?, errors: }
+      diagnostics = diagnostics.uniq { |diagnostic| [diagnostic.fetch(:line), diagnostic.fetch(:severity), diagnostic.fetch(:message)] }
+      errors = diagnostics.select { |diagnostic| diagnostic.fetch(:severity) == "error" }
+      warnings = diagnostics.select { |diagnostic| diagnostic.fetch(:severity) == "warning" }
+      supported = errors.empty? && (!fail_on_warning || warnings.empty?)
+      {
+        schema_version: 1,
+        path:,
+        supported:,
+        summary: llvm_check_summary([{ supported:, errors:, diagnostics: }]),
+        diagnostics:,
+        errors:
+      }
     end
 
-    def llvm_check_directory_result(path)
-      files = Dir.glob(File.join(path, "**", "*.ll")).sort.map { |file| llvm_check_result(file) }
-      { schema_version: 1, path:, supported: files.all? { |file| file.fetch(:supported) }, files: }
+    def llvm_check_directory_result(path, include_patterns: [], exclude_patterns: [], fail_on_warning: false)
+      files = Dir.glob(File.join(path, "**", "*.ll")).sort.filter_map do |file|
+        relative = file.delete_prefix("#{path}/")
+        next unless llvm_check_directory_file_included?(relative, include_patterns, exclude_patterns)
+
+        llvm_check_result(file, fail_on_warning:)
+      end
+      summary = llvm_check_summary(files)
+      supported = files.all? { |file| file.fetch(:supported) }
+      { schema_version: 1, path:, supported:, summary:, files: }
+    end
+
+    def llvm_check_directory_file_included?(relative, include_patterns, exclude_patterns)
+      included = include_patterns.empty? || include_patterns.any? { |pattern| File.fnmatch?(pattern, relative, File::FNM_PATHNAME) }
+      excluded = exclude_patterns.any? { |pattern| File.fnmatch?(pattern, relative, File::FNM_PATHNAME) }
+      included && !excluded
+    end
+
+    def llvm_check_summary(files)
+      diagnostics = files.flat_map { |file| file.fetch(:diagnostics, []) }
+      errors = files.flat_map { |file| file.fetch(:errors, []) }
+      warnings = diagnostics.select { |diagnostic| diagnostic.fetch(:severity) == "warning" }
+      {
+        files: files.length,
+        supported_files: files.count { |file| file.fetch(:supported, false) },
+        unsupported_files: files.count { |file| !file.fetch(:supported, false) },
+        diagnostics: diagnostics.length,
+        errors: errors.length,
+        warnings: warnings.length
+      }
+    end
+
+    def print_llvm_check_summary(result)
+      summary = result.fetch(:summary)
+      puts "summary: files=#{summary.fetch(:files)} supported=#{summary.fetch(:supported_files)} unsupported=#{summary.fetch(:unsupported_files)} errors=#{summary.fetch(:errors)} warnings=#{summary.fetch(:warnings)}"
     end
 
     def llvm_lowering_plan(result)
@@ -238,6 +295,7 @@ module PFC
           schema_version: 1,
           path: result.fetch(:path),
           supported: result.fetch(:supported),
+          summary: result.fetch(:summary),
           files: result.fetch(:files).map { |file| llvm_lowering_plan(file) }
         }
       end
@@ -256,7 +314,10 @@ module PFC
             after_ir_example: llvm_after_ir_example(error),
             reason: error.fetch(:message),
             strategy: llvm_lowering_strategy(error),
+            replacement_strategy: llvm_lowering_replacement_strategy(error),
             confidence: llvm_lowering_confidence(error),
+            estimated_risk: llvm_lowering_estimated_risk(error),
+            requires_runtime_support: llvm_lowering_requires_runtime_support(error),
             blocking: llvm_lowering_blocking(error),
             steps: error.fetch(:fix_suggestions)
           }
@@ -266,7 +327,7 @@ module PFC
 
     def llvm_lowering_strategy(error)
       text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
-      return "scalarize_vector_arithmetic" if text.match?(/\b(add|sub|mul|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
+      return "scalarize_vector_arithmetic" if text.match?(/\b(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
       return "rewrite_float_to_integer" if text.include?("floating-point")
       return "narrow_or_restrict_i128" if text.include?("i128")
       return "replace_blockaddress_control_flow" if text.include?("blockaddress")
@@ -276,9 +337,21 @@ module PFC
       "manual_lowering_required"
     end
 
+    def llvm_lowering_replacement_strategy(error)
+      text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
+      return "lane_by_lane_scalar_ir" if text.include?("vector") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
+      return "fixed_point_or_integer_domain_rewrite" if text.include?("floating-point")
+      return "split_high_low_halves_or_narrow" if text.include?("i128")
+      return "structured_branch_rewrite" if text.include?("blockaddress")
+      return "explicit_storage_materialization" if text.include?("external global")
+      return "target_independent_pointer_lowering" if text.include?("address space")
+
+      "manual_ir_rewrite"
+    end
+
     def llvm_after_ir_example(error)
       text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
-      return "%lane = extractelement <N x iM> %vector, i32 0\n%sum = add iM %lane, %other_lane\n%next = insertelement <N x iM> %acc, iM %sum, i32 0" if text.match?(/\b(add|sub|mul|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
+      return "%lane = extractelement <N x iM> %vector, i32 0\n%sum = add iM %lane, %other_lane\n%next = insertelement <N x iM> %acc, iM %sum, i32 0" if text.match?(/\b(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
       return "%fixed = call i32 @fixed_point_lowered(...)" if text.include?("floating-point")
       return "%narrow = trunc i128 %wide to i64" if text.include?("i128")
       return "br label %target" if text.include?("blockaddress")
@@ -288,10 +361,24 @@ module PFC
 
     def llvm_lowering_confidence(error)
       text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
-      return "high" if text.include?("floating-point") || text.include?("i128") || text.include?("vector")
+      return "high" if text.include?("floating-point") || text.include?("i128") || text.include?("vector") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
       return "medium" if text.include?("blockaddress") || text.include?("address space")
 
       "low"
+    end
+
+    def llvm_lowering_estimated_risk(error)
+      text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
+      return "high" if text.include?("floating-point") || text.include?("blockaddress") || text.include?("address space")
+      return "medium" if text.include?("i128") || text.include?("external global")
+      return "low" if text.include?("vector") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
+
+      "medium"
+    end
+
+    def llvm_lowering_requires_runtime_support(error)
+      text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
+      text.include?("external global") || text.include?("address space") || text.include?("blockaddress")
     end
 
     def llvm_lowering_blocking(error)
@@ -308,6 +395,9 @@ module PFC
         next if line.match?(/\A[@%][-A-Za-z$._0-9]+\s*=/) && !line.include?(" = ")
         message = llvm_static_unsupported_type_message(line)
         next(llvm_check_diagnostic(line: line_number, line_text: line, message:)) if message
+        if line.match?(/\bvolatile\b/) && line.match?(/\A(?:#{PFC::Backend::LLVMCEmitter::NAME}\s*=\s*)?(?:load|store)\b/)
+          next llvm_check_diagnostic(line: line_number, line_text: line, message: "volatile memory access is accepted as backend-equivalent, not target-volatile")
+        end
         next if llvm_static_supported_line?(line)
 
         llvm_check_diagnostic(line: line_number, line_text: line, message: llvm_static_check_message(line))
@@ -333,15 +423,18 @@ module PFC
       text[/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
     end
 
-    def llvm_diagnostic_severity(_message, _line_text)
+    def llvm_diagnostic_severity(message, line_text)
+      text = [message, line_text].compact.join("\n")
+      return "warning" if text.include?("backend-equivalent") || text.match?(/\bvolatile\b/)
+
       "error"
     end
 
     def llvm_diagnostic_hint(message, line_text)
       text = [message, line_text].compact.join("\n")
-      return "Use supported fixed-length integer vector operations or explicitly lower vectors to scalar code." if text.include?("vector")
+      return "Use supported fixed-length integer vector operations or explicitly lower vectors to scalar code." if text.include?("vector") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
       return "Lower floating-point operations to integer code before invoking pfc." if text.include?("floating-point")
-      return "Use only i128 load/store, zeroinitializer, bitwise and/or/xor, unsigned comparisons, eq/ne, or truncation to a supported integer width." if text.include?("i128")
+      return "Use only supported i128 load/store, zeroinitializer, add/sub, bitwise and/or/xor, signed/unsigned comparisons, select, zext/sext, or truncation to a supported integer width." if text.include?("i128")
       return "blockaddress is outside the subset; use normal labels and branches." if text.include?("blockaddress")
       return "Provide a definition for the global or replace it with a supported local/global pointer." if text.include?("external global")
       return "Only the default address space is supported." if text.include?("address space")
@@ -351,9 +444,9 @@ module PFC
 
     def llvm_diagnostic_explanation(message, line_text)
       text = [message, line_text].compact.join("\n")
-      return "Scalable vectors and non-integer vector lanes do not have a stable byte layout in this subset." if text.include?("scalable vector") || text.include?("unsupported vector")
+      return "Scalable vectors, non-integer vector lanes, and unsupported vector opcodes do not have a stable lowering in this subset." if text.include?("scalable vector") || text.include?("unsupported vector") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
       return "The backend models integer operations with unsigned host scalars, so floating-point semantics are intentionally not lowered." if text.include?("floating-point")
-      return "i128 is represented as low and high 64-bit halves for memory movement, bitwise operations, unsigned comparisons, and narrowing." if text.include?("i128")
+      return "i128 is represented as low and high 64-bit halves for memory movement, add/sub, bitwise operations, signed/unsigned comparisons, selection, extension, and narrowing." if text.include?("i128")
       return "blockaddress exposes function-local control-flow addresses, which the generated C scheduler does not model." if text.include?("blockaddress")
       return "Declaration-only globals would require linker/runtime storage that this standalone C emitter cannot allocate safely." if text.include?("external global")
       return "Non-zero address spaces require target-specific pointer provenance that is outside the portable C backend." if text.include?("address space")
@@ -363,14 +456,14 @@ module PFC
 
     def llvm_fix_suggestions(message, line_text)
       text = [message, line_text].compact.join("\n")
-      if text.match?(/\b(add|sub|mul|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
+      if text.match?(/\b(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
         return [
           "replace vector arithmetic with extractelement per lane, scalar operations, and insertelement reconstruction",
           "or compile the source without vectorization before passing LLVM IR to pfc"
         ]
       end
       return ["rewrite floating-point work as integer or fixed-point operations before LLVM lowering"] if text.include?("floating-point")
-      return ["truncate i128 to i64 before unsupported operations, or keep it limited to load/store, and/or/xor, unsigned comparisons, eq/ne, and trunc"] if text.include?("i128")
+      return ["truncate i128 to i64 before unsupported operations, or keep it limited to load/store, add/sub, and/or/xor, signed/unsigned comparisons, select, zext/sext, and trunc"] if text.include?("i128")
       return ["replace blockaddress with explicit labels and branch/switch control flow"] if text.include?("blockaddress")
       return ["define the global in the module or pass the data through supported local/global storage"] if text.include?("external global")
       return ["lower non-zero address-space pointers to default address-space pointers before pfc"] if text.include?("address space")
@@ -531,7 +624,7 @@ module PFC
           pfc dump-c INPUT
           pfc llvm-capabilities [--json]
           pfc llvm-capabilities --check [--json] [--fix-suggestions] [--emit-lowering-plan] INPUT.ll
-          pfc llvm-capabilities --check-dir [--json] [--emit-lowering-plan] DIR
+          pfc llvm-capabilities --check-dir [--json] [--emit-lowering-plan] [--include=GLOB] [--exclude=GLOB] [--fail-on-warning] DIR
           pfc llvm-capabilities --explain INPUT.ll
 
         Options:
@@ -567,7 +660,7 @@ module PFC
             - add/sub/mul, signed/unsigned division and remainder
             - bitwise and/or/xor, shl/lshr/ashr
             - zext/sext/trunc, including trunc from i128 to supported integer widths
-            - limited i128 zeroinitializer, and/or/xor, eq/ne, and unsigned comparisons with high 64-bit preservation
+            - limited i128 zeroinitializer, add/sub, and/or/xor, eq/ne, signed/unsigned comparisons, select, zext/sext, and truncation with high 64-bit preservation
             - ptrtoint and tagged inttoptr for local/global/string pointer values
             - bitcast ptr-to-ptr
             - addrspacecast for default address-space pointers
@@ -577,7 +670,7 @@ module PFC
             - freeze
             - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
             - extractvalue and insertvalue for scalar integer fields in aggregate values
-            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/and/or/xor scalarization, extractelement, and insertelement with runtime index checks
+            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks
           control:
             - br, switch, phi, ret
             - unreachable as runtime abort
@@ -592,8 +685,9 @@ module PFC
             - module-level metadata and attributes blocks accepted as no-ops
             - common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops
             - llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals
-            - llvm-capabilities --check reports schema_version plus multi-error diagnostics with severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode
-            - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance
+            - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode
+            - llvm-capabilities --check-dir supports summary counts, include/exclude globs, and fail-on-warning
+            - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
             - explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces
             - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.expect.* accepted as identity intrinsic
@@ -626,7 +720,7 @@ module PFC
           "add/sub/mul, signed/unsigned division and remainder",
           "bitwise and/or/xor, shl/lshr/ashr",
           "zext/sext/trunc, including trunc from i128 to supported integer widths",
-          "limited i128 zeroinitializer, and/or/xor, eq/ne, and unsigned comparisons with high 64-bit preservation",
+          "limited i128 zeroinitializer, add/sub, and/or/xor, eq/ne, signed/unsigned comparisons, select, zext/sext, and truncation with high 64-bit preservation",
           "ptrtoint and tagged inttoptr for local/global/string pointer values",
           "bitcast ptr-to-ptr",
           "addrspacecast for default address-space pointers",
@@ -636,7 +730,7 @@ module PFC
           "freeze",
           "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
           "extractvalue and insertvalue for scalar integer fields in aggregate values",
-          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/and/or/xor scalarization, extractelement, and insertelement with runtime index checks"
+          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks"
         ],
         control: [
           "br, switch, phi, ret",
@@ -653,8 +747,9 @@ module PFC
           "module-level metadata and attributes blocks accepted as no-ops",
           "common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops",
           "llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals",
-          "llvm-capabilities --check reports schema_version plus multi-error diagnostics with severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode",
-          "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance",
+          "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode",
+          "llvm-capabilities --check-dir supports summary counts, include/exclude globs, and fail-on-warning",
+          "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
           "explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.expect.* accepted as identity intrinsic"

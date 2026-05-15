@@ -11,7 +11,9 @@ class LLVMConformanceTest < Minitest::Test
 
   SUPPORTED_FIXTURES = {
     "minimal_return.ll" => "",
+    "i128_add_signed_cmp.ll" => "B",
     "vector_add.ll" => "B",
+    "vector_scalarized_ops.ll" => "B",
     "vector_literal.ll" => "B",
     "i128_high_bits.ll" => "B"
   }.freeze
@@ -21,7 +23,7 @@ class LLVMConformanceTest < Minitest::Test
     "blockaddress.ll" => "unsupported blockaddress constant expression",
     "external_global.ll" => "unsupported external global reference",
     "float_add.ll" => "unsupported floating-point type",
-    "vector_add.ll" => "unsupported LLVM instruction mul"
+    "vector_add.ll" => "unsupported LLVM instruction udiv"
   }.freeze
 
   def test_supported_conformance_fixtures_compile_and_pass_preflight
@@ -79,6 +81,9 @@ class LLVMConformanceTest < Minitest::Test
     assert plan.fetch("operations").first.key?("before_ir")
     assert plan.fetch("operations").first.key?("after_ir_example")
     assert plan.fetch("operations").first.key?("confidence")
+    assert plan.fetch("operations").first.key?("estimated_risk")
+    assert plan.fetch("operations").first.key?("replacement_strategy")
+    assert plan.fetch("operations").first.key?("requires_runtime_support")
     assert plan.fetch("operations").first.key?("blocking")
   end
 
@@ -89,7 +94,43 @@ class LLVMConformanceTest < Minitest::Test
 
     assert_empty err
     assert_includes out, "unsupported:"
+    assert_includes out, "summary:"
     assert_includes out, "float_add.ll"
+  end
+
+  def test_check_dir_json_summary_filters_and_fail_on_warning
+    Dir.mktmpdir("pfc-check-dir") do |dir|
+      File.write(File.join(dir, "warn.ll"), <<~LLVM)
+        define i32 @main() {
+        entry:
+          %slot = alloca i32, align 4
+          store volatile i32 0, ptr %slot, align 4
+          %value = load volatile i32, ptr %slot, align 4
+          ret i32 %value
+        }
+      LLVM
+      File.write(File.join(dir, "skip.ll"), <<~LLVM)
+        define i32 @main() {
+        entry:
+          %x = fadd float 1.0, 2.0
+          ret i32 0
+        }
+      LLVM
+
+      out, err = capture_io do
+        assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--json", "--include=warn.ll", dir]).run
+      end
+      assert_empty err
+      result = JSON.parse(out)
+      assert result.fetch("supported")
+      assert_equal 1, result.fetch("summary").fetch("files")
+      assert_equal 2, result.fetch("summary").fetch("warnings")
+
+      _out, err = capture_io do
+        assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--json", "--include=warn.ll", "--fail-on-warning", dir]).run
+      end
+      assert_empty err
+    end
   end
 
   def test_static_preflight_fuzz_reports_explicit_diagnostics

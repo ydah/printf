@@ -241,7 +241,7 @@ module PFC
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|and|or|xor)((?:\s+(?:nuw|nsw|exact))*)\s+(<\d+\s+x\s+i(8|16|32|64)>)\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|mul|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact))*)\s+(<\d+\s+x\s+i(8|16|32|64)>)\s+(.+)\z/))
               operands = Instruction.split_arguments(match[6])
               return unless operands.length == 2
 
@@ -256,7 +256,7 @@ module PFC
               return
             end
 
-            if (match = text.match(/\A(#{NAME})\s*=\s*(and|or|xor)\s+i128\s+(.+?),\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|and|or|xor)\s+i128\s+(.+?),\s+(.+)\z/))
               @destination = match[1]
               @operator = match[2]
               @flags = [].freeze
@@ -281,11 +281,26 @@ module PFC
         end
 
         class ICmpInstruction < Instruction
-          attr_reader :bits, :destination, :left, :operand_type, :predicate, :right
+          attr_reader :bits, :destination, :left, :operand_type, :operand_vector_type, :predicate, :right, :vector_type
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule)\s+i128\s+(.+?),\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+(<\d+\s+x\s+i(1|8|16|32|64)>)\s+(.+)\z/))
+              operands = Instruction.split_arguments(match[5])
+              return unless operands.length == 2
+
+              @destination = match[1]
+              @predicate = match[2]
+              @bits = match[4].to_i
+              @operand_type = match[3]
+              @operand_vector_type = match[3]
+              @vector_type = match[3].sub(/i(?:1|8|16|32|64)>\z/, "i1>")
+              @left = operands.fetch(0)
+              @right = operands.fetch(1)
+              return
+            end
+
+            if (match = text.match(/\A(#{NAME})\s*=\s*icmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s+i128\s+(.+?),\s+(.+)\z/))
               @destination = match[1]
               @predicate = match[2]
               @bits = 128
@@ -317,10 +332,28 @@ module PFC
         end
 
         class SelectInstruction < Instruction
-          attr_reader :bits, :condition, :destination, :false_value, :true_value, :value_type
+          attr_reader :bits, :condition, :condition_type, :destination, :false_value, :true_value, :value_type, :vector_type
 
           def initialize(text)
             super
+            if (match = text.match(/\A(#{NAME})\s*=\s*select\s+(<\d+\s+x\s+i1>)\s+(.+)\z/))
+              operands = Instruction.split_arguments(match[3])
+              return unless operands.length == 3
+              true_match = operands.fetch(1).match(/\A(<\d+\s+x\s+i(1|8|16|32|64)>)\s+(.+)\z/)
+              false_match = operands.fetch(2).match(/\A#{Regexp.escape(true_match[1])}\s+(.+)\z/) if true_match
+              return unless true_match && false_match
+
+              @destination = match[1]
+              @condition_type = match[2]
+              @condition = operands.fetch(0)
+              @bits = true_match[2].to_i
+              @value_type = true_match[1]
+              @vector_type = true_match[1]
+              @true_value = true_match[3]
+              @false_value = false_match[1]
+              return
+            end
+
             if (match = text.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i128\s+(.+?),\s+i128\s+(.+)\z/))
               @destination = match[1]
               @condition = match[2]
