@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ydah/printf/blob/main/docs/llvm-capabilities.schema.json",
+  "title": "pfc llvm-capabilities check result",
+  "type": "object",
+  "required": ["schema_version", "path", "policy", "supported", "summary", "diagnostics", "errors"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "path": { "type": "string" },
+    "policy": {
+      "type": "object",
+      "required": ["fail_on", "max_warnings"],
+      "properties": {
+        "fail_on": { "enum": ["error", "warning", "none"] },
+        "max_warnings": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "supported": { "type": "boolean" },
+    "summary": {
+      "type": "object",
+      "required": ["files", "supported_files", "unsupported_files", "diagnostics", "errors", "warnings"],
+      "properties": {
+        "files": { "type": "integer", "minimum": 0 },
+        "supported_files": { "type": "integer", "minimum": 0 },
+        "unsupported_files": { "type": "integer", "minimum": 0 },
+        "diagnostics": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "warnings": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diagnostic" }
+    },
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diagnostic" }
+    }
+  },
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "required": ["severity", "line", "opcode", "message", "hint", "explanation", "fix_suggestions", "line_text"],
+      "properties": {
+        "severity": { "enum": ["error", "warning", "info"] },
+        "line": { "type": ["integer", "null"], "minimum": 1 },
+        "opcode": { "type": ["string", "null"] },
+        "message": { "type": "string" },
+        "hint": { "type": "string" },
+        "explanation": { "type": "string" },
+        "fix_suggestions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "line_text": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -276,6 +276,11 @@ module PFC
             aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(match[1]), type: match[1] }
             next
           end
+          if line.respond_to?(:destination) && line.respond_to?(:aggregate_type) && line.destination == lhs &&
+             line.to_s.match?(/\A#{Regexp.escape(lhs)}\s*=\s*insertvalue\b/)
+            aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(line.aggregate_type), type: line.aggregate_type }
+            next
+          end
           if line.respond_to?(:destination) && line.respond_to?(:value_type) && line.destination == lhs && aggregate_type?(line.value_type)
             aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(line.value_type), type: line.value_type }
             next
@@ -288,6 +293,18 @@ module PFC
 
           if line.respond_to?(:destination) && line.respond_to?(:return_type) && line.destination == lhs && aggregate_type?(line.return_type)
             aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(line.return_type), type: line.return_type }
+            next
+          end
+          if line.respond_to?(:destination) && line.respond_to?(:aggregate_type) && line.respond_to?(:indices) &&
+             line.destination == lhs && line.to_s.match?(/\A#{Regexp.escape(lhs)}\s*=\s*extractvalue\b/)
+            _offset, extracted_type = aggregate_index_info(line.aggregate_type, line.indices)
+            if aggregate_type?(extracted_type)
+              aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(extracted_type), type: extracted_type }
+              next
+            end
+            registers[lhs] = c_value_name(lhs)
+            i128_high_registers[lhs] = "#{c_value_name(lhs)}_hi" if extracted_type == "i128"
+            pointers[lhs] = EncodedPointer.new(value: registers.fetch(lhs)) if pointer_type_name?(extracted_type)
             next
           end
 
@@ -995,6 +1012,26 @@ module PFC
           pointer_map[line.destination] = EncodedPointer.new(value: target)
           return ["    #{target} = pf_llvm_load(#{aggregate.fetch(:name)}, #{offset}, #{pointer_size});"]
         end
+        if value_type == "i128"
+          target = context ? inline_register(context, line.destination) : register(line.destination)
+          high_target = i128_high_register(line.destination, context:)
+          return [
+            "    #{target} = pf_llvm_load(#{aggregate.fetch(:name)}, #{offset}, 8);",
+            "    #{high_target} = pf_llvm_load(#{aggregate.fetch(:name)}, #{offset} + 8, 8);"
+          ]
+        end
+        if aggregate_type?(value_type)
+          target = aggregate_register(line.destination, context:)
+          prefix = next_aggregate_copy_prefix
+          return [
+            "    {",
+            "        int #{prefix}_i = 0;",
+            "        for (#{prefix}_i = 0; #{prefix}_i < #{target.fetch(:size)}; #{prefix}_i++) {",
+            "            #{target.fetch(:name)}[#{prefix}_i] = #{aggregate.fetch(:name)}[#{offset} + #{prefix}_i];",
+            "        }",
+            "    }"
+          ]
+        end
         unless value_type.match?(/\Ai(?:1|8|16|32|64)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported extractvalue result type: #{value_type}"
         end
@@ -1063,6 +1100,37 @@ module PFC
             "            #{aggregate.fetch(:name)}[#{copy_prefix}_i] = #{source ? "#{source}[#{copy_prefix}_i]" : '0u'};",
             "        }",
             "        pf_llvm_store(#{aggregate.fetch(:name)}, #{offset}, #{encoded}, #{pointer_size});",
+            "    }"
+          ]
+        end
+        if value_type == "i128"
+          copy_prefix = next_aggregate_copy_prefix
+          low = i128_low64_value(line.value, context:)
+          high = i128_high64_value(line.value, context:)
+          return [
+            "    {",
+            "        int #{copy_prefix}_i = 0;",
+            "        for (#{copy_prefix}_i = 0; #{copy_prefix}_i < #{aggregate.fetch(:size)}; #{copy_prefix}_i++) {",
+            "            #{aggregate.fetch(:name)}[#{copy_prefix}_i] = #{source ? "#{source}[#{copy_prefix}_i]" : '0u'};",
+            "        }",
+            "        pf_llvm_store(#{aggregate.fetch(:name)}, #{offset}, #{low}, 8);",
+            "        pf_llvm_store(#{aggregate.fetch(:name)}, #{offset} + 8, #{high}, 8);",
+            "    }"
+          ]
+        end
+        if aggregate_type?(value_type)
+          copy_prefix = next_aggregate_copy_prefix
+          inserted = aggregate_value_bytes(line.value, value_type, context:)
+          size = type_size(value_type)
+          return [
+            "    {",
+            "        int #{copy_prefix}_i = 0;",
+            "        for (#{copy_prefix}_i = 0; #{copy_prefix}_i < #{aggregate.fetch(:size)}; #{copy_prefix}_i++) {",
+            "            #{aggregate.fetch(:name)}[#{copy_prefix}_i] = #{source ? "#{source}[#{copy_prefix}_i]" : '0u'};",
+            "        }",
+            "        for (#{copy_prefix}_i = 0; #{copy_prefix}_i < #{size}; #{copy_prefix}_i++) {",
+            "            #{aggregate.fetch(:name)}[#{offset} + #{copy_prefix}_i] = #{inserted ? "#{inserted}[#{copy_prefix}_i]" : '0u'};",
+            "        }",
             "    }"
           ]
         end
@@ -2142,6 +2210,16 @@ module PFC
             target: register(line.destination)
           }
         end
+        if line.respond_to?(:incoming) && line.incoming && line.respond_to?(:value_type) && aggregate_type?(line.value_type)
+          value = line.incoming.find { |_value, label| label == from_label }&.first
+          return nil if value.nil?
+
+          return {
+            source: aggregate_value_bytes(value, line.value_type),
+            size: type_size(line.value_type),
+            target_aggregate: aggregate_register(line.destination)
+          }
+        end
 
         match = line.match(/\A(#{NAME})\s*=\s*phi\s+i(1|8|16|32|64)\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported phi: #{line}" unless match
@@ -2207,6 +2285,16 @@ module PFC
           return {
             expression: "#{unsigned_cast(line.bits)}((#{inline_value(value, context)}) & #{integer_mask_literal(line.bits)})",
             target: inline_register(context, line.destination)
+          }
+        end
+        if line.respond_to?(:incoming) && line.incoming && line.respond_to?(:value_type) && aggregate_type?(line.value_type)
+          value = line.incoming.find { |_value, label| label == from_label }&.first
+          return nil if value.nil?
+
+          return {
+            source: aggregate_value_bytes(value, line.value_type, context:),
+            size: type_size(line.value_type),
+            target_aggregate: aggregate_register(line.destination, context:)
           }
         end
 
@@ -3413,6 +3501,10 @@ module PFC
         return "unsupported floating-point type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/\b(?:half|float|double|fp128|x86_fp80|ppc_fp128)\b/)
         return "unsupported i128 type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/\bi128\b/)
         return "unsupported blockaddress constant expression: #{line}" if line.to_s.include?("blockaddress")
+        return "unsupported LLVM instruction #{opcode}: #{line}. Run `pfc llvm-capabilities --check FILE.ll` to preflight a file. (unsupported atomic operation)" if line.to_s.match?(/\b(?:fence|atomicrmw|cmpxchg)\b/)
+        return "unsupported exception handling instruction: #{line}" if line.to_s.match?(/\b(?:invoke|landingpad|resume|catchswitch|catchpad|cleanuppad|cleanupret|catchret)\b/)
+        return "unsupported vector shuffle instruction: #{line}" if line.to_s.match?(/\bshufflevector\b/)
+        return "unsupported varargs instruction: #{line}" if line.to_s.match?(/\bva_arg\b/)
 
         "unsupported LLVM instruction #{opcode}: #{line}. Run `pfc llvm-capabilities` for the supported subset or `pfc llvm-capabilities --check FILE.ll` to preflight a file."
       end

@@ -10,11 +10,14 @@ class LLVMConformanceTest < Minitest::Test
   SNAPSHOT_ROOT = File.expand_path("fixtures/c_snapshots", __dir__)
 
   SUPPORTED_FIXTURES = {
+    "aggregate_phi_fields.ll" => "B",
+    "internal_array_abi.ll" => "B",
     "minimal_return.ll" => "",
     "i128_add_signed_cmp.ll" => "B",
     "i128_shift_phi.ll" => "B",
     "internal_aggregate_calls.ll" => "B",
     "internal_memory_aggregate.ll" => "B",
+    "internal_memory_intrinsics.ll" => "B",
     "vector_add.ll" => "B",
     "vector_scalarized_ops.ll" => "B",
     "vector_literal.ll" => "B",
@@ -23,10 +26,14 @@ class LLVMConformanceTest < Minitest::Test
 
   UNSUPPORTED_FIXTURES = {
     "addrspace.ll" => "unsupported non-zero address space cast",
+    "atomic.ll" => "unsupported atomic operation",
     "blockaddress.ll" => "unsupported blockaddress constant expression",
+    "exception_handling.ll" => "unsupported exception handling instruction",
     "external_global.ll" => "unsupported external global reference",
     "float_add.ll" => "unsupported floating-point type",
-    "vector_add.ll" => "unsupported LLVM instruction shufflevector"
+    "varargs.ll" => "unsupported varargs instruction",
+    "vector_add.ll" => "unsupported vector shuffle instruction",
+    "vector_shuffle.ll" => "unsupported vector shuffle instruction"
   }.freeze
 
   def test_supported_conformance_fixtures_compile_and_pass_preflight
@@ -125,6 +132,13 @@ class LLVMConformanceTest < Minitest::Test
     assert_equal expected.fetch("diagnostic"), result.fetch("diagnostics").first.keys.sort
   end
 
+  def test_public_check_result_schema_is_available
+    schema = JSON.parse(File.read(File.expand_path("../docs/llvm-capabilities.schema.json", __dir__)))
+    assert_equal "pfc llvm-capabilities check result", schema.fetch("title")
+    assert_includes schema.fetch("required"), "policy"
+    assert schema.fetch("$defs").key?("diagnostic")
+  end
+
   def test_check_dir_can_emit_sarif
     out, err = capture_io do
       assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--format=sarif", File.join(FIXTURE_ROOT, "unsupported")]).run
@@ -138,6 +152,9 @@ class LLVMConformanceTest < Minitest::Test
     rule = sarif.fetch("runs").first.fetch("tool").fetch("driver").fetch("rules").first
     assert_includes rule.fetch("properties").fetch("tags"), "llvm"
     assert rule.key?("helpUri")
+    rule_ids = sarif.fetch("runs").first.fetch("tool").fetch("driver").fetch("rules").map { |entry| entry.fetch("id") }
+    assert_includes rule_ids, "pfc.llvm.error.floating-point"
+    assert_includes rule_ids, "pfc.llvm.error.vector"
   end
 
   def test_capability_data_mentions_representative_lowered_features
@@ -195,6 +212,17 @@ class LLVMConformanceTest < Minitest::Test
 
       _out, err = capture_io do
         assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--json", "--include=warn.ll", "--fail-on-warning", dir]).run
+      end
+      assert_empty err
+
+      out, err = capture_io do
+        assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check", "--json", "--fail-on=none", File.join(dir, "skip.ll")]).run
+      end
+      assert_empty err
+      assert_equal "none", JSON.parse(out).fetch("policy").fetch("fail_on")
+
+      _out, err = capture_io do
+        assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--json", "--include=warn.ll", "--fail-on=none", "--max-warnings=1", dir]).run
       end
       assert_empty err
     end

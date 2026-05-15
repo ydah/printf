@@ -1,5 +1,5 @@
 {
-  "root": ["diagnostics", "errors", "path", "schema_version", "summary", "supported"],
+  "root": ["diagnostics", "errors", "path", "policy", "schema_version", "summary", "supported"],
   "summary": ["diagnostics", "errors", "files", "supported_files", "unsupported_files", "warnings"],
   "diagnostic": ["explanation", "fix_suggestions", "hint", "line", "line_text", "message", "opcode", "severity"]
 }

@@ -526,15 +526,21 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*insertvalue\s+(.+?)\s+(#{NAME}|zeroinitializer|undef|poison),\s+(.+?)\s+(.+?),\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*insertvalue\s+(.+?)\s+(#{NAME}|zeroinitializer|undef|poison),\s+(.+)\z/)
             return unless match
+            operands = Instruction.split_arguments(match[4])
+            return if operands.length < 2
+            insert_match = operands.fetch(0).match(/\A(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(.+)\z/) ||
+                           operands.fetch(0).match(/\A(\[\d+\s+x\s+.+\])\s+(.+)\z/) ||
+                           operands.fetch(0).match(/\A(%[-A-Za-z$._0-9]+|ptr|i(?:1|8|16|32|64|128))\s+(.+)\z/)
+            return unless insert_match
 
             @destination = match[1]
             @aggregate_type = match[2]
             @aggregate = match[3]
-            @insert_type = match[4]
-            @value = match[5]
-            @indices = Instruction.split_arguments(match[6]).map(&:to_i).freeze
+            @insert_type = insert_match[1]
+            @value = insert_match[2]
+            @indices = operands.drop(1).map(&:to_i).freeze
           end
         end
 
@@ -576,6 +582,15 @@ module PFC
               @bits = 128
               @value_type = "i128"
               @incoming = match[2].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/).map do |value, label|
+                [value, label]
+              end.freeze
+              return
+            end
+
+            if (match = text.match(/\A(#{NAME})\s*=\s*phi\s+(#{AGGREGATE_TYPE})\s+(.+)\z/))
+              @destination = match[1]
+              @value_type = match[2]
+              @incoming = match[3].scan(/\[\s*(.+?)\s*,\s+%([-A-Za-z$._0-9]+)\s*\]/).map do |value, label|
                 [value, label]
               end.freeze
               return

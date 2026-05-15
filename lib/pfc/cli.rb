@@ -137,11 +137,12 @@ module PFC
       emit_lowering_plan = false
       explain = false
       exclude_patterns = []
-      fail_on_warning = false
+      fail_on = "error"
       fix_suggestions = false
       format = nil
       include_patterns = []
       json = false
+      max_warnings = nil
       while @argv.first&.start_with?("--")
         case @argv.first
         when "--check"
@@ -160,7 +161,13 @@ module PFC
           emit_lowering_plan = true
         when "--fail-on-warning"
           check = true
-          fail_on_warning = true
+          fail_on = "warning"
+        when /\A--fail-on=(error|warning|none)\z/
+          check = true
+          fail_on = Regexp.last_match(1)
+        when /\A--max-warnings=(\d+)\z/
+          check = true
+          max_warnings = Regexp.last_match(1).to_i
         when /\A--format=(json|sarif)\z/
           check = true
           format = Regexp.last_match(1)
@@ -184,10 +191,10 @@ module PFC
         raise ArgumentError, "--include/--exclude are only supported with --check-dir" if !check_dir && (!include_patterns.empty? || !exclude_patterns.empty?)
         if check_dir
           raise ArgumentError, "llvm-capabilities --check-dir requires a directory" unless File.directory?(path)
-          result = llvm_check_directory_result(path, include_patterns:, exclude_patterns:, fail_on_warning:)
+          result = llvm_check_directory_result(path, include_patterns:, exclude_patterns:, fail_on:, max_warnings:)
         else
           raise ArgumentError, "llvm-capabilities --check only supports LLVM inputs" unless llvm_source?(path)
-          result = llvm_check_result(path, fail_on_warning:)
+          result = llvm_check_result(path, fail_on:, max_warnings:)
         end
 
         if format == "sarif"
@@ -234,7 +241,7 @@ module PFC
       0
     end
 
-    def llvm_check_result(path, fail_on_warning: false)
+    def llvm_check_result(path, fail_on: "error", max_warnings: nil)
       source = File.read(path)
       diagnostics = llvm_static_check_errors(source)
       begin
@@ -247,10 +254,11 @@ module PFC
       diagnostics = diagnostics.uniq { |diagnostic| [diagnostic.fetch(:line), diagnostic.fetch(:severity), diagnostic.fetch(:message)] }
       errors = diagnostics.select { |diagnostic| diagnostic.fetch(:severity) == "error" }
       warnings = diagnostics.select { |diagnostic| diagnostic.fetch(:severity) == "warning" }
-      supported = errors.empty? && (!fail_on_warning || warnings.empty?)
+      supported = llvm_check_supported?(errors, warnings, fail_on:, max_warnings:)
       {
         schema_version: 1,
         path:,
+        policy: { fail_on:, max_warnings: },
         supported:,
         summary: llvm_check_summary([{ supported:, errors:, diagnostics: }]),
         diagnostics:,
@@ -258,16 +266,24 @@ module PFC
       }
     end
 
-    def llvm_check_directory_result(path, include_patterns: [], exclude_patterns: [], fail_on_warning: false)
+    def llvm_check_directory_result(path, include_patterns: [], exclude_patterns: [], fail_on: "error", max_warnings: nil)
       files = Dir.glob(File.join(path, "**", "*.ll")).sort.filter_map do |file|
         relative = file.delete_prefix("#{path}/")
         next unless llvm_check_directory_file_included?(relative, include_patterns, exclude_patterns)
 
-        llvm_check_result(file, fail_on_warning:)
+        llvm_check_result(file, fail_on:, max_warnings:)
       end
       summary = llvm_check_summary(files)
       supported = files.all? { |file| file.fetch(:supported) }
-      { schema_version: 1, path:, supported:, summary:, files: }
+      { schema_version: 1, path:, policy: { fail_on:, max_warnings: }, supported:, summary:, files: }
+    end
+
+    def llvm_check_supported?(errors, warnings, fail_on:, max_warnings:)
+      return false if max_warnings && warnings.length > max_warnings
+      return true if fail_on == "none"
+      return errors.empty? && warnings.empty? if fail_on == "warning"
+
+      errors.empty?
     end
 
     def llvm_check_directory_file_included?(relative, include_patterns, exclude_patterns)
@@ -412,8 +428,7 @@ module PFC
     end
 
     def llvm_sarif_rule_id(diagnostic)
-      opcode = diagnostic.fetch(:opcode) || "unknown"
-      "pfc.llvm.#{diagnostic.fetch(:severity)}.#{opcode}"
+      "pfc.llvm.#{diagnostic.fetch(:severity)}.#{llvm_diagnostic_category(diagnostic)}"
     end
 
     def llvm_diagnostic_category(diagnostic)
@@ -731,8 +746,8 @@ module PFC
           pfc dump-cfg INPUT
           pfc dump-c INPUT
           pfc llvm-capabilities [--json]
-          pfc llvm-capabilities --check [--json] [--format=json|sarif] [--fix-suggestions] [--emit-lowering-plan] INPUT.ll
-          pfc llvm-capabilities --check-dir [--json] [--format=json|sarif] [--emit-lowering-plan] [--include=GLOB] [--exclude=GLOB] [--fail-on-warning] DIR
+          pfc llvm-capabilities --check [--json] [--format=json|sarif] [--fix-suggestions] [--emit-lowering-plan] [--fail-on=error|warning|none] [--max-warnings=N] INPUT.ll
+          pfc llvm-capabilities --check-dir [--json] [--format=json|sarif] [--emit-lowering-plan] [--include=GLOB] [--exclude=GLOB] [--fail-on=error|warning|none] [--max-warnings=N] DIR
           pfc llvm-capabilities --explain INPUT.ll
 
         Options:
@@ -777,10 +792,10 @@ module PFC
             - pointer phi
             - freeze
             - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
-            - extractvalue and insertvalue for scalar integer fields in aggregate values
+            - extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values
             - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks
           control:
-            - br, switch, phi, ret
+            - br, switch, scalar/pointer/i128/vector/aggregate phi, ret
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
             - void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments
@@ -794,7 +809,8 @@ module PFC
             - common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops
             - llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals
             - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode
-            - llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on-warning, and SARIF output
+            - llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output
+            - docs/llvm-capabilities.schema.json publishes the check JSON contract
             - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
             - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
             - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
@@ -837,11 +853,11 @@ module PFC
           "pointer phi",
           "freeze",
           "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
-          "extractvalue and insertvalue for scalar integer fields in aggregate values",
+          "extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values",
           "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks"
         ],
         control: [
-          "br, switch, phi, ret",
+          "br, switch, scalar/pointer/i128/vector/aggregate phi, ret",
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
           "void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments"
@@ -856,7 +872,8 @@ module PFC
           "common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops",
           "llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals",
           "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode",
-          "llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on-warning, and SARIF output",
+          "llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output",
+          "docs/llvm-capabilities.schema.json publishes the check JSON contract",
           "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
           "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
