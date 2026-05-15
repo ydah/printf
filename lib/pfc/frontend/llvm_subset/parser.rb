@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../llvm_subset"
+require_relative "normalizer"
 
 module PFC
   module Frontend
@@ -97,10 +98,10 @@ module PFC
 
             raw.each_char do |char|
               case char
-              when "(", "[", "<"
+              when "(", "[", "<", "{"
                 depth += 1
                 current << char
-              when ")", "]", ">"
+              when ")", "]", ">", "}"
                 depth -= 1
                 current << char
               when ","
@@ -603,7 +604,7 @@ module PFC
         def parse_global_strings
           source.each_line.each_with_object({}) do |line, strings|
             stripped = line.sub(/;.*/, "").strip
-            match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\bconstant\s+\[(\d+)\s+x\s+i8\]\s+c"((?:[^"\\]|\\.)*)"(?:,\s+align\s+\d+)?\z/)
+            match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\bconstant\s+\[(\d+)\s+x\s+i8\]\s+c"((?:[^"\\]|\\.)*)"(?:,\s+align\s+\d+)?(?:,\s+![A-Za-z0-9_.-]+\s+![A-Za-z0-9_.-]+)?\z/)
             next unless match
 
             bytes = decode_llvm_string(match[3])
@@ -974,7 +975,7 @@ module PFC
           parsed = { "entry" => [] }
           current = "entry"
 
-          normalized_lines(body).each do |stripped|
+          Normalizer.lines(body).each do |stripped|
             next if stripped.empty?
 
             if (match = stripped.match(/\A([-A-Za-z$._0-9]+):\z/))
@@ -1022,53 +1023,6 @@ module PFC
           type == "ptr" || type.start_with?("ptr addrspace(") || type.end_with?("*")
         end
 
-        def normalized_lines(body)
-          source_lines = body.each_line.map { |line| line.sub(/;.*/, "").strip }
-          lines = []
-          index = 0
-
-          while index < source_lines.length
-            line = source_lines[index]
-            if line.start_with?("switch ") && line.include?("[") && !line.include?("]")
-              line = collect_switch_line(line, source_lines, index + 1)
-              index += 1 until index >= source_lines.length || source_lines[index].include?("]")
-            end
-            lines << normalize_instruction_line(line)
-            index += 1
-          end
-
-          lines
-        end
-
-        def normalize_instruction_line(line)
-          normalized = line.gsub(/\s+/, " ")
-          normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?(?:tail|musttail|notail)\s+call\b/, '\1call')
-          normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\b/, '\1call \2')
-          normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?load\s+volatile\s+/, '\1load ')
-          normalized = normalized.sub(/\Astore\s+volatile\s+/, "store ")
-          normalized = normalized.sub(/\s+#\d+\z/, "")
-          loop do
-            stripped = normalized.sub(/,\s*![A-Za-z0-9_.-]+(?:\s+![A-Za-z0-9_.-]+|\s+\{[^}]*\})?\z/, "")
-            break if stripped == normalized
-
-            normalized = stripped
-          end
-          normalized = normalized.sub(/\s+#\d+\z/, "")
-          normalized
-        end
-
-        def collect_switch_line(line, source_lines, start_index)
-          combined = line.dup
-          index = start_index
-          while index < source_lines.length
-            combined << " #{source_lines[index]}"
-            break if source_lines[index].include?("]")
-
-            index += 1
-          end
-          combined
-        end
-
         def extract_main_body
           lines = source.each_line.to_a
           start = lines.index { |line| line.match?(/\A\s*define\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(?:#{RETURN_TYPE})\s+@main\s*\(/) }
@@ -1086,7 +1040,7 @@ module PFC
 
         def source_line_numbers
           source.each_line.with_index(1).each_with_object({}) do |(raw_line, line_number), output|
-            normalized = raw_line.sub(/;.*/, "").strip.gsub(/\s+/, " ")
+            normalized = Normalizer.instruction(raw_line.sub(/;.*/, "").strip)
             next if normalized.empty?
 
             output[normalized] ||= line_number
