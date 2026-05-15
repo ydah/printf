@@ -1,7 +1,11 @@
 # frozen_string_literal: true
 
 require_relative "c_emitter"
+require_relative "llvm_c_emitter/aggregate_values"
+require_relative "llvm_c_emitter/intrinsics"
+require_relative "llvm_c_emitter/pointer_memory"
 require_relative "llvm_c_emitter/source_locations"
+require_relative "llvm_c_emitter/type_layout"
 require_relative "printf_primitives"
 require_relative "../frontend/llvm_subset"
 require_relative "../frontend/llvm_subset/parser"
@@ -9,7 +13,11 @@ require_relative "../frontend/llvm_subset/parser"
 module PFC
   module Backend
     class LLVMCEmitter
+      include AggregateValues
+      include Intrinsics
+      include PointerMemory
       include SourceLocations
+      include TypeLayout
 
       DEFAULT_TAPE_SIZE = CEmitter::DEFAULT_TAPE_SIZE
       NAME = /%[-A-Za-z$._0-9]+/
@@ -282,7 +290,7 @@ module PFC
           end
 
           registers[lhs] = c_value_name(lhs)
-          i128_high_registers[lhs] = "#{c_value_name(lhs)}_hi" if line.respond_to?(:bits) && line.bits == 128
+          i128_high_registers[lhs] = "#{c_value_name(lhs)}_hi" if (line.respond_to?(:bits) && line.bits == 128) || (line.respond_to?(:to_bits) && line.to_bits == 128)
           pointers[lhs] = EncodedPointer.new(value: registers.fetch(lhs)) if pointer_result || line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*phi\s+(?:ptr|.+?\*)\b/)
         end
       end
@@ -902,7 +910,7 @@ module PFC
       end
 
       def emit_vector_binary(line)
-        unless line.operator == "add"
+        unless vector_binary_operator?(line.operator)
           raise Frontend::LLVMSubset::ParseError, "unsupported vector binary operator: #{line.operator}"
         end
 
@@ -934,6 +942,8 @@ module PFC
         end
 
         if line.respond_to?(:destination) && line.respond_to?(:condition) && line.respond_to?(:bits) && line.bits
+          return emit_i128_select(line.destination, line.condition, line.true_value, line.false_value) if line.bits == 128
+
           condition = llvm_value(line.condition)
           true_value = llvm_value(line.true_value)
           false_value = llvm_value(line.false_value)
@@ -983,9 +993,36 @@ module PFC
           to_bits = match[5].to_i
         end
         raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless from_bits
+        return emit_i128_extend(destination, operator, from_bits, value) if to_bits == 128
         raise Frontend::LLVMSubset::ParseError, "unsupported i128 cast: #{line}" if from_bits == 128 && operator != "trunc"
 
         ["    #{register(destination)} = #{cast_expression(operator, from_bits, to_bits, llvm_value(value))};"]
+      end
+
+      def emit_i128_extend(destination, operator, from_bits, value, context: nil)
+        unless %w[zext sext].include?(operator) && from_bits < 128
+          raise Frontend::LLVMSubset::ParseError, "unsupported i128 cast"
+        end
+
+        target = context ? inline_register(context, destination) : register(destination)
+        high_target = context ? nil : i128_high_register(destination)
+        source = context ? inline_value(value, context) : llvm_value(value)
+        low = operator == "sext" ? cast_expression("sext", from_bits, 64, source) : "((#{source}) & #{integer_mask_literal(from_bits)})"
+        high = operator == "sext" ? "(((#{source}) & #{sign_bit_literal(from_bits)}) ? ~0ull : 0ull)" : "0ull"
+        lines = ["    #{target} = #{low};"]
+        lines << "    #{high_target} = #{high};" if high_target
+        lines
+      end
+
+      def emit_i128_select(destination, condition, true_value, false_value, context: nil)
+        target = context ? inline_register(context, destination) : register(destination)
+        high_target = context ? nil : i128_high_register(destination)
+        cond = context ? inline_value(condition, context) : llvm_value(condition)
+        lines = [
+          "    #{target} = ((#{cond}) != 0u) ? #{i128_low64_value(true_value, context:)} : #{i128_low64_value(false_value, context:)};"
+        ]
+        lines << "    #{high_target} = ((#{cond}) != 0u) ? #{i128_high64_value(true_value, context:)} : #{i128_high64_value(false_value, context:)};" if high_target
+        lines
       end
 
       def emit_ptrtoint_cast(destination, value, to_bits, context: nil)
@@ -1595,6 +1632,8 @@ module PFC
         end
 
         if line.respond_to?(:destination) && line.respond_to?(:condition) && line.respond_to?(:bits) && line.bits
+          return emit_i128_select(line.destination, line.condition, line.true_value, line.false_value, context:) if line.bits == 128
+
           local = inline_register(context, line.destination)
           condition = inline_value(line.condition, context)
           true_value = inline_value(line.true_value, context)
@@ -1645,6 +1684,7 @@ module PFC
           to_bits = match[5].to_i
         end
         raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless from_bits
+        return emit_i128_extend(destination, operator, from_bits, value, context:) if to_bits == 128
 
         local = inline_register(context, destination)
         ["    #{local} = #{cast_expression(operator, from_bits, to_bits, inline_value(value, context))};"]
@@ -3186,13 +3226,6 @@ module PFC
 
       def i128_high_register(name)
         i128_high_registers.fetch(name) { raise Frontend::LLVMSubset::ParseError, "unknown i128 register: #{name}" }
-      end
-
-      def vector_element_count(type)
-        match = type.to_s.match(/\A<(\d+)\s+x\s+i(?:1|8|16|32|64)>\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported vector type: #{type}" unless match
-
-        match[1].to_i
       end
 
       def alloca?(line)

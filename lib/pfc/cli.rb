@@ -133,6 +133,7 @@ module PFC
 
     def llvm_capabilities_command
       check = false
+      check_dir = false
       emit_lowering_plan = false
       explain = false
       fix_suggestions = false
@@ -141,6 +142,9 @@ module PFC
         case @argv.first
         when "--check"
           check = true
+        when "--check-dir"
+          check = true
+          check_dir = true
         when "--explain"
           check = true
           explain = true
@@ -161,15 +165,28 @@ module PFC
       if check
         path = require_input_path!
         raise ArgumentError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
-        raise ArgumentError, "llvm-capabilities --check only supports LLVM inputs" unless llvm_source?(path)
+        if check_dir
+          raise ArgumentError, "llvm-capabilities --check-dir requires a directory" unless File.directory?(path)
+          result = llvm_check_directory_result(path)
+        else
+          raise ArgumentError, "llvm-capabilities --check only supports LLVM inputs" unless llvm_source?(path)
+          result = llvm_check_result(path)
+        end
 
-        result = llvm_check_result(path)
         if emit_lowering_plan
           puts JSON.pretty_generate(llvm_lowering_plan(result))
         elsif json
           puts JSON.pretty_generate(result)
         elsif result.fetch(:supported)
           puts "supported: #{path}"
+        elsif result.key?(:files)
+          puts "unsupported: #{path}"
+          result.fetch(:files).reject { |file| file.fetch(:supported) }.each do |file|
+            file.fetch(:errors).each do |error|
+              location = error.fetch(:line) ? "#{file.fetch(:path)}:#{error.fetch(:line)}" : file.fetch(:path)
+              puts "  #{location}: #{error.fetch(:message)}"
+            end
+          end
         else
           puts "unsupported: #{path}"
           result.fetch(:errors).each do |error|
@@ -210,7 +227,21 @@ module PFC
       { schema_version: 1, path:, supported: errors.empty?, errors: }
     end
 
+    def llvm_check_directory_result(path)
+      files = Dir.glob(File.join(path, "**", "*.ll")).sort.map { |file| llvm_check_result(file) }
+      { schema_version: 1, path:, supported: files.all? { |file| file.fetch(:supported) }, files: }
+    end
+
     def llvm_lowering_plan(result)
+      if result.key?(:files)
+        return {
+          schema_version: 1,
+          path: result.fetch(:path),
+          supported: result.fetch(:supported),
+          files: result.fetch(:files).map { |file| llvm_lowering_plan(file) }
+        }
+      end
+
       {
         schema_version: 1,
         path: result.fetch(:path),
@@ -221,8 +252,12 @@ module PFC
             line: error.fetch(:line),
             opcode: error.fetch(:opcode),
             line_text: error.fetch(:line_text),
+            before_ir: error.fetch(:line_text),
+            after_ir_example: llvm_after_ir_example(error),
             reason: error.fetch(:message),
             strategy: llvm_lowering_strategy(error),
+            confidence: llvm_lowering_confidence(error),
+            blocking: llvm_lowering_blocking(error),
             steps: error.fetch(:fix_suggestions)
           }
         end
@@ -239,6 +274,28 @@ module PFC
       return "lower_to_default_address_space" if text.include?("address space")
 
       "manual_lowering_required"
+    end
+
+    def llvm_after_ir_example(error)
+      text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
+      return "%lane = extractelement <N x iM> %vector, i32 0\n%sum = add iM %lane, %other_lane\n%next = insertelement <N x iM> %acc, iM %sum, i32 0" if text.match?(/\b(add|sub|mul|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
+      return "%fixed = call i32 @fixed_point_lowered(...)" if text.include?("floating-point")
+      return "%narrow = trunc i128 %wide to i64" if text.include?("i128")
+      return "br label %target" if text.include?("blockaddress")
+
+      nil
+    end
+
+    def llvm_lowering_confidence(error)
+      text = [error.fetch(:message), error.fetch(:line_text)].compact.join("\n")
+      return "high" if text.include?("floating-point") || text.include?("i128") || text.include?("vector")
+      return "medium" if text.include?("blockaddress") || text.include?("address space")
+
+      "low"
+    end
+
+    def llvm_lowering_blocking(error)
+      error.fetch(:severity) == "error"
     end
 
     def llvm_static_check_errors(source)
@@ -259,7 +316,7 @@ module PFC
 
     def llvm_check_diagnostic(line:, line_text:, message:)
       {
-        severity: "error",
+        severity: llvm_diagnostic_severity(message, line_text),
         line:,
         opcode: llvm_diagnostic_opcode(line_text || message),
         message:,
@@ -274,6 +331,10 @@ module PFC
       return nil if text.nil? || text.empty?
 
       text[/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
+    end
+
+    def llvm_diagnostic_severity(_message, _line_text)
+      "error"
     end
 
     def llvm_diagnostic_hint(message, line_text)
@@ -470,6 +531,7 @@ module PFC
           pfc dump-c INPUT
           pfc llvm-capabilities [--json]
           pfc llvm-capabilities --check [--json] [--fix-suggestions] [--emit-lowering-plan] INPUT.ll
+          pfc llvm-capabilities --check-dir [--json] [--emit-lowering-plan] DIR
           pfc llvm-capabilities --explain INPUT.ll
 
         Options:
@@ -515,7 +577,7 @@ module PFC
             - freeze
             - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
             - extractvalue and insertvalue for scalar integer fields in aggregate values
-            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add scalarization, extractelement, and insertelement with runtime index checks
+            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/and/or/xor scalarization, extractelement, and insertelement with runtime index checks
           control:
             - br, switch, phi, ret
             - unreachable as runtime abort
@@ -574,7 +636,7 @@ module PFC
           "freeze",
           "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
           "extractvalue and insertvalue for scalar integer fields in aggregate values",
-          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add scalarization, extractelement, and insertelement with runtime index checks"
+          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/and/or/xor scalarization, extractelement, and insertelement with runtime index checks"
         ],
         control: [
           "br, switch, phi, ret",

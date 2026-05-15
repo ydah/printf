@@ -241,16 +241,16 @@ module PFC
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*add((?:\s+(?:nuw|nsw|exact))*)\s+(<\d+\s+x\s+i(8|16|32|64)>)\s+(.+)\z/))
-              operands = Instruction.split_arguments(match[5])
+            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|and|or|xor)((?:\s+(?:nuw|nsw|exact))*)\s+(<\d+\s+x\s+i(8|16|32|64)>)\s+(.+)\z/))
+              operands = Instruction.split_arguments(match[6])
               return unless operands.length == 2
 
               @destination = match[1]
-              @operator = "add"
-              @flags = match[2].split.freeze
-              @value_type = match[3]
-              @vector_type = match[3]
-              @bits = match[4].to_i
+              @operator = match[2]
+              @flags = match[3].split.freeze
+              @value_type = match[4]
+              @vector_type = match[4]
+              @bits = vector_type[/i(8|16|32|64)>/, 1].to_i
               @left = operands.fetch(0)
               @right = operands.fetch(1)
               return
@@ -321,6 +321,16 @@ module PFC
 
           def initialize(text)
             super
+            if (match = text.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i128\s+(.+?),\s+i128\s+(.+)\z/))
+              @destination = match[1]
+              @condition = match[2]
+              @bits = 128
+              @value_type = "i128"
+              @true_value = match[3]
+              @false_value = match[4]
+              return
+            end
+
             if (match = text.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32|64)\s+(.+?),\s+i(?:1|8|16|32|64)\s+(.+)\z/))
               @destination = match[1]
               @condition = match[2]
@@ -347,7 +357,7 @@ module PFC
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64|128)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64|128)\s+(.+?)\s+to\s+i(1|8|16|32|64|128)\z/))
               @destination = match[1]
               @operator = match[2]
               @from_bits = match[3].to_i

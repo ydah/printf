@@ -21,7 +21,7 @@ class LLVMConformanceTest < Minitest::Test
     "blockaddress.ll" => "unsupported blockaddress constant expression",
     "external_global.ll" => "unsupported external global reference",
     "float_add.ll" => "unsupported floating-point type",
-    "vector_add.ll" => "unsupported LLVM instruction sub"
+    "vector_add.ll" => "unsupported LLVM instruction mul"
   }.freeze
 
   def test_supported_conformance_fixtures_compile_and_pass_preflight
@@ -76,6 +76,20 @@ class LLVMConformanceTest < Minitest::Test
     assert_equal 1, plan.fetch("schema_version")
     assert_equal "rewrite_float_to_integer", plan.fetch("operations").first.fetch("strategy")
     assert_includes plan.fetch("operations").first.fetch("steps").join("\n"), "fixed-point"
+    assert plan.fetch("operations").first.key?("before_ir")
+    assert plan.fetch("operations").first.key?("after_ir_example")
+    assert plan.fetch("operations").first.key?("confidence")
+    assert plan.fetch("operations").first.key?("blocking")
+  end
+
+  def test_check_dir_reports_nested_llvm_files
+    out, err = capture_io do
+      assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--check-dir", File.join(FIXTURE_ROOT, "unsupported")]).run
+    end
+
+    assert_empty err
+    assert_includes out, "unsupported:"
+    assert_includes out, "float_add.ll"
   end
 
   def test_static_preflight_fuzz_reports_explicit_diagnostics
@@ -103,7 +117,9 @@ class LLVMConformanceTest < Minitest::Test
 
   def test_generated_c_snapshot_for_minimal_return_is_deterministic
     generated = PFC::Backend::LLVMCEmitter.new(File.read(supported_path("minimal_return.ll"))).emit
-    expected = File.read(File.join(SNAPSHOT_ROOT, "minimal_return.c"))
+    snapshot = File.join(SNAPSHOT_ROOT, "minimal_return.c")
+    File.write(snapshot, generated) if ENV["UPDATE_SNAPSHOTS"] == "1"
+    expected = File.read(snapshot)
     assert_equal expected, generated
   end
 
