@@ -41,6 +41,7 @@ module ClangFixtureGenerator
     line
       .gsub(/\bnoundef\s+/, "")
       .gsub(/\brange\([^)]+\)\s+/, "")
+      .gsub(/\b(?:nuw|nsw|nusw)\s+/, "")
       .gsub(/\b(?:noalias|nocapture|readonly|readnone|writeonly|immarg)\s+/, "")
       .gsub(/\bcaptures\([^)]*\)\s*/, "")
       .gsub(/\bptr\s+align\s+\d+\s+/, "ptr ")

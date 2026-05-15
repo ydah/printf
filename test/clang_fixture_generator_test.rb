@@ -14,6 +14,7 @@ class ClangFixtureGeneratorTest < Minitest::Test
       ; Function Attrs: nofree nounwind
       define range(i32 0, 2) i32 @main() #0 !dbg !12 {
           #dbg_value(i32 1, !15, !DIExpression(), !22)
+        %0 = getelementptr inbounds i32, ptr %base, i32 0
         %1 = add i32 1, 2, !dbg !23
         %2 = call i32 @putchar(i32 %1), !dbg !24
         ret i32 %2, !dbg !25
@@ -35,6 +36,7 @@ class ClangFixtureGeneratorTest < Minitest::Test
       ; Function Attrs: mustprogress nofree nounwind
       define range(i32 0, 3) i32 @main() #3 !dbg !99 {
         call void @llvm.dbg.value(metadata i32 1, metadata !50, metadata !DIExpression()), !dbg !51
+        %0 = getelementptr inbounds nuw i32, ptr %base, i32 0
         %1 = add i32 1, 2, !dbg !52
         %2 = call i32 @putchar(i32 noundef %1), !dbg !53
         ret i32 %2, !dbg !54
