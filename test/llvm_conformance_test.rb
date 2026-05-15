@@ -12,7 +12,9 @@ class LLVMConformanceTest < Minitest::Test
   SUPPORTED_FIXTURES = {
     "aggregate_phi_fields.ll" => "B",
     "aggregate_argument_abi.ll" => "B",
+    "atomic_cmpxchg_single_thread.ll" => "B",
     "atomic_fence_single_thread.ll" => "B",
+    "atomic_rmw_single_thread.ll" => "B",
     "clang_noop_intrinsics.ll" => "B",
     "compound_gep_lifetime.ll" => "B",
     "function_pointer_tables.ll" => "B",
@@ -37,6 +39,7 @@ class LLVMConformanceTest < Minitest::Test
     "aggregate_icmp.ll" => "B",
     "sret_multiple_byval_abi.ll" => "B",
     "sret_byval_abi.ll" => "B",
+    "shufflevector_arbitrary.ll" => "B",
     "shufflevector_limited.ll" => "B",
     "overflow_intrinsics.ll" => "B",
     "select_phi_matrix.ll" => "B",
@@ -59,7 +62,7 @@ class LLVMConformanceTest < Minitest::Test
     "float_add.ll" => "unsupported floating-point type",
     "varargs.ll" => "unsupported varargs instruction",
     "unsupported_intrinsic.ll" => "unsupported call",
-    "vector_add.ll" => "unsupported vector shuffle instruction",
+    "vector_add.ll" => "unsupported vector type",
     "vector_shuffle.ll" => "unsupported vector shuffle instruction"
   }.freeze
 
@@ -247,7 +250,7 @@ class LLVMConformanceTest < Minitest::Test
     assert report.fetch("opcodes").any? { |entry| entry.fetch("opcode") == "ret" }
     assert report.fetch("diagnostics").any? { |entry| entry.fetch("count") > 0 }
     assert report.fetch("severities").any? { |entry| entry.fetch("severity") == "error" }
-    assert report.fetch("top_unsupported_opcodes").any? { |entry| entry.fetch("name") == "call" }
+    assert report.fetch("top_unsupported_opcodes").any? { |entry| entry.fetch("name") == "fadd" }
     assert report.fetch("top_unsupported_intrinsics").any? { |entry| entry.fetch("name") == "llvm.experimental.unsupported.i32" }
   end
 
@@ -259,7 +262,9 @@ class LLVMConformanceTest < Minitest::Test
     assert_empty err
     result = JSON.parse(out)
     assert_equal 1, result.fetch("schema_version")
-    assert result.fetch("suggestions").any? { |entry| entry.fetch("feature").include?("LLVM intrinsic") || entry.fetch("feature").include?("opcode") }
+    features = result.fetch("suggestions").map { |entry| entry.fetch("feature") }
+    refute_includes features, "LLVM opcode call"
+    assert features.any? { |feature| feature.include?("intrinsic") || feature.include?("opcode") }
   end
 
   def test_check_dir_json_summary_filters_and_fail_on_warning
@@ -386,9 +391,9 @@ class LLVMConformanceTest < Minitest::Test
 
   def test_static_preflight_classifies_unsupported_feature_families
     cases = {
-      "atomic.ll" => ["%old = atomicrmw add ptr null, i32 1 seq_cst", "unsupported atomic operation"],
+      "atomic.ll" => ["%old = atomicrmw uinc_wrap ptr null, i32 1 seq_cst", "unsupported atomic operation"],
       "eh.ll" => ["landingpad { ptr, i32 } cleanup", "unsupported exception handling instruction"],
-      "shuffle.ll" => ["%x = shufflevector <2 x i32> <i32 1, i32 2>, <2 x i32> <i32 3, i32 4>, <2 x i32> <i32 0, i32 2>", "unsupported vector shuffle instruction"],
+      "shuffle.ll" => ["%x = shufflevector <2 x i32> <i32 1, i32 2>, <2 x i32> <i32 3, i32 4>, <2 x i32> <i32 0, i32 4>", "unsupported vector shuffle instruction"],
       "varargs.ll" => ["%x = va_arg ptr null, i32", "unsupported varargs instruction"]
     }
     Dir.mktmpdir("pfc-feature-families") do |dir|

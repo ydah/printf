@@ -418,12 +418,13 @@ module PFC
         candidates << llvm_opcode_suggestion(entry.fetch(:name), entry.fetch(:count))
       end
       candidates.compact!
+      intrinsic_names = report.fetch(:top_unsupported_intrinsics).map { |entry| entry.fetch(:name) }
       {
         schema_version: 1,
         path: report.fetch(:path),
         supported: report.fetch(:supported),
         summary: report.fetch(:summary),
-        suggestions: candidates.uniq { |candidate| candidate.fetch(:feature) }.first(10)
+        suggestions: candidates.reject { |candidate| generic_call_suggestion_shadowed?(candidate, intrinsic_names) }.uniq { |candidate| candidate.fetch(:feature) }.first(10)
       }
     end
 
@@ -434,6 +435,8 @@ module PFC
                   "saturating integer intrinsic"
                 elsif name.include?("fsh")
                   "funnel shift intrinsic"
+                elsif name.start_with?("llvm.experimental.")
+                  "unsupported experimental intrinsic diagnostic"
                 else
                   "LLVM intrinsic #{name}"
                 end
@@ -445,10 +448,15 @@ module PFC
                 when "shufflevector" then "limited shufflevector lowering"
                 when "invoke" then "nounwind invoke lowering"
                 when "fence" then "single-thread fence no-op"
-                when "atomicrmw", "cmpxchg" then "single-thread atomic read-modify-write lowering"
+                when "atomicrmw" then "advanced atomicrmw variant lowering"
+                when "cmpxchg" then "single-thread cmpxchg lowering"
                 else "LLVM opcode #{name}"
                 end
       { feature:, count:, rationale: "Observed unsupported opcode #{name}. Prioritize only common patterns before adding general semantics." }
+    end
+
+    def generic_call_suggestion_shadowed?(candidate, intrinsic_names)
+      candidate.fetch(:feature) == "LLVM opcode call" && !intrinsic_names.empty?
     end
 
     def print_llvm_next_suggestions(suggestions)
@@ -755,6 +763,11 @@ module PFC
 
     def llvm_diagnostic_opcode(text)
       return nil if text.nil? || text.empty?
+      if (intrinsic = text[/\b@((?:llvm\.)[-A-Za-z$._0-9]+)\b/, 1])
+        return intrinsic
+      end
+      return "external_global" if text.include?("external global")
+      return "addrspacecast" if text.include?("address space")
 
       text[/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
     end
@@ -799,6 +812,7 @@ module PFC
           "or compile the source without vectorization before passing LLVM IR to pfc"
         ]
       end
+      return ["lower this construct to the documented scalar integer, pointer, aggregate, or libc subset"] if text.include?("unsupported vector type")
       return ["rewrite floating-point work as integer or fixed-point operations before LLVM lowering"] if text.include?("floating-point")
       return ["truncate i128 to i64 before unsupported operations, or keep it limited to load/store, add/sub, and/or/xor, signed/unsigned comparisons, select, zext/sext, and trunc"] if text.include?("i128")
       return ["replace blockaddress with explicit labels and branch/switch control flow"] if text.include?("blockaddress")
@@ -901,7 +915,7 @@ module PFC
     def llvm_static_supported_line?(line)
       return true if line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?invoke\b/) && line.match?(/\bnounwind\b/)
 
-      line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?(?:(?:tail|musttail|notail)\s+)?(?:alloca|getelementptr|load|store|extractelement|insertelement|extractvalue|insertvalue|shufflevector|add|sub|mul|udiv|sdiv|urem|srem|and|or|xor|shl|lshr|ashr|zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast|freeze|icmp|select|phi|call|switch|br|ret|fence|unreachable)\b/) ||
+      line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?(?:(?:tail|musttail|notail)\s+)?(?:alloca|getelementptr|load|store|atomicrmw|cmpxchg|extractelement|insertelement|extractvalue|insertvalue|shufflevector|add|sub|mul|udiv|sdiv|urem|srem|and|or|xor|shl|lshr|ashr|zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast|freeze|icmp|select|phi|call|switch|br|ret|fence|unreachable)\b/) ||
         line.match?(/\A[@%][-A-Za-z$._0-9]+\s*=.*\b(?:global|constant|alias)\b/)
     end
 
@@ -1108,7 +1122,7 @@ module PFC
             - integer llvm.vector.reduce add/and/or/xor/min/max intrinsics over fixed-length integer vectors
             - aggregate byte equality/compare helpers for libc and future aggregate lowering
             - extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values
-            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks
+            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, arbitrary constant-mask shufflevector, vector icmp/select, extractelement, and insertelement with runtime index checks
             - fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns
           control:
             - br, switch, scalar/pointer/i128/vector/aggregate phi, ret
@@ -1138,7 +1152,7 @@ module PFC
             - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
             - llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics
-            - single-thread atomic load/store accepted as normal memory access, and fence accepted as a no-op
+            - single-thread atomic load/store plus atomicrmw/cmpxchg accepted as normal memory access, and fence accepted as a no-op
             - llvm.expect.* accepted as identity intrinsic
           libc:
             - putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, atoi, strtol with null endptr, isdigit, isalpha, isalnum, isspace, tolower, toupper, malloc, calloc, free as no-op, memcpy, memmove, memset, memcmp, memchr
@@ -1181,7 +1195,7 @@ module PFC
           "integer llvm.vector.reduce add/and/or/xor/min/max intrinsics over fixed-length integer vectors",
           "aggregate byte equality/compare helpers for libc and future aggregate lowering",
           "extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values",
-          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks",
+          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, arbitrary constant-mask shufflevector, vector icmp/select, extractelement, and insertelement with runtime index checks",
           "fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns"
         ],
         control: [
@@ -1213,7 +1227,7 @@ module PFC
           "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics",
-          "single-thread atomic load/store accepted as normal memory access, and fence accepted as a no-op",
+          "single-thread atomic load/store plus atomicrmw/cmpxchg accepted as normal memory access, and fence accepted as a no-op",
           "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [

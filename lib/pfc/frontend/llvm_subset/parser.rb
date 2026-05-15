@@ -28,6 +28,8 @@ module PFC
             when :gep then GEPInstruction.new(text)
             when :load then LoadInstruction.new(text)
             when :store then StoreInstruction.new(text)
+            when :atomicrmw then AtomicRMWInstruction.new(text)
+            when :cmpxchg then CmpXchgInstruction.new(text)
             when :binary then BinaryInstruction.new(text)
             when :icmp then ICmpInstruction.new(text)
             when :select then SelectInstruction.new(text)
@@ -134,6 +136,8 @@ module PFC
             return :alloca if text.match?(/\A#{NAME}\s*=\s*alloca\b/)
             return :store if text.start_with?("store ")
             return :load if text.include?(" load ")
+            return :atomicrmw if text.match?(/\A(?:#{NAME}\s*=\s*)?atomicrmw\b/)
+            return :cmpxchg if text.match?(/\A(?:#{NAME}\s*=\s*)?cmpxchg\b/)
             return :binary if text.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
             return :select if text.match?(/\A#{NAME}\s*=\s*select\b/)
             return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast)\b/)
@@ -249,6 +253,40 @@ module PFC
             @bits = @value_type.delete_prefix("i").to_i if @value_type.match?(/\Ai(?:1|8|16|32|64|128)\z/)
             @value = match[2]
             @pointer = match[3].strip
+          end
+        end
+
+        class AtomicRMWInstruction < Instruction
+          attr_reader :bits, :destination, :operator, :pointer, :value, :value_type
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*atomicrmw\s+(?:volatile\s+)?([A-Za-z_]+)\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?),\s+i(1|8|16|32|64)\s+(.+?)\s+(?:syncscope\("[^"]+"\)\s+)?(?:unordered|monotonic|acquire|release|acq_rel|seq_cst)(?:,\s+align\s+\d+)?\z/)
+            return unless match
+
+            @destination = match[1]
+            @operator = match[2]
+            @pointer = match[3].strip
+            @bits = match[4].to_i
+            @value_type = "i#{match[4]}"
+            @value = match[5].strip
+          end
+        end
+
+        class CmpXchgInstruction < Instruction
+          attr_reader :bits, :compare_value, :destination, :new_value, :pointer, :value_type
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*cmpxchg\s+(?:weak\s+)?(?:volatile\s+)?(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?),\s+i(1|8|16|32|64)\s+(.+?),\s+i\3\s+(.+?)\s+(?:syncscope\("[^"]+"\)\s+)?(?:unordered|monotonic|acquire|release|acq_rel|seq_cst)\s+(?:unordered|monotonic|acquire|release|acq_rel|seq_cst)(?:,\s+align\s+\d+)?\z/)
+            return unless match
+
+            @destination = match[1]
+            @pointer = match[2].strip
+            @bits = match[3].to_i
+            @compare_value = match[4].strip
+            @new_value = match[5].strip
+            @value_type = "{ i#{match[3]}, i1 }"
           end
         end
 

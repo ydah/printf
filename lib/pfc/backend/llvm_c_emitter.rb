@@ -921,6 +921,8 @@ module PFC
           when :alloca then return []
           when :store then return emit_store(line)
           when :load then return emit_load(line)
+          when :atomicrmw then return emit_atomicrmw(line)
+          when :cmpxchg then return emit_cmpxchg(line)
           when :binary then return emit_binary(line)
           when :select then return emit_select(line)
           when :cast then return emit_cast(line)
@@ -1366,17 +1368,80 @@ module PFC
       end
 
       def supported_shuffle_mask?(indices, source_count)
-        compact = indices.compact
-        return true if compact.empty?
-        return true if compact.uniq.length == 1
+        indices.compact.all? { |index| index.between?(0, (source_count * 2) - 1) }
+      end
 
-        expected_identity = (0...indices.length).to_a
-        return true if indices == expected_identity
+      def emit_atomicrmw(line, context: nil)
+        unless line.respond_to?(:destination) && line.destination && line.respond_to?(:bits) && line.bits
+          raise Frontend::LLVMSubset::ParseError, "unsupported atomic operation: #{line}"
+        end
+        unless supported_atomicrmw_operator?(line.operator)
+          raise Frontend::LLVMSubset::ParseError, "unsupported atomic operation: #{line.operator}. Run `pfc llvm-capabilities --check FILE.ll` to preflight a file."
+        end
 
-        expected_concat = (0...(source_count * 2)).to_a
-        return true if indices == expected_concat
+        address = memory_address(line.pointer, context:)
+        target = context ? inline_register(context, line.destination) : register(line.destination)
+        value = scalar_value(line.value, context:)
+        width = byte_width(line.bits)
+        prefix = next_memory_intrinsic_prefix
+        [
+          "    {",
+          *slot_lines(address, width),
+          "        unsigned long long #{prefix}_old = pf_llvm_load(#{address.memory}, pf_slot_index, #{width}) & #{integer_mask_literal(line.bits)};",
+          "        unsigned long long #{prefix}_value = ((unsigned long long)(#{value})) & #{integer_mask_literal(line.bits)};",
+          "        unsigned long long #{prefix}_next = #{atomicrmw_next_expression(line.operator, line.bits, prefix)};",
+          "        pf_llvm_store(#{address.memory}, pf_slot_index, #{prefix}_next & #{integer_mask_literal(line.bits)}, #{width});",
+          "        #{target} = #{unsigned_cast(line.bits)}(#{prefix}_old);",
+          "    }"
+        ]
+      end
 
-        compact == (compact.first...(compact.first + compact.length)).to_a
+      def emit_cmpxchg(line, context: nil)
+        unless line.respond_to?(:destination) && line.destination && line.respond_to?(:bits) && line.bits
+          raise Frontend::LLVMSubset::ParseError, "unsupported atomic operation: #{line}"
+        end
+
+        address = memory_address(line.pointer, context:)
+        aggregate = aggregate_register(line.destination, context:)
+        compare = scalar_value(line.compare_value, context:)
+        replacement = scalar_value(line.new_value, context:)
+        width = byte_width(line.bits)
+        prefix = next_memory_intrinsic_prefix
+        [
+          "    {",
+          *slot_lines(address, width),
+          "        unsigned long long #{prefix}_old = pf_llvm_load(#{address.memory}, pf_slot_index, #{width}) & #{integer_mask_literal(line.bits)};",
+          "        unsigned long long #{prefix}_compare = ((unsigned long long)(#{compare})) & #{integer_mask_literal(line.bits)};",
+          "        unsigned long long #{prefix}_replacement = ((unsigned long long)(#{replacement})) & #{integer_mask_literal(line.bits)};",
+          "        unsigned long long #{prefix}_success = (#{prefix}_old == #{prefix}_compare) ? 1ull : 0ull;",
+          "        if (#{prefix}_success) {",
+          "            pf_llvm_store(#{address.memory}, pf_slot_index, #{prefix}_replacement, #{width});",
+          "        }",
+          "        pf_llvm_store(#{aggregate.fetch(:name)}, 0, #{prefix}_old, #{width});",
+          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{width}, #{prefix}_success, 1);",
+          "    }"
+        ]
+      end
+
+      def supported_atomicrmw_operator?(operator)
+        %w[xchg add sub and nand or xor max min umax umin].include?(operator)
+      end
+
+      def atomicrmw_next_expression(operator, bits, prefix)
+        mask = integer_mask_literal(bits)
+        case operator
+        when "xchg" then "#{prefix}_value"
+        when "add" then "(#{prefix}_old + #{prefix}_value) & #{mask}"
+        when "sub" then "(#{prefix}_old - #{prefix}_value) & #{mask}"
+        when "and" then "#{prefix}_old & #{prefix}_value"
+        when "nand" then "~(#{prefix}_old & #{prefix}_value) & #{mask}"
+        when "or" then "#{prefix}_old | #{prefix}_value"
+        when "xor" then "#{prefix}_old ^ #{prefix}_value"
+        when "umax" then "(#{prefix}_old > #{prefix}_value ? #{prefix}_old : #{prefix}_value)"
+        when "umin" then "(#{prefix}_old < #{prefix}_value ? #{prefix}_old : #{prefix}_value)"
+        when "max" then "(#{signed_expression("#{prefix}_old", bits)} > #{signed_expression("#{prefix}_value", bits)} ? #{prefix}_old : #{prefix}_value)"
+        when "min" then "(#{signed_expression("#{prefix}_old", bits)} < #{signed_expression("#{prefix}_value", bits)} ? #{prefix}_old : #{prefix}_value)"
+        end
       end
 
       def emit_insertvalue(line, context: nil)
@@ -2052,6 +2117,8 @@ module PFC
           when :cast then return emit_inline_cast(line, context)
           when :freeze then return emit_inline_freeze(line, context)
           when :shufflevector then return emit_shufflevector(line, context:)
+          when :atomicrmw then return emit_atomicrmw(line, context:)
+          when :cmpxchg then return emit_cmpxchg(line, context:)
           when :extractelement then return emit_extractelement(line, context:)
           when :insertelement then return emit_insertelement(line, context:)
           when :extractvalue then return emit_extractvalue(line, context:)

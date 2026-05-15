@@ -694,7 +694,7 @@ class LLVMSubsetTest < Minitest::Test
     source = <<~LLVM
       define i32 @main() {
       entry:
-        %old = atomicrmw add ptr null, i32 1 seq_cst
+        %old = atomicrmw uinc_wrap ptr null, i32 1 seq_cst
         ret i32 0
       }
     LLVM
@@ -703,7 +703,7 @@ class LLVMSubsetTest < Minitest::Test
       PFC::Backend::LLVMCEmitter.new(source).emit
     end
 
-    assert_includes error.message, "line 3: unsupported LLVM instruction atomicrmw: %old = atomicrmw add ptr null, i32 1 seq_cst"
+    assert_includes error.message, "line 3: unsupported atomic operation: uinc_wrap"
     assert_includes error.message, "llvm-capabilities --check"
   end
 

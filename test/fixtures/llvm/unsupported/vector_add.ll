@@ -1,5 +1,5 @@
 define i32 @main() {
 entry:
-  %x = shufflevector <2 x i32> <i32 1, i32 2>, <2 x i32> <i32 3, i32 4>, <2 x i32> <i32 0, i32 2>
+  %x = add <2 x i128> <i128 1, i128 2>, <i128 3, i128 4>
   ret i32 0
 }
