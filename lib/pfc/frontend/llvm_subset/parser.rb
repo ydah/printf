@@ -11,6 +11,7 @@ module PFC
         POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
         INTEGER_TYPE = /i(?:1|8|16|32|64)/
         RETURN_TYPE = /(?:#{INTEGER_TYPE}|ptr|void)/
+        ATTRIBUTE_TOKEN = /[-\w]+(?:\([^)]*\))?/
 
         class Instruction
           attr_reader :kind, :text
@@ -27,6 +28,7 @@ module PFC
             when :icmp then ICmpInstruction.new(text)
             when :select then SelectInstruction.new(text)
             when :cast then CastInstruction.new(text)
+            when :freeze then FreezeInstruction.new(text)
             when :extractvalue then ExtractValueInstruction.new(text)
             when :insertvalue then InsertValueInstruction.new(text)
             when :switch then SwitchInstruction.new(text)
@@ -120,13 +122,14 @@ module PFC
           def classify(text)
             return :phi if text.match?(/\A#{NAME}\s*=\s*phi\b/)
             return :call if text.include?("call ")
-            return :gep if text.include?("getelementptr")
             return :alloca if text.match?(/\A#{NAME}\s*=\s*alloca\b/)
             return :store if text.start_with?("store ")
             return :load if text.include?(" load ")
             return :binary if text.match?(/\A#{NAME}\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\b/)
             return :select if text.match?(/\A#{NAME}\s*=\s*select\b/)
             return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr|bitcast)\b/)
+            return :freeze if text.match?(/\A#{NAME}\s*=\s*freeze\b/)
+            return :gep if text.match?(/\A#{NAME}\s*=\s*getelementptr\b/)
             return :extractvalue if text.match?(/\A#{NAME}\s*=\s*extractvalue\b/)
             return :insertvalue if text.match?(/\A#{NAME}\s*=\s*insertvalue\b/)
             return :icmp if text.match?(/\A#{NAME}\s*=\s*icmp\b/)
@@ -201,13 +204,13 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*load\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*load\s+(.+?),\s+(?:ptr|.+?\*)\s+(.+?)(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @destination = match[1]
             @value_type = match[2]
             @bits = match[2].delete_prefix("i").to_i if match[2].match?(/\Ai(?:1|8|16|32|64)\z/)
-            @pointer = match[3]
+            @pointer = match[3].strip
           end
         end
 
@@ -216,13 +219,13 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Astore\s+(.+?)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\Astore\s+(.+?)\s+(.+?),\s+(?:ptr|.+?\*)\s+(.+?)(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @value_type = match[1]
             @bits = match[1].delete_prefix("i").to_i if match[1].match?(/\Ai(?:1|8|16|32|64)\z/)
             @value = match[2]
-            @pointer = match[3]
+            @pointer = match[3].strip
           end
         end
 
@@ -311,7 +314,7 @@ module PFC
               return
             end
 
-            if (match = text.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})\s+to\s+i(1|8|16|32|64)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr|.+?\*)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
               @destination = match[1]
               @operator = "ptrtoint"
               @from_type = "ptr"
@@ -339,6 +342,27 @@ module PFC
             @from_type = "i#{match[2]}"
             @value = match[3]
             @to_type = "ptr"
+          end
+        end
+
+        class FreezeInstruction < Instruction
+          attr_reader :bits, :destination, :value, :value_type
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*freeze\s+(.+?)\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @value_type = pointer_type?(match[2]) ? "ptr" : match[2]
+            @bits = @value_type.match(/\Ai(1|8|16|32|64)\z/)&.[](1)&.to_i
+            @value = match[3]
+          end
+
+          private
+
+          def pointer_type?(type)
+            type == "ptr" || type.end_with?("*")
           end
         end
 
@@ -457,6 +481,7 @@ module PFC
             internal_functions:,
             source:,
             source_line_numbers:,
+            struct_packed_types: parse_struct_packed_types,
             struct_types: parse_struct_types
           }
         end
@@ -476,7 +501,7 @@ module PFC
 
           while index < lines.length
             header = lines[index].strip
-            match = header.match(/\Adefine\s+(?:[-\w]+\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+[^{}]+)?\s*\{\z/)
+            match = header.match(/\Adefine\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+[^{}]+)?\s*\{\z/)
             unless match
               index += 1
               next
@@ -544,6 +569,14 @@ module PFC
           end
         end
 
+        def parse_struct_packed_types
+          source.each_line.each_with_object({}) do |line, structs|
+            stripped = line.sub(/;.*/, "").strip
+            match = stripped.match(/\A(%[-A-Za-z$._0-9]+)\s*=\s*type\s+<\{\s*.*?\s*\}>\z/)
+            structs[match[1]] = true if match
+          end
+        end
+
         def parse_global_numeric_data
           source.each_line.each_with_object({}) do |line, globals|
             stripped = line.sub(/;.*/, "").strip
@@ -551,6 +584,10 @@ module PFC
 
             if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+i(1|8|16|32|64)\s+(-?\d+|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = integer_bytes(match[3], match[2].to_i)
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+i(1|8|16|32|64)\s+ptrtoint\s*\(.+\)(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = Array.new(byte_width(match[2].to_i), 0)
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+ptr\s+(.+?)(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = Array.new(pointer_size, 0)
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\]\s+(zeroinitializer|\[(.*)\])(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = global_integer_array_bytes(match, stripped)
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+(.+?)\s+(\{.*\}|\[.*\]|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
@@ -565,6 +602,10 @@ module PFC
             next if stripped.empty?
 
             if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+i(?:1|8|16|32|64)\s+(?:-?\d+|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = match[2] == "global"
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+i(?:1|8|16|32|64)\s+ptrtoint\s*\(.+\)(?:,\s+align\s+\d+)?\z/))
+              globals[match[1]] = match[2] == "global"
+            elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+ptr\s+.+?(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = match[2] == "global"
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+\[\d+\s+x\s+i(?:1|8|16|32|64)\]\s+(?:zeroinitializer|\[.*\])(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = match[2] == "global"
@@ -586,10 +627,8 @@ module PFC
 
           output = Array.new(type_size(type), 0)
           fields.zip(elements).each_with_index do |(field_type, element), index|
-            element_match = element.match(/\A(.+?)\s+(.+)\z/)
-            raise parse_error("unsupported aggregate element: #{element}", line) unless element_match
-
-            bytes = typed_initializer_bytes(element_match[1], element_match[2], line)
+            element_type, element_value = split_typed_initializer(element, field_type)
+            bytes = typed_initializer_bytes(element_type, element_value, line)
             offset = aggregate_field_offsets(type).fetch(index)
             bytes.each_with_index { |byte, byte_index| output[offset + byte_index] = byte }
           end
@@ -600,13 +639,14 @@ module PFC
           if (match = type.match(/\Ai(1|8|16|32|64)\z/))
             return integer_bytes(value, match[1].to_i)
           end
+          return Array.new(pointer_size, 0) if pointer_type?(type)
           return aggregate_initializer_bytes(type, value, line) if aggregate_type?(type)
 
           raise parse_error("unsupported aggregate initializer type: #{type}", line)
         end
 
         def aggregate_type?(type)
-          type.strip.match?(/\A(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|\{.*\})\z/)
+          type.strip.match?(/\A(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|(?:<)?\{.*\}(?:>)?)\z/)
         end
 
         def aggregate_fields(type)
@@ -615,14 +655,16 @@ module PFC
             return Array.new(match[1].to_i, match[2])
           end
           return parse_struct_types.fetch(stripped) if parse_struct_types.key?(stripped)
-          if stripped.match?(/\A\{.*\}\z/)
-            return Instruction.split_arguments(stripped.delete_prefix("{").delete_suffix("}"))
+          if stripped.match?(/\A(?:<)?\{.*\}(?:>)?\z/)
+            return Instruction.split_arguments(stripped.delete_prefix("<").delete_prefix("{").delete_suffix(">").delete_suffix("}"))
           end
 
           raise ParseError, "unsupported aggregate type: #{type}"
         end
 
         def aggregate_field_offsets(type)
+          return struct_layout(type).fetch(:field_offsets) if struct_type?(type)
+
           offset = 0
           aggregate_fields(type).map do |field|
             current = offset
@@ -634,9 +676,99 @@ module PFC
         def type_size(type)
           stripped = type.strip
           return byte_width(Regexp.last_match(1).to_i) if stripped.match(/\Ai(1|8|16|32|64)\z/)
-          return aggregate_fields(stripped).sum { |field| type_size(field) } if aggregate_type?(stripped)
+          return pointer_size if pointer_type?(stripped)
+          if stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+            count = Regexp.last_match(1).to_i
+            element = Regexp.last_match(2)
+            return type_size(element) * count
+          end
+          return struct_layout(stripped).fetch(:size) if struct_type?(stripped)
 
           raise ParseError, "unsupported type: #{type}"
+        end
+
+        def type_align(type)
+          stripped = type.strip
+          return integer_align(Regexp.last_match(1).to_i) if stripped.match(/\Ai(1|8|16|32|64)\z/)
+          return pointer_align if pointer_type?(stripped)
+          return type_align(Regexp.last_match(2)) if stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+          return struct_layout(stripped).fetch(:align) if struct_type?(stripped)
+
+          1
+        end
+
+        def struct_type?(type)
+          stripped = type.strip
+          parse_struct_types.key?(stripped) || stripped.match?(/\A(?:<)?\{.*\}(?:>)?\z/)
+        end
+
+        def struct_layout(type)
+          @struct_layout_cache ||= {}
+          key = type.strip
+          return @struct_layout_cache.fetch(key) if @struct_layout_cache.key?(key)
+
+          offset = 0
+          align = 1
+          field_offsets = []
+          packed = packed_struct?(key)
+          fields = aggregate_fields(key)
+          fields.each do |field|
+            field_align = packed ? 1 : type_align(field)
+            offset = align_to(offset, field_align)
+            field_offsets << offset
+            offset += type_size(field)
+            align = [align, field_align].max
+          end
+
+          @struct_layout_cache[key] = {
+            align:,
+            field_offsets:,
+            fields:,
+            size: packed ? offset : align_to(offset, align)
+          }
+        end
+
+        def packed_struct?(type)
+          stripped = type.strip
+          stripped.start_with?("<{") || parse_struct_packed_types.fetch(stripped, false)
+        end
+
+        def align_to(value, alignment)
+          return value if alignment <= 1
+
+          ((value + alignment - 1) / alignment) * alignment
+        end
+
+        def pointer_size
+          return 8 unless parse_target_datalayout
+
+          match = parse_target_datalayout.match(/(?:\A|-)p(?::\d+)?:([0-9]+)/)
+          match ? byte_width(match[1].to_i) : 8
+        end
+
+        def pointer_align
+          return pointer_size unless parse_target_datalayout
+
+          match = parse_target_datalayout.match(/(?:\A|-)p(?::\d+)?:\d+:([0-9]+)/)
+          match ? byte_width(match[1].to_i) : pointer_size
+        end
+
+        def integer_align(bits)
+          match = parse_target_datalayout&.match(/(?:\A|-)i#{bits}:([0-9]+)/)
+          match ? byte_width(match[1].to_i) : byte_width(bits)
+        end
+
+        def split_typed_initializer(element, expected_type)
+          stripped = element.strip
+          expected = expected_type.strip
+          if stripped.start_with?("#{expected} ")
+            return [expected, stripped.delete_prefix("#{expected} ").strip]
+          end
+
+          match = stripped.match(/\A(.+?)\s+(.+)\z/)
+          raise parse_error("unsupported aggregate element: #{element}", element) unless match
+
+          [pointer_type?(match[1]) ? "ptr" : match[1], match[2]]
         end
 
         def global_integer_array_bytes(match, line)
@@ -684,13 +816,13 @@ module PFC
             stripped = line.sub(/;.*/, "").strip
             next if stripped.empty?
 
-            if (match = stripped.match(/\Adeclare\s+(?:[-\w]+\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+#[0-9]+)?\z/))
+            if (match = stripped.match(/\Adeclare\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+#[0-9]+)?\z/))
               add_function_signature!(
                 signatures,
                 build_function_signature(match[2], match[1], match[3], defined: false),
                 stripped
               )
-            elsif (match = stripped.match(/\Adefine\s+(?:[-\w]+\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+[^{}]+)?\s*\{\z/))
+            elsif (match = stripped.match(/\Adefine\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+[^{}]+)?\s*\{\z/))
               add_function_signature!(
                 signatures,
                 build_function_signature(match[2], match[1], match[3], defined: true),
@@ -829,7 +961,7 @@ module PFC
         def normalize_instruction_line(line)
           normalized = line.gsub(/\s+/, " ")
           normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?(?:tail|musttail|notail)\s+call\b/, '\1call')
-          normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?call\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|void)\b/, '\1call \2')
+          normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\b/, '\1call \2')
           normalized = normalized.sub(/\A(#{NAME}\s*=\s*)?load\s+volatile\s+/, '\1load ')
           normalized = normalized.sub(/\Astore\s+volatile\s+/, "store ")
           normalized = normalized.sub(/\s+#\d+\z/, "")
@@ -856,7 +988,7 @@ module PFC
 
         def extract_main_body
           lines = source.each_line.to_a
-          start = lines.index { |line| line.match?(/\A\s*define\s+(?:[-\w]+\s+)*(?:#{RETURN_TYPE})\s+@main\s*\(/) }
+          start = lines.index { |line| line.match?(/\A\s*define\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(?:#{RETURN_TYPE})\s+@main\s*\(/) }
           raise ParseError, "missing define @main()" if start.nil?
 
           body = []

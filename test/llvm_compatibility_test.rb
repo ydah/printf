@@ -180,11 +180,126 @@ class LLVMCompatibilityTest < Minitest::Test
     assert_equal "B", compile_llvm_source_and_run(source)
   end
 
+  def test_freeze_numeric_intrinsics_and_value_attributes
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+      declare i32 @llvm.smax.i32(i32, i32)
+      declare i32 @llvm.abs.i32(i32, i1)
+
+      define noundef i32 @main() #0 {
+      entry:
+        %frozen = freeze i32 65
+        %max = call noundef i32 @llvm.smax.i32(i32 noundef %frozen, i32 noundef 66), !range !0
+        %abs = call i32 @llvm.abs.i32(i32 -66, i1 true), !tbaa !1
+        %same = icmp eq i32 %max, %abs
+        %value = select i1 %same, i32 %max, i32 78
+        call i32 @putchar(i32 %value)
+        ret i32 0
+      }
+
+      attributes #0 = { noinline nounwind optnone }
+      !0 = !{i32 0, i32 100}
+      !1 = !{!2, !2, i64 0}
+      !2 = !{!"int", !3}
+      !3 = !{!"omnipotent char"}
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_nested_aggregate_pointer_field_extract_insert
+    source = <<~LLVM
+      %struct.Inner = type { i8, ptr }
+      %struct.Outer = type { i8, %struct.Inner }
+
+      @.cell = global i8 66, align 1
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %outer = alloca %struct.Outer, align 8
+        %loaded = load %struct.Outer, ptr %outer, align 8
+        %updated = insertvalue %struct.Outer %loaded, ptr nonnull @.cell, 1, 1
+        store %struct.Outer %updated, ptr %outer, align 8
+        %stored = load %struct.Outer, ptr %outer, align 8
+        %ptr = extractvalue %struct.Outer %stored, 1, 1
+        %value = load i8, ptr %ptr, align 1
+        call i32 @putchar(i32 %value)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_padded_and_packed_struct_layout
+    source = <<~LLVM
+      target datalayout = "e-m:o-i64:64-n32:64-S128"
+
+      %struct.Padded = type { i8, i32 }
+      %struct.Packed = type <{ i8, i32 }>
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %padded = alloca %struct.Padded, align 4
+        %packed = alloca %struct.Packed, align 1
+        %padded_field = getelementptr %struct.Padded, ptr %padded, i64 0, i32 1
+        %packed_field = getelementptr %struct.Packed, ptr %packed, i64 0, i32 1
+        store i32 66, ptr %padded_field, align 4
+        store i32 66, ptr %packed_field, align 1
+        %padded_byte1 = getelementptr i8, ptr %padded, i64 1
+        %packed_byte1 = getelementptr i8, ptr %packed, i64 1
+        %padding = load i8, ptr %padded_byte1, align 1
+        %packed_value = load i8, ptr %packed_byte1, align 1
+        %is_padding_zero = icmp eq i8 %padding, 0
+        %value = select i1 %is_padding_zero, i8 %packed_value, i8 78
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_global_pointer_relocations_constant_gep_ptrtoint_and_alias
+    source = <<~LLVM
+      @.arr = global [2 x i8] [i8 65, i8 66], align 1
+      @.cell_alias = alias i8, ptr getelementptr ([2 x i8], ptr @.arr, i64 0, i64 1)
+      @.ptr = global ptr @.cell_alias, align 8
+      @.addr = global i64 ptrtoint (ptr @.cell_alias to i64), align 8
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %encoded = load i64, ptr @.addr, align 8
+        %from_int = inttoptr i64 %encoded to ptr
+        %from_global = load ptr, ptr @.ptr, align 8
+        %same = icmp eq ptr %from_int, %from_global
+        %value = load i8, ptr %from_global, align 1
+        %out = select i1 %same, i8 %value, i8 78
+        %wide = zext i8 %out to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
   def test_clang_smoke_fixture
     assert_equal "B", compile_llvm_and_run("samples/clang_smoke.ll")
   end
 
   def test_clang_aggregate_smoke_fixture
     assert_equal "B", compile_llvm_and_run("samples/clang_aggregate_smoke.ll")
+  end
+
+  def test_clang_attrs_intrinsics_smoke_fixture
+    assert_equal "B", compile_llvm_and_run("samples/clang_attrs_intrinsics_smoke.ll")
   end
 end

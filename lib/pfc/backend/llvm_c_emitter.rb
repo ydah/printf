@@ -12,6 +12,7 @@ module PFC
       NAME = /%[-A-Za-z$._0-9]+/
       GLOBAL_NAME = /@[-A-Za-z$._0-9]+/
       POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
+      ATTRIBUTE_TOKEN = /[-\w]+(?:\([^)]*\))?/
       GlobalStringPointer = Struct.new(:name, :offset, keyword_init: true)
       GlobalMemoryPointer = Struct.new(:name, :offset, keyword_init: true)
       EncodedPointer = Struct.new(:value, keyword_init: true)
@@ -35,6 +36,7 @@ module PFC
         @global_string_offsets = build_global_string_offsets
         @global_string_bytes = build_global_string_memory
         @struct_types = parsed.fetch(:struct_types)
+        @struct_packed_types = parsed.fetch(:struct_packed_types, {})
         @internal_functions = parsed.fetch(:internal_functions)
         @blocks = parsed.fetch(:blocks)
         @block_order = parsed.fetch(:block_order)
@@ -42,7 +44,7 @@ module PFC
         @slots = {}
         @slot_count = 0
         @pointers = {}
-        @global_numeric_offsets, @global_numeric_bytes = build_global_numeric_layout
+        @global_numeric_offsets, raw_global_numeric_bytes = build_global_numeric_layout
         @aggregate_registers = {}
         @registers = {}
         @aggregate_copy_index = 0
@@ -54,6 +56,8 @@ module PFC
         validate_tape_size!
         validate_builtin_declarations!
         analyze_global_numeric_pointers
+        analyze_global_aliases
+        @global_numeric_bytes = apply_global_numeric_relocations(raw_global_numeric_bytes)
         analyze_allocations
         analyze_registers
       end
@@ -107,7 +111,7 @@ module PFC
 
       private
 
-      attr_reader :aggregate_registers, :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :struct_types, :target_datalayout, :tape_size
+      attr_reader :aggregate_registers, :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :internal_functions, :pointers, :registers, :slot_count, :source, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -126,6 +130,73 @@ module PFC
         [offsets, bytes]
       end
 
+      def apply_global_numeric_relocations(bytes)
+        output = bytes.dup
+        global_numeric_relocations.each do |relocation|
+          base = global_numeric_offsets.fetch(relocation.fetch(:global))
+          encoded = relocation.fetch(:encoded)
+          relocation.fetch(:width).times do |index|
+            output[base + relocation.fetch(:offset) + index] = "(((#{encoded}) >> #{index * 8}) & 255ull)"
+          end
+        end
+        output
+      end
+
+      def global_numeric_relocations
+        source.each_line.flat_map do |line|
+          stripped = line.sub(/;.*/, "").strip
+          next [] if stripped.empty?
+
+          if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+ptr\s+(.+?)(?:,\s+align\s+\d+)?\z/))
+            next global_pointer_initializer_relocations(match[1], "ptr", match[2], 0)
+          end
+          if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+i(1|8|16|32|64)\s+ptrtoint\s*\(ptr\s+(.+?)\s+to\s+i\2\)(?:,\s+align\s+\d+)?\z/))
+            next global_pointer_initializer_relocations(match[1], "i#{match[2]}", match[3], 0)
+          end
+          if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+(.+?)\s+(\{.*\}|\[.*\]|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+            next collect_global_initializer_relocations(match[1], match[2], match[3], 0)
+          end
+
+          []
+        end
+      end
+
+      def collect_global_initializer_relocations(global, type, initializer, base_offset)
+        return [] if initializer == "zeroinitializer"
+
+        values = initializer.delete_prefix("{").delete_prefix("[").delete_suffix("}").delete_suffix("]")
+        elements = Frontend::LLVMSubset::Parser::Instruction.split_arguments(values)
+        fields = aggregate_fields(type)
+        offsets = aggregate_field_offsets(type)
+        fields.zip(elements).flat_map.with_index do |(field_type, element), index|
+          element_type, element_value = split_typed_initializer(element, field_type)
+          offset = base_offset + offsets.fetch(index)
+          if pointer_type_name?(element_type)
+            global_pointer_initializer_relocations(global, element_type, element_value, offset)
+          elsif integer_type?(element_type) && element_value.match?(/\Aptrtoint\s*\(ptr\s+(.+?)\s+to\s+#{Regexp.escape(element_type)}\)\z/)
+            global_pointer_initializer_relocations(global, element_type, Regexp.last_match(1), offset)
+          elsif aggregate_type?(element_type)
+            collect_global_initializer_relocations(global, element_type, element_value, offset)
+          else
+            []
+          end
+        end
+      end
+
+      def global_pointer_initializer_relocations(global, type, value, offset)
+        stripped = strip_value_attributes(value)
+        return [] if %w[null zeroinitializer undef poison].include?(stripped)
+        return [] if stripped.match?(/\Ainttoptr\s*\(i(?:1|8|16|32|64)\s+0\s+to\s+ptr\)\z/)
+
+        encoded = if (match = stripped.match(/\Ainttoptr\s*\(i(?:1|8|16|32|64)\s+(-?\d+)\s+to\s+ptr\)\z/))
+                    match[1]
+                  else
+                    encoded_pointer_value(stripped)
+                  end
+        width = integer_type?(type) ? byte_width(type.delete_prefix("i").to_i) : pointer_size
+        [{ global:, offset:, width:, encoded: }]
+      end
+
       def build_global_string_offsets
         offset = 0
         global_strings.each_with_object({}) do |(name, bytes), offsets|
@@ -141,6 +212,16 @@ module PFC
       def analyze_global_numeric_pointers
         global_numeric_offsets.each do |name, offset|
           pointers[name] = GlobalMemoryPointer.new(name:, offset:)
+        end
+      end
+
+      def analyze_global_aliases
+        source.each_line do |line|
+          stripped = line.sub(/;.*/, "").strip
+          match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\balias\s+.+?,\s+(?:ptr|.+?\*)\s+(.+)\z/)
+          next unless match
+
+          pointers[match[1]] = pointer_binding(match[2])
         end
       end
 
@@ -177,13 +258,14 @@ module PFC
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*inttoptr\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*bitcast\s+(?:ptr|.+?\*)\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*select\s+i1\s+.+?,\s+ptr\b/)
+          pointer_result = line.respond_to?(:value_type) && line.value_type == "ptr" && line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|extractvalue|freeze)\b/)
           if (match = line.match(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|insertvalue)\s+(.+?)(?:,|\s+)/)) && aggregate_type?(match[1])
             aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(match[1]), type: match[1] }
             next
           end
 
           registers[lhs] = c_value_name(lhs)
-          pointers[lhs] = EncodedPointer.new(value: registers.fetch(lhs)) if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*phi\s+(?:ptr|.+?\*)\b/)
+          pointers[lhs] = EncodedPointer.new(value: registers.fetch(lhs)) if pointer_result || line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*phi\s+(?:ptr|.+?\*)\b/)
         end
       end
 
@@ -219,7 +301,11 @@ module PFC
         type = raw_type.strip
         return byte_width(Regexp.last_match(1).to_i) if type.match(/\Ai(1|8|16|32|64)\z/)
         return pointer_size if pointer_type_name?(type)
-        return type_size(Regexp.last_match(2)) * Regexp.last_match(1).to_i if type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+        if type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+          count = Regexp.last_match(1).to_i
+          element = Regexp.last_match(2)
+          return type_size(element) * count
+        end
         return struct_layout(type).fetch(:size) if struct_type?(type)
         raise Frontend::LLVMSubset::ParseError, "unsupported LLVM type: #{raw_type}"
       end
@@ -231,9 +317,22 @@ module PFC
         match ? byte_width(match[1].to_i) : 8
       end
 
+      def pointer_align
+        return pointer_size unless target_datalayout
+
+        match = target_datalayout.match(/(?:\A|-)p(?::\d+)?:\d+:([0-9]+)/)
+        match ? byte_width(match[1].to_i) : pointer_size
+      end
+
+      def integer_align(bits)
+        match = target_datalayout&.match(/(?:\A|-)i#{bits}:([0-9]+)/)
+        match ? byte_width(match[1].to_i) : byte_width(bits)
+      end
+
       def type_align(raw_type)
         type = raw_type.strip
-        return [type_size(type), 8].min if type.match?(/\Ai(?:1|8|16|32|64)\z/) || pointer_type_name?(type)
+        return integer_align(Regexp.last_match(1).to_i) if type.match(/\Ai(1|8|16|32|64)\z/)
+        return pointer_align if pointer_type_name?(type)
         return type_align(Regexp.last_match(2)) if type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
         return struct_layout(type).fetch(:align) if struct_type?(type)
         1
@@ -260,9 +359,10 @@ module PFC
         offset = 0
         align = 1
         field_offsets = []
+        packed = packed_struct_type?(key)
         fields = struct_fields(key)
         fields.each do |field|
-          field_align = type_align(field)
+          field_align = packed ? 1 : type_align(field)
           offset = align_to(offset, field_align)
           field_offsets << offset
           offset += type_size(field)
@@ -272,8 +372,13 @@ module PFC
           align:,
           field_offsets:,
           fields:,
-          size: align_to(offset, align)
+          size: packed ? offset : align_to(offset, align)
         }
+      end
+
+      def packed_struct_type?(type)
+        stripped = type.strip
+        stripped.start_with?("<{") || struct_packed_types.fetch(stripped, false)
       end
 
       def align_to(value, alignment)
@@ -284,6 +389,41 @@ module PFC
 
       def pointer_type_name?(type)
         type == "ptr" || type.end_with?("*")
+      end
+
+      def integer_type?(type)
+        type.to_s.match?(/\Ai(?:1|8|16|32|64)\z/)
+      end
+
+      def aggregate_field_offsets(type)
+        stripped = type.strip
+        if stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+          count = Regexp.last_match(1).to_i
+          element = Regexp.last_match(2)
+          element_size = type_size(element)
+          return Array.new(count) { |index| index * element_size }
+        end
+        return struct_layout(stripped).fetch(:field_offsets) if struct_type?(stripped)
+
+        offset = 0
+        struct_fields(stripped).map do |field|
+          current = offset
+          offset += type_size(field)
+          current
+        end
+      end
+
+      def split_typed_initializer(element, expected_type)
+        stripped = element.strip
+        expected = expected_type.strip
+        if stripped.start_with?("#{expected} ")
+          return [expected, stripped.delete_prefix("#{expected} ").strip]
+        end
+
+        match = stripped.match(/\A(.+?)\s+(.+)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported aggregate element: #{element}" unless match
+
+        [pointer_type_name?(match[1]) ? "ptr" : match[1], match[2]]
       end
 
       def gep_offset_expression(source_type, indices, base_offset, context: nil)
@@ -317,6 +457,15 @@ module PFC
       def aggregate_type?(type)
         stripped = type.to_s.strip
         struct_type?(stripped) || stripped.match?(/\A\[\d+\s+x\s+.+\]\z/)
+      end
+
+      def aggregate_fields(type)
+        stripped = type.strip
+        if stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+          return Array.new(Regexp.last_match(1).to_i, Regexp.last_match(2))
+        end
+
+        struct_fields(stripped)
       end
 
       def aggregate_register(name)
@@ -390,7 +539,7 @@ module PFC
 
       def global_memory_initializer
         bytes = global_numeric_bytes.empty? ? [0] : global_numeric_bytes
-        bytes.map { |byte| "#{byte}u" }.join(", ")
+        bytes.map { |byte| byte.is_a?(Integer) ? "#{byte}u" : "((unsigned char)(#{byte}))" }.join(", ")
       end
 
       def global_string_memory_initializer
@@ -478,6 +627,7 @@ module PFC
           when :binary then return emit_binary(line)
           when :select then return emit_select(line)
           when :cast then return emit_cast(line)
+          when :freeze then return emit_freeze(line)
           when :extractvalue then return emit_extractvalue(line)
           when :insertvalue then return emit_insertvalue(line)
           when :icmp then return emit_icmp(line)
@@ -488,7 +638,7 @@ module PFC
           when :unreachable then return emit_unreachable
           end
 
-          raise Frontend::LLVMSubset::ParseError, "unsupported LLVM instruction: #{line}"
+          raise Frontend::LLVMSubset::ParseError, unsupported_instruction_message(line)
         end
       end
 
@@ -557,11 +707,16 @@ module PFC
           bits = line.bits
           value = line.value
           pointer = line.pointer
+        elsif line.respond_to?(:value_type) && line.value_type == "ptr"
+          return emit_pointer_store(line.value, line.pointer)
         elsif line.respond_to?(:value_type) && line.value_type && aggregate_type?(line.value_type)
           return emit_aggregate_store(line.value_type, line.value, line.pointer)
         else
           if (aggregate_match = line.match(/\Astore\s+(.+?)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)) && aggregate_type?(aggregate_match[1])
             return emit_aggregate_store(aggregate_match[1], aggregate_match[2], aggregate_match[3])
+          end
+          if (pointer_match = line.match(/\Astore\s+(?:ptr|.+?\*)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/))
+            return emit_pointer_store(pointer_match[1], pointer_match[2])
           end
 
           match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
@@ -584,11 +739,16 @@ module PFC
           destination = line.destination
           bits = line.bits
           pointer = line.pointer
+        elsif line.respond_to?(:value_type) && line.value_type == "ptr"
+          return emit_pointer_load(line.destination, line.pointer)
         elsif line.respond_to?(:value_type) && line.value_type && aggregate_type?(line.value_type)
           return emit_aggregate_load(line.destination, line.value_type, line.pointer)
         else
           if (aggregate_match = line.match(/\A(#{NAME})\s*=\s*load\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)) && aggregate_type?(aggregate_match[2])
             return emit_aggregate_load(aggregate_match[1], aggregate_match[2], aggregate_match[3])
+          end
+          if (pointer_match = line.match(/\A(#{NAME})\s*=\s*load\s+(?:ptr|.+?\*),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/))
+            return emit_pointer_load(pointer_match[1], pointer_match[2])
           end
 
           match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
@@ -665,7 +825,7 @@ module PFC
             value = line.value
             to_bits = line.to_bits
           end
-        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})\s+to\s+i(1|8|16|32|64)\z/))
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr|.+?\*)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
           return emit_ptrtoint_cast(match[1], match[2], match[3].to_i)
         elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/))
           return emit_inttoptr_cast(match[1], match[2])
@@ -692,9 +852,26 @@ module PFC
         ["    #{target} = #{unsigned_cast(to_bits)}((#{encoded}) & #{integer_mask_literal(to_bits)});"]
       end
 
+      def emit_freeze(line)
+        if line.value_type == "ptr"
+          pointers[line.destination] = EncodedPointer.new(value: register(line.destination))
+          return ["    #{register(line.destination)} = #{encoded_pointer_value(line.value)};"]
+        end
+        unless line.bits
+          raise Frontend::LLVMSubset::ParseError, "unsupported freeze type: #{line.value_type}"
+        end
+
+        ["    #{register(line.destination)} = #{unsigned_cast(line.bits)}((#{llvm_value(line.value)}) & #{integer_mask_literal(line.bits)});"]
+      end
+
       def emit_extractvalue(line)
         aggregate_type = line.aggregate_type
         offset, value_type = aggregate_index_info(aggregate_type, line.indices)
+        if pointer_type_name?(value_type)
+          aggregate = aggregate_register(line.aggregate)
+          pointers[line.destination] = EncodedPointer.new(value: register(line.destination))
+          return ["    #{register(line.destination)} = pf_llvm_load(#{aggregate.fetch(:name)}, #{offset}, #{pointer_size});"]
+        end
         unless value_type.match?(/\Ai(?:1|8|16|32|64)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported extractvalue result type: #{value_type}"
         end
@@ -710,6 +887,19 @@ module PFC
         aggregate = aggregate_register(line.destination)
         source = aggregate_value_bytes(line.aggregate, line.aggregate_type)
         offset, value_type = aggregate_index_info(line.aggregate_type, line.indices)
+        if pointer_type_name?(value_type)
+          copy_prefix = next_aggregate_copy_prefix
+          encoded = encoded_pointer_value(line.value)
+          return [
+            "    {",
+            "        int #{copy_prefix}_i = 0;",
+            "        for (#{copy_prefix}_i = 0; #{copy_prefix}_i < #{aggregate.fetch(:size)}; #{copy_prefix}_i++) {",
+            "            #{aggregate.fetch(:name)}[#{copy_prefix}_i] = #{source ? "#{source}[#{copy_prefix}_i]" : '0u'};",
+            "        }",
+            "        pf_llvm_store(#{aggregate.fetch(:name)}, #{offset}, #{encoded}, #{pointer_size});",
+            "    }"
+          ]
+        end
         unless value_type.match?(/\Ai(?:1|8|16|32|64)\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported insertvalue field type: #{value_type}"
         end
@@ -738,6 +928,22 @@ module PFC
         pointer_map = context ? context.fetch(:pointers) : pointers
         pointer_map[destination] = pointer_binding(value, context:)
         []
+      end
+
+      def emit_pointer_load(destination, pointer)
+        address = memory_address(pointer)
+        pointers[destination] = EncodedPointer.new(value: register(destination))
+        slot_lines(address, pointer_size) + [
+          "    #{register(destination)} = pf_llvm_load(#{address.memory}, pf_slot_index, #{pointer_size});"
+        ]
+      end
+
+      def emit_pointer_store(value, pointer)
+        address = memory_address(pointer)
+        ensure_writable_address!(address)
+        dynamic_writable_address_lines(address) + slot_lines(address, pointer_size) + [
+          "    pf_llvm_store(#{address.memory}, pf_slot_index, #{encoded_pointer_value(value)}, #{pointer_size});"
+        ]
       end
 
       def emit_aggregate_load(destination, value_type, pointer)
@@ -819,6 +1025,7 @@ module PFC
         return [] if llvm_noop_intrinsic?(call.fetch(:function_name))
         return emit_expect_intrinsic(call) if llvm_expect_intrinsic?(call.fetch(:function_name))
         return emit_memory_intrinsic_call(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
+        return emit_numeric_intrinsic_call(call) if llvm_numeric_intrinsic?(call.fetch(:function_name))
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
           output = ["    pf_ch = getchar();"]
@@ -990,6 +1197,7 @@ module PFC
           when :binary then return emit_inline_binary(line, context)
           when :select then return emit_inline_select(line, context)
           when :cast then return emit_inline_cast(line, context)
+          when :freeze then return emit_inline_freeze(line, context)
           when :icmp then return emit_inline_icmp(line, context)
           when :call then return emit_inline_call(line, context)
           when :switch then return emit_inline_switch(line, context, label)
@@ -998,7 +1206,7 @@ module PFC
           when :unreachable then return emit_unreachable
           end
 
-          raise Frontend::LLVMSubset::ParseError, "unsupported internal function instruction: #{line}"
+          raise Frontend::LLVMSubset::ParseError, unsupported_instruction_message(line)
         end
       end
 
@@ -1067,7 +1275,13 @@ module PFC
           bits = line.bits
           value = line.value
           pointer = line.pointer
+        elsif line.respond_to?(:value_type) && line.value_type == "ptr"
+          return emit_inline_pointer_store(line.value, line.pointer, context)
         else
+          if (pointer_match = line.match(/\Astore\s+(?:ptr|.+?\*)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/))
+            return emit_inline_pointer_store(pointer_match[1], pointer_match[2], context)
+          end
+
           match = line.match(/\Astore\s+i(1|8|16|32|64)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported store: #{line}" unless match
 
@@ -1088,7 +1302,13 @@ module PFC
           destination = line.destination
           bits = line.bits
           pointer = line.pointer
+        elsif line.respond_to?(:value_type) && line.value_type == "ptr"
+          return emit_inline_pointer_load(line.destination, line.pointer, context)
         else
+          if (pointer_match = line.match(/\A(#{NAME})\s*=\s*load\s+(?:ptr|.+?\*),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/))
+            return emit_inline_pointer_load(pointer_match[1], pointer_match[2], context)
+          end
+
           match = line.match(/\A(#{NAME})\s*=\s*load\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)
           raise Frontend::LLVMSubset::ParseError, "unsupported load: #{line}" unless match
 
@@ -1165,7 +1385,7 @@ module PFC
             value = line.value
             to_bits = line.to_bits
           end
-        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME})\s+to\s+i(1|8|16|32|64)\z/))
+        elsif (match = line.match(/\A(#{NAME})\s*=\s*ptrtoint\s+(?:ptr|.+?\*)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
           return emit_ptrtoint_cast(match[1], match[2], match[3].to_i, context:)
         elsif (match = line.match(/\A(#{NAME})\s*=\s*inttoptr\s+i(?:1|8|16|32|64)\s+(.+?)\s+to\s+(?:ptr|.+?\*)\z/))
           return emit_inttoptr_cast(match[1], match[2], context:)
@@ -1185,6 +1405,34 @@ module PFC
 
         local = inline_register(context, destination)
         ["    #{local} = #{cast_expression(operator, from_bits, to_bits, inline_value(value, context))};"]
+      end
+
+      def emit_inline_freeze(line, context)
+        if line.value_type == "ptr"
+          context.fetch(:pointers)[line.destination] = EncodedPointer.new(value: inline_register(context, line.destination))
+          return ["    #{inline_register(context, line.destination)} = #{encoded_pointer_value(line.value, context:)};"]
+        end
+        unless line.bits
+          raise Frontend::LLVMSubset::ParseError, "unsupported freeze type: #{line.value_type}"
+        end
+
+        ["    #{inline_register(context, line.destination)} = #{unsigned_cast(line.bits)}((#{inline_value(line.value, context)}) & #{integer_mask_literal(line.bits)});"]
+      end
+
+      def emit_inline_pointer_load(destination, pointer, context)
+        address = memory_address(pointer, context:)
+        context.fetch(:pointers)[destination] = EncodedPointer.new(value: inline_register(context, destination))
+        inline_slot_lines(address, pointer_size) + [
+          "    #{inline_register(context, destination)} = pf_llvm_load(#{address.memory}, pf_slot_index, #{pointer_size});"
+        ]
+      end
+
+      def emit_inline_pointer_store(value, pointer, context)
+        address = memory_address(pointer, context:)
+        ensure_writable_address!(address)
+        dynamic_writable_address_lines(address) + inline_slot_lines(address, pointer_size) + [
+          "    pf_llvm_store(#{address.memory}, pf_slot_index, #{encoded_pointer_value(value, context:)}, #{pointer_size});"
+        ]
       end
 
       def emit_inline_icmp(line, context)
@@ -1224,6 +1472,7 @@ module PFC
         return [] if llvm_noop_intrinsic?(call.fetch(:function_name))
         return emit_expect_intrinsic(call, context:) if llvm_expect_intrinsic?(call.fetch(:function_name))
         return emit_memory_intrinsic_call(call, context:) if llvm_memory_intrinsic?(call.fetch(:function_name))
+        return emit_numeric_intrinsic_call(call, context:) if llvm_numeric_intrinsic?(call.fetch(:function_name))
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
           output = ["    pf_ch = getchar();"]
@@ -2048,7 +2297,7 @@ module PFC
       end
 
       def parsed_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:[-\w]+\s+)*(i(?:1|8|16|32|64)|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64)|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         {
@@ -2080,6 +2329,7 @@ module PFC
         return validate_memory_intrinsic_signature!(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
         return validate_noop_intrinsic_signature!(call) if llvm_noop_intrinsic?(call.fetch(:function_name))
         return validate_expect_intrinsic_signature!(call) if llvm_expect_intrinsic?(call.fetch(:function_name))
+        return validate_numeric_intrinsic_signature!(call) if llvm_numeric_intrinsic?(call.fetch(:function_name))
 
         signature = function_signature(call.fetch(:function_name))
         unless signature
@@ -2141,6 +2391,18 @@ module PFC
         name.start_with?("llvm.expect.")
       end
 
+      def llvm_numeric_intrinsic?(name)
+        llvm_minmax_intrinsic?(name) || llvm_abs_intrinsic?(name)
+      end
+
+      def llvm_minmax_intrinsic?(name)
+        name.match?(/\Allvm\.(?:smax|smin|umax|umin)\.i(?:1|8|16|32|64)\z/)
+      end
+
+      def llvm_abs_intrinsic?(name)
+        name.match?(/\Allvm\.abs\.i(?:1|8|16|32|64)\z/)
+      end
+
       def llvm_memset_intrinsic?(name)
         name.start_with?("llvm.memset.")
       end
@@ -2193,6 +2455,36 @@ module PFC
         value = context ? inline_value(argument.fetch(:value), context) : llvm_value(argument.fetch(:value))
         target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
         ["    #{target} = #{unsigned_cast(bits)}((#{value}) & #{integer_mask_literal(bits)});"]
+      end
+
+      def validate_numeric_intrinsic_signature!(call)
+        name = call.fetch(:function_name)
+        bits = name[/\.i(1|8|16|32|64)\z/, 1]&.to_i
+        unless bits && call.fetch(:return_type) == "i#{bits}"
+          raise Frontend::LLVMSubset::ParseError, "call return type mismatch for @#{name}: expected i#{bits}, got #{call.fetch(:return_type)}"
+        end
+
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        expected = llvm_abs_intrinsic?(name) ? ["i#{bits}", "i1"] : ["i#{bits}", "i#{bits}"]
+        validate_memory_intrinsic_arguments!(name, arguments, expected)
+        unless call.fetch(:destination)
+          raise Frontend::LLVMSubset::ParseError, "numeric intrinsic must assign a result: @#{name}"
+        end
+      end
+
+      def emit_numeric_intrinsic_call(call, context: nil)
+        name = call.fetch(:function_name)
+        bits = name[/\.i(1|8|16|32|64)\z/, 1].to_i
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        left = scalar_value(arguments.fetch(0).fetch(:value), context:)
+        expression = if llvm_abs_intrinsic?(name)
+                       abs_expression(bits, left)
+                     else
+                       right = scalar_value(arguments.fetch(1).fetch(:value), context:)
+                       minmax_expression(name, bits, left, right)
+                     end
+        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
+        ["    #{target} = #{unsigned_cast(bits)}((#{expression}) & #{integer_mask_literal(bits)});"]
       end
 
       def validate_memory_intrinsic_signature!(call)
@@ -2437,6 +2729,15 @@ module PFC
         stripped = name.to_s.strip
         return encoded_memory_address("0ull") if stripped == "null"
 
+        constant = constant_gep_pointer(strip_value_attributes(stripped), context:)
+        if constant
+          return encoded_memory_address(constant.value) if constant.is_a?(EncodedPointer)
+          return MemoryAddress.new(limit: "PF_LLVM_GLOBAL_MEMORY_SIZE", memory: "llvm_global_memory", name: constant.name, readonly: !global_numeric_mutability.fetch(constant.name, false), readonly_expression: nil, offset: constant.offset) if constant.is_a?(GlobalMemoryPointer)
+          return MemoryAddress.new(limit: "PF_LLVM_STRING_MEMORY_SIZE", memory: "llvm_string_memory", name: constant.name, offset: global_string_offset_expression(constant), readonly: true) if constant.is_a?(GlobalStringPointer)
+
+          return MemoryAddress.new(limit: "PF_LLVM_MEMORY_SIZE", memory: "llvm_memory", offset: constant, readonly: false)
+        end
+
         pointer = if global_strings.key?(stripped)
                     GlobalStringPointer.new(name: stripped, offset: 0)
                   else
@@ -2530,7 +2831,7 @@ module PFC
       end
 
       def encoded_pointer_value(raw, context: nil)
-        stripped = raw.to_s.strip
+        stripped = strip_value_attributes(raw)
         return "0ull" if stripped == "null"
 
         pointer = pointer_binding(stripped, context:)
@@ -2548,7 +2849,7 @@ module PFC
       end
 
       def pointer_binding(raw, context: nil)
-        stripped = raw.to_s.strip
+        stripped = strip_value_attributes(raw)
         constant = constant_gep_pointer(stripped, context:)
         return constant if constant
 
@@ -2557,6 +2858,19 @@ module PFC
         return GlobalStringPointer.new(name: token, offset: 0) if global_strings.key?(token)
 
         resolve_pointer(token, context:)
+      end
+
+      def strip_value_attributes(raw)
+        stripped = raw.to_s.strip
+        loop do
+          updated = stripped
+          updated = updated.sub(/\A(?:noundef|nonnull|noalias|readonly|writeonly|returned|nocapture)\s+/, "")
+          updated = updated.sub(/\A(?:dereferenceable|dereferenceable_or_null|align|captures)\([^)]*\)\s+/, "")
+          updated = updated.sub(/\Aalign\s+\d+\s+/, "")
+          break stripped if updated == stripped
+
+          stripped = updated
+        end
       end
 
       def constant_gep_pointer(raw, context:)
@@ -2589,6 +2903,11 @@ module PFC
 
       def phi?(line)
         line.match?(/\A#{NAME}\s*=\s*phi\b/)
+      end
+
+      def unsupported_instruction_message(line)
+        opcode = line.to_s[/\A(?:#{NAME}\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
+        "unsupported LLVM instruction #{opcode}: #{line}. Run `pfc llvm-capabilities` for the supported subset or `pfc llvm-capabilities --check FILE.ll` to preflight a file."
       end
 
       def c_label(label)
@@ -2687,6 +3006,19 @@ module PFC
         when "lshr" then "(#{left}) >> (#{right})"
         when "ashr" then "#{unsigned_cast(bits)}((#{signed_expression(left, bits)}) >> (#{right}))"
         end
+      end
+
+      def minmax_expression(name, bits, left, right)
+        signed = name.include?(".smax.") || name.include?(".smin.")
+        minimum = name.include?("min")
+        left_compare = signed ? signed_expression(left, bits) : left
+        right_compare = signed ? signed_expression(right, bits) : right
+        operator = minimum ? "<" : ">"
+        "((#{left_compare}) #{operator} (#{right_compare}) ? (#{left}) : (#{right}))"
+      end
+
+      def abs_expression(bits, value)
+        "(((#{value}) & #{sign_bit_literal(bits)}) ? ((~(#{value}) + 1ull) & #{integer_mask_literal(bits)}) : ((#{value}) & #{integer_mask_literal(bits)}))"
       end
 
       def cast_expression(operator, from_bits, to_bits, value)

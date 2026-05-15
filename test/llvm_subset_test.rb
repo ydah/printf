@@ -703,7 +703,8 @@ class LLVMSubsetTest < Minitest::Test
       PFC::Backend::LLVMCEmitter.new(source).emit
     end
 
-    assert_equal "line 3: unsupported LLVM instruction: fence seq_cst", error.message
+    assert_includes error.message, "line 3: unsupported LLVM instruction fence: fence seq_cst"
+    assert_includes error.message, "llvm-capabilities --check"
   end
 
   def test_rejects_wrong_call_argument_count
