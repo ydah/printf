@@ -12,6 +12,7 @@ class LLVMConformanceTest < Minitest::Test
   SUPPORTED_FIXTURES = {
     "aggregate_phi_fields.ll" => "B",
     "aggregate_argument_abi.ll" => "B",
+    "compound_gep_lifetime.ll" => "B",
     "internal_array_abi.ll" => "B",
     "minimal_return.ll" => "",
     "i128_add_signed_cmp.ll" => "B",
@@ -19,6 +20,7 @@ class LLVMConformanceTest < Minitest::Test
     "internal_aggregate_calls.ll" => "B",
     "internal_memory_aggregate.ll" => "B",
     "internal_memory_intrinsics.ll" => "B",
+    "libc_string_copy.ll" => "B",
     "libc_string_search.ll" => "B",
     "libc_memory_strlen.ll" => "B",
     "libc_string_compare.ll" => "B",
@@ -26,6 +28,8 @@ class LLVMConformanceTest < Minitest::Test
     "aggregate_icmp.ll" => "B",
     "sret_multiple_byval_abi.ll" => "B",
     "sret_byval_abi.ll" => "B",
+    "overflow_intrinsics.ll" => "B",
+    "select_phi_matrix.ll" => "B",
     "vector_add.ll" => "B",
     "vector_pointer_abi.ll" => "B",
     "vector_pointer_lanes.ll" => "B",
@@ -36,8 +40,10 @@ class LLVMConformanceTest < Minitest::Test
 
   UNSUPPORTED_FIXTURES = {
     "addrspace.ll" => "unsupported non-zero address space cast",
+    "alloca_addrspace.ll" => "unsupported alloca address space",
     "atomic.ll" => "unsupported atomic operation",
     "blockaddress.ll" => "unsupported blockaddress constant expression",
+    "escaped_local_pointer.ll" => "unsupported escaped local pointer",
     "exception_handling.ll" => "unsupported exception handling instruction",
     "external_global.ll" => "unsupported external global reference",
     "float_add.ll" => "unsupported floating-point type",
@@ -216,6 +222,20 @@ class LLVMConformanceTest < Minitest::Test
     assert_includes out, "unsupported:"
     assert_includes out, "summary:"
     assert_includes out, "float_add.ll"
+  end
+
+  def test_coverage_report_summarizes_opcodes_and_diagnostics
+    out, err = capture_io do
+      assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--coverage-report", "--json", File.join(FIXTURE_ROOT, "unsupported")]).run
+    end
+
+    assert_empty err
+    report = JSON.parse(out)
+    assert_equal 1, report.fetch("schema_version")
+    assert report.fetch("summary").fetch("instructions") > 0
+    assert report.fetch("opcodes").any? { |entry| entry.fetch("opcode") == "ret" }
+    assert report.fetch("diagnostics").any? { |entry| entry.fetch("count") > 0 }
+    assert report.fetch("severities").any? { |entry| entry.fetch("severity") == "error" }
   end
 
   def test_check_dir_json_summary_filters_and_fail_on_warning

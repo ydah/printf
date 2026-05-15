@@ -134,6 +134,7 @@ module PFC
     def llvm_capabilities_command
       check = false
       check_dir = false
+      coverage_report = false
       emit_lowering_plan = false
       explain = false
       exclude_patterns = []
@@ -151,6 +152,9 @@ module PFC
         when "--check-dir"
           check = true
           check_dir = true
+        when "--coverage-report", "--coverage"
+          check = true
+          coverage_report = true
         when "--explain"
           check = true
           explain = true
@@ -192,7 +196,9 @@ module PFC
       if check
         path = require_input_path!
         raise ArgumentError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
+        check_dir = true if coverage_report && File.directory?(path)
         raise ArgumentError, "--include/--exclude are only supported with --check-dir" if !check_dir && (!include_patterns.empty? || !exclude_patterns.empty?)
+        raise ArgumentError, "--coverage-report is incompatible with --format=sarif" if coverage_report && format == "sarif"
         if check_dir
           raise ArgumentError, "llvm-capabilities --check-dir requires a directory" unless File.directory?(path)
           result = llvm_check_directory_result(path, include_patterns:, exclude_patterns:, fail_on:, max_warnings:)
@@ -202,7 +208,14 @@ module PFC
         end
         llvm_validate_result_schema!(result) if validate_schema
 
-        if format == "sarif"
+        if coverage_report
+          report = llvm_coverage_report(path, result)
+          if json || format == "json"
+            puts JSON.pretty_generate(report)
+          else
+            print_llvm_coverage_report(report)
+          end
+        elsif format == "sarif"
           puts JSON.pretty_generate(llvm_sarif(result))
         elsif emit_lowering_plan
           puts JSON.pretty_generate(llvm_lowering_plan(result))
@@ -314,6 +327,76 @@ module PFC
     def print_llvm_check_summary(result)
       summary = result.fetch(:summary)
       puts "summary: files=#{summary.fetch(:files)} supported=#{summary.fetch(:supported_files)} unsupported=#{summary.fetch(:unsupported_files)} errors=#{summary.fetch(:errors)} warnings=#{summary.fetch(:warnings)}"
+    end
+
+    def llvm_coverage_report(path, result)
+      files = result.key?(:files) ? result.fetch(:files) : [result]
+      opcode_counts = Hash.new(0)
+      diagnostic_counts = Hash.new(0)
+      severity_counts = Hash.new(0)
+      files.each do |file|
+        File.read(file.fetch(:path)).each_line do |raw_line|
+          line = llvm_coverage_instruction_line(raw_line)
+          next unless line
+
+          opcode = llvm_diagnostic_opcode(line)
+          opcode_counts[opcode] += 1 if opcode
+        end
+        file.fetch(:diagnostics, []).each do |diagnostic|
+          diagnostic_counts[diagnostic.fetch(:opcode) || "unknown"] += 1
+          severity_counts[diagnostic.fetch(:severity)] += 1
+        end
+      end
+      diagnostics = files.flat_map { |file| file.fetch(:diagnostics, []) }
+      {
+        schema_version: 1,
+        path:,
+        supported: result.fetch(:supported),
+        summary: result.fetch(:summary).merge(
+          instructions: opcode_counts.values.sum,
+          unique_opcodes: opcode_counts.length,
+          diagnostic_opcodes: diagnostic_counts.length
+        ),
+        opcodes: opcode_counts.sort.map { |opcode, count| { opcode:, count: } },
+        diagnostics: diagnostic_counts.sort.map { |opcode, count| { opcode:, count: } },
+        severities: severity_counts.sort.map { |severity, count| { severity:, count: } },
+        unsupported_examples: diagnostics.first(10).map do |diagnostic|
+          {
+            path: files.find { |file| file.fetch(:diagnostics, []).include?(diagnostic) }&.fetch(:path),
+            line: diagnostic.fetch(:line),
+            severity: diagnostic.fetch(:severity),
+            opcode: diagnostic.fetch(:opcode),
+            message: diagnostic.fetch(:message)
+          }
+        end
+      }
+    end
+
+    def llvm_coverage_instruction_line(raw_line)
+      line = raw_line.sub(/;.*/, "").strip
+      return nil if line.empty? || line == "}" || line.match?(/\A[-A-Za-z$._0-9]+:\z/)
+      return nil if line.match?(/\A(?:source_filename|target|attributes|![A-Za-z0-9_.-]+|declare|define)\b/)
+      return nil if line.match?(/\A%[-A-Za-z$._0-9]+\s*=\s*type\b/)
+      return nil if line.match?(/\A#dbg_[A-Za-z0-9_.]+\b/)
+      return nil if line.match?(/\A[@%][-A-Za-z$._0-9]+\s*=/) && !line.include?(" = ")
+
+      line
+    end
+
+    def print_llvm_coverage_report(report)
+      summary = report.fetch(:summary)
+      puts "coverage: #{report.fetch(:path)}"
+      puts "summary: files=#{summary.fetch(:files)} supported=#{summary.fetch(:supported_files)} unsupported=#{summary.fetch(:unsupported_files)} instructions=#{summary.fetch(:instructions)} opcodes=#{summary.fetch(:unique_opcodes)} diagnostics=#{summary.fetch(:diagnostics)}"
+      puts "opcodes:"
+      report.fetch(:opcodes).each do |entry|
+        puts "  #{entry.fetch(:opcode)}: #{entry.fetch(:count)}"
+      end
+      return if report.fetch(:diagnostics).empty?
+
+      puts "diagnostics:"
+      report.fetch(:diagnostics).each do |entry|
+        puts "  #{entry.fetch(:opcode)}: #{entry.fetch(:count)}"
+      end
     end
 
     def llvm_lowering_plan(result)
@@ -880,6 +963,7 @@ module PFC
           pfc llvm-capabilities [--json]
           pfc llvm-capabilities --check [--json] [--format=json|sarif] [--fix-suggestions] [--emit-lowering-plan] [--validate-schema] [--fail-on=error|warning|none] [--max-warnings=N] INPUT.ll
           pfc llvm-capabilities --check-dir [--json] [--format=json|sarif] [--emit-lowering-plan] [--validate-schema] [--include=GLOB] [--exclude=GLOB] [--fail-on=error|warning|none] [--max-warnings=N] DIR
+          pfc llvm-capabilities --coverage-report [--json] INPUT.ll|DIR
           pfc llvm-capabilities --explain INPUT.ll
 
         Options:
@@ -902,14 +986,14 @@ module PFC
             - fixed-length integer vector alloca/load/store byte copies in main and internal functions
             - pointer load/store and pointer fields inside aggregates
             - read-only global string byte memory for load/getelementptr/ptrtoint
-            - constant and dynamic getelementptr for integer, array, and struct element sizes
+            - constant and dynamic getelementptr for integer, array, struct, vector, and compound aggregate element sizes
             - constant-expression getelementptr/bitcast/inttoptr pointer operands and global initializer relocations
             - llvm.memcpy.inline.* over local/global memory
             - named struct alloca and struct field getelementptr
             - constant-count alloca, with dynamic-count alloca reserving tape-size capacity
             - volatile load/store accepted as backend-equivalent memory access
             - llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory
-            - llvm.lifetime.start/end accepted as no-op intrinsics
+            - llvm.lifetime.start/end accepted as no-op intrinsics, including typed and untyped forms
           values:
             - true/false/undef/poison/zeroinitializer scalar constants
             - add/sub/mul, signed/unsigned division and remainder
@@ -923,7 +1007,7 @@ module PFC
             - integer, pointer, and aggregate select
             - pointer phi
             - freeze
-            - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
+            - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, llvm.cttz, and llvm.[su]{add,sub,mul}.with.overflow scalar intrinsics
             - aggregate byte equality/compare helpers for libc and future aggregate lowering
             - extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values
             - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks
@@ -945,15 +1029,16 @@ module PFC
             - llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals
             - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode
             - llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output
+            - llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, and severities for a file or directory
             - llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning
             - docs/llvm-capabilities.schema.json publishes the check JSON contract
             - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
             - info-level diagnostics distinguish accepted backend-equivalent constructs from warnings and errors
             - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
-            - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
+            - llvm.assume.*, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.expect.* accepted as identity intrinsic
           libc:
-            - putchar, getchar, puts, strlen, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, memcpy, memmove, memset, memcmp, memchr
+            - putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, memcpy, memmove, memset, memcmp, memchr
             - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags
       TEXT
     end
@@ -967,14 +1052,14 @@ module PFC
           "fixed-length integer vector alloca/load/store byte copies in main and internal functions",
           "pointer load/store and pointer fields inside aggregates",
           "read-only global string byte memory for load/getelementptr/ptrtoint",
-          "constant and dynamic getelementptr for integer, array, and struct element sizes",
+          "constant and dynamic getelementptr for integer, array, struct, vector, and compound aggregate element sizes",
           "constant-expression getelementptr/bitcast/inttoptr pointer operands and global initializer relocations",
           "llvm.memcpy.inline.* over local/global memory",
           "named struct alloca and struct field getelementptr",
           "constant-count alloca, with dynamic-count alloca reserving tape-size capacity",
           "volatile load/store accepted as backend-equivalent memory access",
           "llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory",
-          "llvm.lifetime.start/end accepted as no-op intrinsics"
+          "llvm.lifetime.start/end accepted as no-op intrinsics, including typed and untyped forms"
         ],
         values: [
           "true/false/undef/poison/zeroinitializer scalar constants",
@@ -989,7 +1074,7 @@ module PFC
           "integer, pointer, and aggregate select",
           "pointer phi",
           "freeze",
-          "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
+          "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, llvm.cttz, and llvm.[su]{add,sub,mul}.with.overflow scalar intrinsics",
           "aggregate byte equality/compare helpers for libc and future aggregate lowering",
           "extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values",
           "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks",
@@ -1013,16 +1098,17 @@ module PFC
           "llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals",
           "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode",
           "llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output",
+          "llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, and severities for a file or directory",
           "llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning",
           "docs/llvm-capabilities.schema.json publishes the check JSON contract",
           "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
           "info-level diagnostics distinguish accepted backend-equivalent constructs from warnings and errors",
           "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
-          "llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
+          "llvm.assume.*, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [
-          "putchar, getchar, puts, strlen, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, memcpy, memmove, memset, memcmp, memchr",
+          "putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, memcpy, memmove, memset, memcmp, memchr",
           "static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags"
         ]
       }

@@ -13,7 +13,8 @@ module PFC
         INTEGER_TYPE = /i(?:1|8|16|32|64)/
         VECTOR_TYPE = /<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>/
         AGGREGATE_TYPE = /(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\])/
-        RETURN_TYPE = /(?:#{INTEGER_TYPE}|i128|#{VECTOR_TYPE}|#{AGGREGATE_TYPE}|ptr|void)/
+        STRUCT_LITERAL_TYPE = /(?:<)?\{.*\}(?:>)?/
+        RETURN_TYPE = /(?:#{INTEGER_TYPE}|i128|#{VECTOR_TYPE}|#{AGGREGATE_TYPE}|#{STRUCT_LITERAL_TYPE}|ptr|void)/
         ATTRIBUTE_TOKEN = /[-\w]+(?:\([^)]*\))?/
 
         class Instruction
@@ -156,7 +157,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+            match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)(?:\s+\[.*\])?\z/)
             return unless match
 
             @destination = match[1]
@@ -381,7 +382,7 @@ module PFC
             if (match = text.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+(.+)\z/))
               operands = Instruction.split_arguments(match[3])
               if operands.length == 2
-                true_match = operands.fetch(0).match(/\A(#{AGGREGATE_TYPE})\s+(.+)\z/)
+                true_match = operands.fetch(0).match(/\A(#{VECTOR_TYPE}|#{AGGREGATE_TYPE}|#{STRUCT_LITERAL_TYPE})\s+(.+)\z/)
                 false_match = operands.fetch(1).match(/\A#{Regexp.escape(true_match[1])}\s+(.+)\z/) if true_match
                 if true_match && false_match
                   @destination = match[1]

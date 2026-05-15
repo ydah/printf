@@ -10,12 +10,17 @@ module PFC
           case call.fetch(:function_name)
           when "memcmp" then emit_memcmp_call(call, context:)
           when "memchr" then emit_memchr_call(call, context:)
+          when "strcat" then emit_strcat_call(call, nil, context:)
           when "strchr" then emit_strchr_call(call, reverse: false, context:)
-          when "strrchr" then emit_strchr_call(call, reverse: true, context:)
-          when "strpbrk" then emit_strpbrk_call(call, context:)
-          when "strspn" then emit_strspan_call(call, stop_on_match: false, context:)
-          when "strcspn" then emit_strspan_call(call, stop_on_match: true, context:)
           when "strcmp" then emit_strcmp_call(call, nil, context:)
+          when "strcpy" then emit_strcpy_call(call, nil, context:)
+          when "strcspn" then emit_strspan_call(call, stop_on_match: true, context:)
+          when "strdup" then emit_strdup_call(call, context:)
+          when "strncat" then emit_strcat_call(call, parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(2), context:)
+          when "strncpy" then emit_strcpy_call(call, parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(2), context:)
+          when "strpbrk" then emit_strpbrk_call(call, context:)
+          when "strrchr" then emit_strchr_call(call, reverse: true, context:)
+          when "strspn" then emit_strspan_call(call, stop_on_match: false, context:)
           else emit_strcmp_call(call, parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(2), context:)
           end
         end
@@ -207,6 +212,154 @@ module PFC
             "            fprintf(stderr, \"pfc runtime error: strpbrk missing null terminator\\n\");",
             "            PF_ABORT();",
             "        }",
+            "    }"
+          ]
+        end
+
+        def emit_strcpy_call(call, limit_argument, context:)
+          arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+          destination = memory_address(arguments.fetch(0).fetch(:value), context:)
+          ensure_writable_address!(destination)
+          source = memory_address(arguments.fetch(1).fetch(:value), context:)
+          prefix = next_memory_intrinsic_prefix
+          limit = limit_argument ? scalar_value(limit_argument.fetch(:value), context:) : "-1"
+          [
+            "    {",
+            "        long long #{prefix}_dst = (long long)(#{destination.offset});",
+            "        long long #{prefix}_src = (long long)(#{source.offset});",
+            "        long long #{prefix}_limit = (long long)(#{limit});",
+            "        long long #{prefix}_i = 0;",
+            "        int #{prefix}_copied_null = 0;",
+            *dynamic_valid_address_lines(destination),
+            *dynamic_valid_address_lines(source),
+            *dynamic_writable_address_lines(destination),
+            "        if (#{prefix}_dst < 0 || #{prefix}_src < 0 || #{prefix}_dst >= #{destination.limit} || #{prefix}_src >= #{source.limit} || #{prefix}_limit < -1) {",
+            "            fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} pointer out of range\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        while (#{prefix}_limit < 0 || #{prefix}_i < #{prefix}_limit) {",
+            "            unsigned char #{prefix}_ch;",
+            "            if (#{prefix}_dst + #{prefix}_i >= #{destination.limit}) {",
+            "                fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} destination out of range\\n\");",
+            "                PF_ABORT();",
+            "            }",
+            "            if (#{prefix}_src + #{prefix}_i >= #{source.limit}) {",
+            "                fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} missing null terminator\\n\");",
+            "                PF_ABORT();",
+            "            }",
+            "            #{prefix}_ch = #{source.memory}[#{prefix}_src + #{prefix}_i];",
+            "            #{destination.memory}[#{prefix}_dst + #{prefix}_i] = #{prefix}_ch;",
+            "            #{prefix}_i++;",
+            "            if (#{prefix}_ch == 0u) {",
+            "                #{prefix}_copied_null = 1;",
+            "                break;",
+            "            }",
+            "        }",
+            "        if (#{prefix}_limit < 0 && #{prefix}_copied_null == 0) {",
+            "            fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} missing null terminator\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        while (#{prefix}_limit >= 0 && #{prefix}_copied_null != 0 && #{prefix}_i < #{prefix}_limit) {",
+            "            if (#{prefix}_dst + #{prefix}_i >= #{destination.limit}) {",
+            "                fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} destination out of range\\n\");",
+            "                PF_ABORT();",
+            "            }",
+            "            #{destination.memory}[#{prefix}_dst + #{prefix}_i] = 0u;",
+            "            #{prefix}_i++;",
+            "        }",
+            "    }",
+            *emit_pointer_return_assignment(call.fetch(:destination), arguments.fetch(0).fetch(:value), context:)
+          ]
+        end
+
+        def emit_strcat_call(call, limit_argument, context:)
+          arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+          destination = memory_address(arguments.fetch(0).fetch(:value), context:)
+          ensure_writable_address!(destination)
+          source = memory_address(arguments.fetch(1).fetch(:value), context:)
+          prefix = next_memory_intrinsic_prefix
+          limit = limit_argument ? scalar_value(limit_argument.fetch(:value), context:) : "-1"
+          [
+            "    {",
+            "        long long #{prefix}_dst = (long long)(#{destination.offset});",
+            "        long long #{prefix}_src = (long long)(#{source.offset});",
+            "        long long #{prefix}_limit = (long long)(#{limit});",
+            "        long long #{prefix}_dst_len = 0;",
+            "        long long #{prefix}_i = 0;",
+            *dynamic_valid_address_lines(destination),
+            *dynamic_valid_address_lines(source),
+            *dynamic_writable_address_lines(destination),
+            "        if (#{prefix}_dst < 0 || #{prefix}_src < 0 || #{prefix}_dst >= #{destination.limit} || #{prefix}_src >= #{source.limit} || #{prefix}_limit < -1) {",
+            "            fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} pointer out of range\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        while (#{prefix}_dst + #{prefix}_dst_len < #{destination.limit} && #{destination.memory}[#{prefix}_dst + #{prefix}_dst_len] != 0u) {",
+            "            #{prefix}_dst_len++;",
+            "        }",
+            "        if (#{prefix}_dst + #{prefix}_dst_len >= #{destination.limit}) {",
+            "            fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} destination missing null terminator\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        while (#{prefix}_limit < 0 || #{prefix}_i < #{prefix}_limit) {",
+            "            unsigned char #{prefix}_ch;",
+            "            if (#{prefix}_src + #{prefix}_i >= #{source.limit}) {",
+            "                fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} missing null terminator\\n\");",
+            "                PF_ABORT();",
+            "            }",
+            "            #{prefix}_ch = #{source.memory}[#{prefix}_src + #{prefix}_i];",
+            "            if (#{prefix}_ch == 0u) break;",
+            "            if (#{prefix}_dst + #{prefix}_dst_len + #{prefix}_i >= #{destination.limit}) {",
+            "                fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} destination out of range\\n\");",
+            "                PF_ABORT();",
+            "            }",
+            "            #{destination.memory}[#{prefix}_dst + #{prefix}_dst_len + #{prefix}_i] = #{prefix}_ch;",
+            "            #{prefix}_i++;",
+            "        }",
+            "        if (#{prefix}_dst + #{prefix}_dst_len + #{prefix}_i >= #{destination.limit}) {",
+            "            fprintf(stderr, \"pfc runtime error: #{call.fetch(:function_name)} destination out of range\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        #{destination.memory}[#{prefix}_dst + #{prefix}_dst_len + #{prefix}_i] = 0u;",
+            "    }",
+            *emit_pointer_return_assignment(call.fetch(:destination), arguments.fetch(0).fetch(:value), context:)
+          ]
+        end
+
+        def emit_strdup_call(call, context:)
+          destination_name = call.fetch(:destination)
+          raise Frontend::LLVMSubset::ParseError, "strdup result must be assigned" unless destination_name
+
+          arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+          source = memory_address(arguments.fetch(0).fetch(:value), context:)
+          target = context ? inline_register(context, destination_name) : register(destination_name)
+          pointer_map = context ? context.fetch(:pointers) : pointers
+          pointer_map[destination_name] = EncodedPointer.new(value: target)
+          slot = strdup_slots.fetch(destination_name)
+          prefix = next_memory_intrinsic_prefix
+          [
+            "    {",
+            "        long long #{prefix}_src = (long long)(#{source.offset});",
+            "        long long #{prefix}_i = 0;",
+            "        int #{prefix}_copied_null = 0;",
+            *dynamic_valid_address_lines(source),
+            "        if (#{prefix}_src < 0 || #{prefix}_src >= #{source.limit}) {",
+            "            fprintf(stderr, \"pfc runtime error: strdup pointer out of range\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        while (#{prefix}_src + #{prefix}_i < #{source.limit} && #{prefix}_i < #{tape_size}) {",
+            "            unsigned char #{prefix}_ch = #{source.memory}[#{prefix}_src + #{prefix}_i];",
+            "            llvm_memory[#{slot} + #{prefix}_i] = #{prefix}_ch;",
+            "            #{prefix}_i++;",
+            "            if (#{prefix}_ch == 0u) {",
+            "                #{prefix}_copied_null = 1;",
+            "                break;",
+            "            }",
+            "        }",
+            "        if (#{prefix}_copied_null == 0) {",
+            "            fprintf(stderr, \"pfc runtime error: strdup missing null terminator or destination out of range\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        #{target} = (unsigned long long)#{slot};",
             "    }"
           ]
         end

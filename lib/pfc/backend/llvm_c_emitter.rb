@@ -40,10 +40,15 @@ module PFC
         "printf" => { return_type: "i32", parameter_types: ["ptr"], varargs: true },
         "putchar" => { return_type: "i32", parameter_types: ["i32"], varargs: false },
         "puts" => { return_type: "i32", parameter_types: ["ptr"], varargs: false },
+        "strcat" => { return_type: "ptr", parameter_types: %w[ptr ptr], varargs: false },
         "strchr" => { return_type: "ptr", parameter_types: %w[ptr i32], varargs: false },
         "strcmp" => { return_type: "i32", parameter_types: %w[ptr ptr], varargs: false },
         "strcspn" => { return_type: "i64", parameter_types: %w[ptr ptr], varargs: false },
+        "strcpy" => { return_type: "ptr", parameter_types: %w[ptr ptr], varargs: false },
+        "strdup" => { return_type: "ptr", parameter_types: %w[ptr], varargs: false },
+        "strncat" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
         "strpbrk" => { return_type: "ptr", parameter_types: %w[ptr ptr], varargs: false },
+        "strncpy" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
         "strrchr" => { return_type: "ptr", parameter_types: %w[ptr i32], varargs: false },
         "strncmp" => { return_type: "i32", parameter_types: %w[ptr ptr i64], varargs: false },
         "strspn" => { return_type: "i64", parameter_types: %w[ptr ptr], varargs: false },
@@ -70,6 +75,7 @@ module PFC
         @slots = {}
         @slot_count = 0
         @pointers = {}
+        @strdup_slots = {}
         @global_numeric_offsets, raw_global_numeric_bytes = build_global_numeric_layout
         @aggregate_registers = {}
         @i128_high_registers = {}
@@ -138,7 +144,7 @@ module PFC
 
       private
 
-      attr_reader :aggregate_registers, :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :i128_high_registers, :internal_functions, :pointers, :registers, :slot_count, :source, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
+      attr_reader :aggregate_registers, :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :i128_high_registers, :internal_functions, :pointers, :registers, :slot_count, :source, :strdup_slots, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -254,6 +260,7 @@ module PFC
 
       def analyze_allocations
         all_lines.each do |line|
+          analyze_alloca_line!(line)
           if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\](?:,\s+align\s+\d+)?\z/))
             allocate_pointer(match[1], match[2].to_i * byte_width(match[3].to_i))
           elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+(.+?)(?:,\s+i(?:32|64)\s+(.+?))?(?:,\s+align\s+\d+)?\z/))
@@ -261,10 +268,12 @@ module PFC
           elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32|64)(?:,\s+align\s+\d+)?\z/))
             allocate_pointer(match[1], byte_width(match[2].to_i))
           end
+          allocate_strdup_slot_for_call(line)
         end
 
         internal_functions.each_value do |function|
           function.fetch(:blocks).values.flatten.each do |line|
+            analyze_alloca_line!(line)
             if (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\](?:,\s+align\s+\d+)?\z/))
               function.fetch(:allocations)[match[1]] = allocate_slots(match[2].to_i * byte_width(match[3].to_i))
             elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+(.+?)(?:,\s+i(?:32|64)\s+(.+?))?(?:,\s+align\s+\d+)?\z/))
@@ -272,6 +281,7 @@ module PFC
             elsif (match = line.match(/\A(#{NAME})\s*=\s*alloca\s+i(1|8|16|32|64)(?:,\s+align\s+\d+)?\z/))
               function.fetch(:allocations)[match[1]] = allocate_slots(byte_width(match[2].to_i))
             end
+            allocate_strdup_slot_for_call(line)
           end
           function.fetch(:param_byval_types, []).each_with_index do |byval_type, index|
             next unless byval_type
@@ -280,6 +290,25 @@ module PFC
             function.fetch(:byval_slots)[param] ||= allocate_slots(type_size(byval_type))
           end
         end
+      end
+
+      def analyze_alloca_line!(line)
+        text = line.to_s
+        return unless text.match?(/\A#{NAME}\s*=\s*alloca\b/)
+
+        if (match = text.match(/\baddrspace\((\d+)\)/)) && match[1] != "0"
+          raise Frontend::LLVMSubset::ParseError, "unsupported alloca address space: addrspace(#{match[1]})"
+        end
+        if (match = text.match(/\balign\s+(-?\d+)/)) && match[1].to_i <= 0
+          raise Frontend::LLVMSubset::ParseError, "invalid alloca alignment: #{match[1]}"
+        end
+      end
+
+      def allocate_strdup_slot_for_call(line)
+        match = line.to_s.match(/\A(#{NAME})\s*=\s*(?:tail\s+|musttail\s+|notail\s+)?call\s+ptr\s+@strdup\(/)
+        return unless match
+
+        strdup_slots[match[1]] ||= allocate_slots(tape_size)
       end
 
       def analyze_registers
@@ -362,6 +391,8 @@ module PFC
                 else
                   tape_size
                 end
+        raise Frontend::LLVMSubset::ParseError, "negative alloca count is unsupported: #{raw_count}" if count.negative?
+
         [type_size(raw_type) * count, 1].max
       end
 
@@ -529,6 +560,10 @@ module PFC
             element_type = Regexp.last_match(2)
             offset = "((#{offset}) + ((#{value}) * #{type_size(element_type)}))"
             current_type = element_type
+          elsif current_type.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64)|ptr)>\z/)
+            element_type = Regexp.last_match(2)
+            offset = "((#{offset}) + ((#{value}) * #{type_size(element_type)}))"
+            current_type = element_type
           elsif struct_type?(current_type)
             field_index = raw_index.to_i
             layout = struct_layout(current_type)
@@ -574,7 +609,7 @@ module PFC
           if current_type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
             current_type = Regexp.last_match(2)
             offset += index * type_size(current_type)
-          elsif current_type.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
+          elsif current_type.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64)|ptr)>\z/)
             current_type = Regexp.last_match(2)
             offset += index * type_size(current_type)
           elsif struct_type?(current_type)
@@ -1424,12 +1459,26 @@ module PFC
       end
 
       def emit_internal_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|(?:<)?\{.*\}(?:>)?|ptr|void)\s+@([-A-Za-z$._0-9]+)\((.*)\)(?:\s+\[.*\])?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         destination = match[1]
         return_type = match[2]
         function = internal_functions.fetch(match[3]) do
+          call = {
+            destination:,
+            function_name: match[3],
+            raw_arguments: match[4],
+            return_type:
+          }
+          validate_call_signature!(
+            call,
+            line
+          )
+          arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+          if arguments.any? { |argument| local_pointer_argument?(argument) }
+            raise Frontend::LLVMSubset::ParseError, "unsupported escaped local pointer to external function @#{call.fetch(:function_name)}"
+          end
           raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}"
         end
         raise Frontend::LLVMSubset::ParseError, "void call cannot assign a result: #{line}" if destination && return_type == "void"
@@ -3008,7 +3057,7 @@ module PFC
       end
 
       def parsed_call(line)
-        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)\z/)
+        match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|(?:<)?\{.*\}(?:>)?|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)(?:\s+\[.*\])?\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
 
         {
@@ -3022,7 +3071,7 @@ module PFC
       def parse_typed_call_arguments(raw)
         split_call_arguments(raw).map do |argument|
           stripped = argument.strip
-          if (match = stripped.match(/\A(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\])\s+(.+)\z/))
+          if (match = stripped.match(/\A(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|(?:<)?\{.*\}(?:>)?)\s+(.+)\z/))
             next({ type: match[1], value: match[2] })
           end
           if stripped.start_with?("ptr ") || stripped.match?(/\A.+?\*\s+/)
@@ -3044,6 +3093,10 @@ module PFC
 
         signature = function_signature(call.fetch(:function_name))
         unless signature
+          arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+          if arguments.any? { |argument| local_pointer_argument?(argument) }
+            raise Frontend::LLVMSubset::ParseError, "unsupported escaped local pointer to unknown function @#{call.fetch(:function_name)}"
+          end
           raise Frontend::LLVMSubset::ParseError, "unknown function: @#{call.fetch(:function_name)}"
         end
         unless call.fetch(:return_type) == signature.fetch(:return_type)
@@ -3078,6 +3131,13 @@ module PFC
         function_signatures[name] || BUILTIN_FUNCTION_SIGNATURES[name]
       end
 
+      def local_pointer_argument?(argument)
+        return false unless argument.fetch(:type) == "ptr"
+
+        token = argument.fetch(:value).to_s.strip.split(/\s+/).last
+        pointers.key?(token) || @slots.key?(token) || strdup_slots.key?(token)
+      end
+
       def llvm_memory_intrinsic?(name)
         llvm_memset_intrinsic?(name) || llvm_memcpy_intrinsic?(name) || llvm_memmove_intrinsic?(name)
       end
@@ -3087,11 +3147,11 @@ module PFC
       end
 
       def llvm_lifetime_intrinsic?(name)
-        name.start_with?("llvm.lifetime.start.") || name.start_with?("llvm.lifetime.end.")
+        name.match?(/\Allvm\.lifetime\.(?:start|end)(?:\.|$)/)
       end
 
       def llvm_assume_intrinsic?(name)
-        name == "llvm.assume"
+        name == "llvm.assume" || name.start_with?("llvm.assume.")
       end
 
       def llvm_debug_intrinsic?(name)
@@ -3103,7 +3163,11 @@ module PFC
       end
 
       def llvm_numeric_intrinsic?(name)
-        llvm_minmax_intrinsic?(name) || llvm_abs_intrinsic?(name) || llvm_bit_count_intrinsic?(name) || llvm_bswap_intrinsic?(name)
+        llvm_minmax_intrinsic?(name) || llvm_abs_intrinsic?(name) || llvm_bit_count_intrinsic?(name) || llvm_bswap_intrinsic?(name) || llvm_overflow_intrinsic?(name)
+      end
+
+      def llvm_overflow_intrinsic?(name)
+        name.match?(/\Allvm\.[us](?:add|sub|mul)\.with\.overflow\.i(?:1|8|16|32|64)\z/)
       end
 
       def llvm_minmax_intrinsic?(name)
@@ -3139,7 +3203,7 @@ module PFC
       end
 
       def libc_string_memory_function?(name)
-        %w[memchr memcmp strchr strcmp strcspn strpbrk strrchr strncmp strspn].include?(name)
+        %w[memchr memcmp strcat strchr strcmp strcpy strcspn strdup strncat strncmp strncpy strpbrk strrchr strspn].include?(name)
       end
 
       def validate_noop_intrinsic_signature!(call)
@@ -3186,6 +3250,8 @@ module PFC
 
       def validate_numeric_intrinsic_signature!(call)
         name = call.fetch(:function_name)
+        return validate_overflow_intrinsic_signature!(call) if llvm_overflow_intrinsic?(name)
+
         bits = name[/\.i(1|8|16|32|64)\z/, 1]&.to_i
         unless bits && call.fetch(:return_type) == "i#{bits}"
           raise Frontend::LLVMSubset::ParseError, "call return type mismatch for @#{name}: expected i#{bits}, got #{call.fetch(:return_type)}"
@@ -3205,8 +3271,26 @@ module PFC
         end
       end
 
+      def validate_overflow_intrinsic_signature!(call)
+        name = call.fetch(:function_name)
+        bits = overflow_intrinsic_bits(name)
+        expected_return = "{ i#{bits}, i1 }"
+        actual_return = call.fetch(:return_type).to_s.gsub(/\s+/, " ")
+        unless actual_return == expected_return
+          raise Frontend::LLVMSubset::ParseError, "call return type mismatch for @#{name}: expected #{expected_return}, got #{call.fetch(:return_type)}"
+        end
+
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        validate_memory_intrinsic_arguments!(name, arguments, ["i#{bits}", "i#{bits}"])
+        unless call.fetch(:destination)
+          raise Frontend::LLVMSubset::ParseError, "numeric intrinsic must assign a result: @#{name}"
+        end
+      end
+
       def emit_numeric_intrinsic_call(call, context: nil)
         name = call.fetch(:function_name)
+        return emit_overflow_intrinsic_call(call, context:) if llvm_overflow_intrinsic?(name)
+
         bits = name[/\.i(1|8|16|32|64)\z/, 1].to_i
         arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
         left = scalar_value(arguments.fetch(0).fetch(:value), context:)
@@ -3222,6 +3306,29 @@ module PFC
                      end
         target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
         ["    #{target} = #{unsigned_cast(bits)}((#{expression}) & #{integer_mask_literal(bits)});"]
+      end
+
+      def emit_overflow_intrinsic_call(call, context:)
+        name = call.fetch(:function_name)
+        bits = overflow_intrinsic_bits(name)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        left = scalar_value(arguments.fetch(0).fetch(:value), context:)
+        right = scalar_value(arguments.fetch(1).fetch(:value), context:)
+        aggregate = aggregate_register(call.fetch(:destination), context:)
+        prefix = next_memory_intrinsic_prefix
+        width = byte_width(bits)
+        overflow_expression = overflow_intrinsic_overflow_expression(name, bits, prefix)
+        raw_expression = overflow_intrinsic_raw_expression(name, prefix)
+        [
+          "    {",
+          *overflow_intrinsic_operand_lines(name, bits, left, right, prefix),
+          "        #{raw_expression}",
+          "        int #{prefix}_overflow = #{overflow_expression};",
+          "        unsigned long long #{prefix}_result = ((unsigned long long)#{prefix}_raw) & #{integer_mask_literal(bits)};",
+          "        pf_llvm_store(#{aggregate.fetch(:name)}, 0, #{prefix}_result, #{width});",
+          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{width}, (unsigned long long)#{prefix}_overflow, 1);",
+          "    }"
+        ]
       end
 
       def validate_memory_intrinsic_signature!(call)
@@ -3539,7 +3646,7 @@ module PFC
         MemoryAddress.new(
           invalid_expression: nil,
           limit: "(((#{encoded}) & PF_LLVM_STRING_POINTER_TAG) != 0ull ? PF_LLVM_STRING_MEMORY_SIZE : (((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? PF_LLVM_GLOBAL_MEMORY_SIZE : PF_LLVM_MEMORY_SIZE))",
-          memory: "(((#{encoded}) & PF_LLVM_STRING_POINTER_TAG) != 0ull ? llvm_string_memory : (((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? llvm_global_memory : llvm_memory))",
+          memory: "(((#{encoded}) & PF_LLVM_STRING_POINTER_TAG) != 0ull ? (unsigned char *)llvm_string_memory : (((#{encoded}) & PF_LLVM_GLOBAL_POINTER_TAG) != 0ull ? llvm_global_memory : llvm_memory))",
           name: encoded,
           offset: "((#{encoded}) & PF_LLVM_POINTER_OFFSET_MASK)",
           readonly: false,
@@ -3705,9 +3812,11 @@ module PFC
       def unsupported_instruction_message(line)
         opcode = line.to_s[/\A(?:#{NAME}\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
         return "unsupported scalable vector type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/(?:^|\s)<vscale\s+x\s+/)
-        return "unsupported vector type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/(?:^|\s)<\d+\s+x\s+(?!i(?:1|8|16|32|64)\b)[^>]+>/)
+        return "unsupported vector type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/(?:^|\s)<\d+\s+x\s+(?!(?:i(?:1|8|16|32|64)|ptr)\b)[^>]+>/)
         return "unsupported floating-point type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/\b(?:half|float|double|fp128|x86_fp80|ppc_fp128)\b/)
         return "unsupported i128 type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/\bi128\b/)
+        return "unsupported alloca address space: #{line}" if line.to_s.match?(/\balloca\b.*\baddrspace\((?!0\))\d+\)/)
+        return "invalid alloca alignment: #{line}" if line.to_s.match?(/\balloca\b.*\balign\s+(?:0|-)/)
         return "unsupported blockaddress constant expression: #{line}" if line.to_s.include?("blockaddress")
         return "unsupported LLVM instruction #{opcode}: #{line}. Run `pfc llvm-capabilities --check FILE.ll` to preflight a file. (unsupported atomic operation)" if line.to_s.match?(/\b(?:fence|atomicrmw|cmpxchg)\b/)
         return "unsupported exception handling instruction: #{line}" if line.to_s.match?(/\b(?:invoke|landingpad|resume|catchswitch|catchpad|cleanuppad|cleanupret|catchret)\b/)
@@ -3813,6 +3922,53 @@ module PFC
         when "lshr" then "(#{left}) >> (#{right})"
         when "ashr" then "#{unsigned_cast(bits)}((#{signed_expression(left, bits)}) >> (#{right}))"
         end
+      end
+
+      def overflow_intrinsic_bits(name)
+        name[/\.i(1|8|16|32|64)\z/, 1].to_i
+      end
+
+      def signed_overflow_intrinsic?(name)
+        name.start_with?("llvm.s")
+      end
+
+      def overflow_intrinsic_operator(name)
+        name[/\Allvm\.[us](add|sub|mul)\.with\.overflow\./, 1]
+      end
+
+      def overflow_intrinsic_operand_lines(name, bits, left, right, prefix)
+        if signed_overflow_intrinsic?(name)
+          return [
+            "        __int128 #{prefix}_left = (__int128)(#{signed_expression(left, bits)});",
+            "        __int128 #{prefix}_right = (__int128)(#{signed_expression(right, bits)});"
+          ]
+        end
+
+        [
+          "        unsigned __int128 #{prefix}_left = (unsigned __int128)((#{left}) & #{integer_mask_literal(bits)});",
+          "        unsigned __int128 #{prefix}_right = (unsigned __int128)((#{right}) & #{integer_mask_literal(bits)});"
+        ]
+      end
+
+      def overflow_intrinsic_raw_expression(name, prefix)
+        type = signed_overflow_intrinsic?(name) ? "__int128" : "unsigned __int128"
+        operator = case overflow_intrinsic_operator(name)
+                   when "add" then "+"
+                   when "sub" then "-"
+                   when "mul" then "*"
+                   end
+        "#{type} #{prefix}_raw = #{prefix}_left #{operator} #{prefix}_right;"
+      end
+
+      def overflow_intrinsic_overflow_expression(name, bits, prefix)
+        if signed_overflow_intrinsic?(name)
+          min = "(-((__int128)1 << #{bits - 1}))"
+          max = "(((__int128)1 << #{bits - 1}) - 1)"
+          return "((#{prefix}_raw < #{min}) || (#{prefix}_raw > #{max}))"
+        end
+
+        max = "(((unsigned __int128)1 << #{bits}) - 1)"
+        "(#{prefix}_raw > #{max})"
       end
 
       def minmax_expression(name, bits, left, right)
