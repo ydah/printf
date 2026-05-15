@@ -333,6 +333,8 @@ module PFC
       files = result.key?(:files) ? result.fetch(:files) : [result]
       opcode_counts = Hash.new(0)
       diagnostic_counts = Hash.new(0)
+      unsupported_intrinsic_counts = Hash.new(0)
+      unsupported_opcode_counts = Hash.new(0)
       severity_counts = Hash.new(0)
       files.each do |file|
         File.read(file.fetch(:path)).each_line do |raw_line|
@@ -343,7 +345,12 @@ module PFC
           opcode_counts[opcode] += 1 if opcode
         end
         file.fetch(:diagnostics, []).each do |diagnostic|
-          diagnostic_counts[diagnostic.fetch(:opcode) || "unknown"] += 1
+          opcode = diagnostic.fetch(:opcode) || "unknown"
+          diagnostic_counts[opcode] += 1
+          unsupported_opcode_counts[opcode] += 1 if diagnostic.fetch(:severity) == "error"
+          if (intrinsic = diagnostic.fetch(:line_text).to_s[/@((?:llvm\.)[-A-Za-z$._0-9]+)/, 1])
+            unsupported_intrinsic_counts[intrinsic] += 1
+          end
           severity_counts[diagnostic.fetch(:severity)] += 1
         end
       end
@@ -360,6 +367,8 @@ module PFC
         opcodes: opcode_counts.sort.map { |opcode, count| { opcode:, count: } },
         diagnostics: diagnostic_counts.sort.map { |opcode, count| { opcode:, count: } },
         severities: severity_counts.sort.map { |severity, count| { severity:, count: } },
+        top_unsupported_opcodes: llvm_rank_counts(unsupported_opcode_counts),
+        top_unsupported_intrinsics: llvm_rank_counts(unsupported_intrinsic_counts),
         unsupported_examples: diagnostics.first(10).map do |diagnostic|
           {
             path: files.find { |file| file.fetch(:diagnostics, []).include?(diagnostic) }&.fetch(:path),
@@ -383,6 +392,10 @@ module PFC
       line
     end
 
+    def llvm_rank_counts(counts)
+      counts.sort_by { |name, count| [-count, name] }.map { |name, count| { name:, count: } }
+    end
+
     def print_llvm_coverage_report(report)
       summary = report.fetch(:summary)
       puts "coverage: #{report.fetch(:path)}"
@@ -396,6 +409,18 @@ module PFC
       puts "diagnostics:"
       report.fetch(:diagnostics).each do |entry|
         puts "  #{entry.fetch(:opcode)}: #{entry.fetch(:count)}"
+      end
+      unless report.fetch(:top_unsupported_opcodes).empty?
+        puts "top unsupported opcodes:"
+        report.fetch(:top_unsupported_opcodes).each do |entry|
+          puts "  #{entry.fetch(:name)}: #{entry.fetch(:count)}"
+        end
+      end
+      return if report.fetch(:top_unsupported_intrinsics).empty?
+
+      puts "top unsupported intrinsics:"
+      report.fetch(:top_unsupported_intrinsics).each do |entry|
+        puts "  #{entry.fetch(:name)}: #{entry.fetch(:count)}"
       end
     end
 
@@ -995,8 +1020,8 @@ module PFC
             - llvm.memset.*, llvm.memcpy.*, llvm.memmove.* over local/global memory
             - llvm.lifetime.start/end accepted as no-op intrinsics, including typed and untyped forms
           values:
-            - true/false/undef/poison/zeroinitializer scalar constants
-            - add/sub/mul, signed/unsigned division and remainder
+            - true/false/undef/poison/zeroinitializer scalar constants plus selected scalar constant expressions
+            - add/sub/mul, signed/unsigned division and remainder, with no-op nuw/nsw/exact/disjoint flags
             - bitwise and/or/xor, shl/lshr/ashr
             - zext/sext/trunc, including trunc from i128 to supported integer widths
             - limited i128 zeroinitializer, add/sub, shl/lshr/ashr, and/or/xor, eq/ne, signed/unsigned comparisons, phi, select, zext/sext, and truncation with high 64-bit preservation
@@ -1017,6 +1042,7 @@ module PFC
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
             - void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments
+            - limited indirect calls through known builtin function pointers with matching signatures
             - sret-style aggregate returns through the first pointer parameter and byval pointer arguments with callee-local copies
           tolerance:
             - common value attributes accepted as no-ops
@@ -1029,16 +1055,17 @@ module PFC
             - llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals
             - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode
             - llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output
-            - llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, and severities for a file or directory
+            - llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, severities, and top unsupported opcode/intrinsic rankings
             - llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning
             - docs/llvm-capabilities.schema.json publishes the check JSON contract
             - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
             - info-level diagnostics distinguish accepted backend-equivalent constructs from warnings and errors
             - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
-            - llvm.assume.*, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
+            - llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
+            - llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics
             - llvm.expect.* accepted as identity intrinsic
           libc:
-            - putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, memcpy, memmove, memset, memcmp, memchr
+            - putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, atoi, strtol with null endptr, isdigit, isalpha, isalnum, isspace, tolower, toupper, memcpy, memmove, memset, memcmp, memchr
             - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags
       TEXT
     end
@@ -1062,8 +1089,8 @@ module PFC
           "llvm.lifetime.start/end accepted as no-op intrinsics, including typed and untyped forms"
         ],
         values: [
-          "true/false/undef/poison/zeroinitializer scalar constants",
-          "add/sub/mul, signed/unsigned division and remainder",
+          "true/false/undef/poison/zeroinitializer scalar constants plus selected scalar constant expressions",
+          "add/sub/mul, signed/unsigned division and remainder, with no-op nuw/nsw/exact/disjoint flags",
           "bitwise and/or/xor, shl/lshr/ashr",
           "zext/sext/trunc, including trunc from i128 to supported integer widths",
           "limited i128 zeroinitializer, add/sub, shl/lshr/ashr, and/or/xor, eq/ne, signed/unsigned comparisons, phi, select, zext/sext, and truncation with high 64-bit preservation",
@@ -1085,6 +1112,7 @@ module PFC
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
           "void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments",
+          "limited indirect calls through known builtin function pointers with matching signatures",
           "sret-style aggregate returns through the first pointer parameter and byval pointer arguments with callee-local copies"
         ],
         tolerance: [
@@ -1098,17 +1126,18 @@ module PFC
           "llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals",
           "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode",
           "llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output",
-          "llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, and severities for a file or directory",
+          "llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, severities, and top unsupported opcode/intrinsic rankings",
           "llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning",
           "docs/llvm-capabilities.schema.json publishes the check JSON contract",
           "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
           "info-level diagnostics distinguish accepted backend-equivalent constructs from warnings and errors",
           "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
-          "llvm.assume.*, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
+          "llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
+          "llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics",
           "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [
-          "putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, memcpy, memmove, memset, memcmp, memchr",
+          "putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, atoi, strtol with null endptr, isdigit, isalpha, isalnum, isspace, tolower, toupper, memcpy, memmove, memset, memcmp, memchr",
           "static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags"
         ]
       }

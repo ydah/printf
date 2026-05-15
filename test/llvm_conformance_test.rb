@@ -12,7 +12,9 @@ class LLVMConformanceTest < Minitest::Test
   SUPPORTED_FIXTURES = {
     "aggregate_phi_fields.ll" => "B",
     "aggregate_argument_abi.ll" => "B",
+    "clang_noop_intrinsics.ll" => "B",
     "compound_gep_lifetime.ll" => "B",
+    "indirect_function_pointer.ll" => "B",
     "internal_array_abi.ll" => "B",
     "minimal_return.ll" => "",
     "i128_add_signed_cmp.ll" => "B",
@@ -20,11 +22,13 @@ class LLVMConformanceTest < Minitest::Test
     "internal_aggregate_calls.ll" => "B",
     "internal_memory_aggregate.ll" => "B",
     "internal_memory_intrinsics.ll" => "B",
+    "libc_numeric_ctype.ll" => "B",
     "libc_string_copy.ll" => "B",
     "libc_string_search.ll" => "B",
     "libc_memory_strlen.ll" => "B",
     "libc_string_compare.ll" => "B",
     "nested_aggregate_select.ll" => "B",
+    "noop_flags_constexpr.ll" => "B",
     "aggregate_icmp.ll" => "B",
     "sret_multiple_byval_abi.ll" => "B",
     "sret_byval_abi.ll" => "B",
@@ -48,6 +52,7 @@ class LLVMConformanceTest < Minitest::Test
     "external_global.ll" => "unsupported external global reference",
     "float_add.ll" => "unsupported floating-point type",
     "varargs.ll" => "unsupported varargs instruction",
+    "unsupported_intrinsic.ll" => "unsupported call",
     "vector_add.ll" => "unsupported vector shuffle instruction",
     "vector_shuffle.ll" => "unsupported vector shuffle instruction"
   }.freeze
@@ -236,6 +241,8 @@ class LLVMConformanceTest < Minitest::Test
     assert report.fetch("opcodes").any? { |entry| entry.fetch("opcode") == "ret" }
     assert report.fetch("diagnostics").any? { |entry| entry.fetch("count") > 0 }
     assert report.fetch("severities").any? { |entry| entry.fetch("severity") == "error" }
+    assert report.fetch("top_unsupported_opcodes").any? { |entry| entry.fetch("name") == "call" }
+    assert report.fetch("top_unsupported_intrinsics").any? { |entry| entry.fetch("name") == "llvm.experimental.unsupported.i32" }
   end
 
   def test_check_dir_json_summary_filters_and_fail_on_warning

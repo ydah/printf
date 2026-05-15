@@ -8,6 +8,8 @@ module PFC
 
         def emit_libc_string_memory_call(call, context: nil)
           case call.fetch(:function_name)
+          when "atoi" then emit_atoi_call(call, context:)
+          when "isalnum", "isalpha", "isdigit", "isspace", "tolower", "toupper" then emit_ctype_call(call, context:)
           when "memcmp" then emit_memcmp_call(call, context:)
           when "memchr" then emit_memchr_call(call, context:)
           when "strcat" then emit_strcat_call(call, nil, context:)
@@ -21,8 +23,39 @@ module PFC
           when "strpbrk" then emit_strpbrk_call(call, context:)
           when "strrchr" then emit_strchr_call(call, reverse: true, context:)
           when "strspn" then emit_strspan_call(call, stop_on_match: false, context:)
+          when "strtol" then emit_strtol_call(call, context:)
           else emit_strcmp_call(call, parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(2), context:)
           end
+        end
+
+        def emit_ctype_call(call, context:)
+          arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+          value = scalar_value(arguments.fetch(0).fetch(:value), context:)
+          target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
+          function = call.fetch(:function_name)
+          expression = case function
+                       when "isdigit" then "((#{value}) >= '0' && (#{value}) <= '9')"
+                       when "isalpha" then "(((#{value}) >= 'A' && (#{value}) <= 'Z') || ((#{value}) >= 'a' && (#{value}) <= 'z'))"
+                       when "isalnum" then "(((#{value}) >= '0' && (#{value}) <= '9') || ((#{value}) >= 'A' && (#{value}) <= 'Z') || ((#{value}) >= 'a' && (#{value}) <= 'z'))"
+                       when "isspace" then "((#{value}) == ' ' || (#{value}) == '\\t' || (#{value}) == '\\n' || (#{value}) == '\\v' || (#{value}) == '\\f' || (#{value}) == '\\r')"
+                       when "tolower" then "(((#{value}) >= 'A' && (#{value}) <= 'Z') ? ((#{value}) + 32) : (#{value}))"
+                       when "toupper" then "(((#{value}) >= 'a' && (#{value}) <= 'z') ? ((#{value}) - 32) : (#{value}))"
+                       end
+          if function.start_with?("is")
+            ["    #{target} = (#{expression}) ? 1u : 0u;"]
+          else
+            ["    #{target} = (unsigned int)(unsigned char)(#{expression});"]
+          end
+        end
+
+        def emit_atoi_call(call, context:)
+          strtol_call = call.merge(
+            function_name: "strtol",
+            raw_arguments: "#{parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(0).fetch(:type)} #{parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(0).fetch(:value)}, ptr null, i32 10",
+            return_type: "i64"
+          )
+          lines = emit_strtol_call(strtol_call, context:, target_override: context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination)), target_bits: 32)
+          lines
         end
 
         def emit_memcmp_call(call, context:)
@@ -360,6 +393,73 @@ module PFC
             "            PF_ABORT();",
             "        }",
             "        #{target} = (unsigned long long)#{slot};",
+            "    }"
+          ]
+        end
+
+        def emit_strtol_call(call, context:, target_override: nil, target_bits: 64)
+          arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+          unless arguments.fetch(1).fetch(:value).strip == "null"
+            raise Frontend::LLVMSubset::ParseError, "strtol endptr is only supported when null"
+          end
+
+          source = memory_address(arguments.fetch(0).fetch(:value), context:)
+          base = scalar_value(arguments.fetch(2).fetch(:value), context:)
+          target = target_override || (context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination)))
+          prefix = next_memory_intrinsic_prefix
+          [
+            "    {",
+            "        long long #{prefix}_src = (long long)(#{source.offset});",
+            "        long long #{prefix}_i = 0;",
+            "        long long #{prefix}_base = (long long)(#{base});",
+            "        long long #{prefix}_sign = 1;",
+            "        unsigned long long #{prefix}_value = 0ull;",
+            "        int #{prefix}_digit = -1;",
+            "        int #{prefix}_any = 0;",
+            *dynamic_valid_address_lines(source),
+            "        if (#{prefix}_src < 0 || #{prefix}_src >= #{source.limit}) {",
+            "            fprintf(stderr, \"pfc runtime error: strtol pointer out of range\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        while (#{prefix}_src + #{prefix}_i < #{source.limit}) {",
+            "            unsigned char #{prefix}_ch = #{source.memory}[#{prefix}_src + #{prefix}_i];",
+            "            if (!(#{prefix}_ch == ' ' || #{prefix}_ch == '\\t' || #{prefix}_ch == '\\n' || #{prefix}_ch == '\\v' || #{prefix}_ch == '\\f' || #{prefix}_ch == '\\r')) break;",
+            "            #{prefix}_i++;",
+            "        }",
+            "        if (#{prefix}_src + #{prefix}_i >= #{source.limit}) {",
+            "            fprintf(stderr, \"pfc runtime error: strtol missing null terminator\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        if (#{source.memory}[#{prefix}_src + #{prefix}_i] == '-' || #{source.memory}[#{prefix}_src + #{prefix}_i] == '+') {",
+            "            #{prefix}_sign = (#{source.memory}[#{prefix}_src + #{prefix}_i] == '-') ? -1 : 1;",
+            "            #{prefix}_i++;",
+            "        }",
+            "        if (#{prefix}_base == 0) #{prefix}_base = 10;",
+            "        if (#{prefix}_base != 10 && #{prefix}_base != 16) {",
+            "            fprintf(stderr, \"pfc runtime error: strtol base is unsupported\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        if (#{prefix}_base == 16 && #{prefix}_src + #{prefix}_i + 1 < #{source.limit} && #{source.memory}[#{prefix}_src + #{prefix}_i] == '0' && (#{source.memory}[#{prefix}_src + #{prefix}_i + 1] == 'x' || #{source.memory}[#{prefix}_src + #{prefix}_i + 1] == 'X')) {",
+            "            #{prefix}_i += 2;",
+            "        }",
+            "        while (#{prefix}_src + #{prefix}_i < #{source.limit}) {",
+            "            unsigned char #{prefix}_ch = #{source.memory}[#{prefix}_src + #{prefix}_i];",
+            "            if (#{prefix}_ch >= '0' && #{prefix}_ch <= '9') #{prefix}_digit = (int)(#{prefix}_ch - '0');",
+            "            else if (#{prefix}_ch >= 'A' && #{prefix}_ch <= 'F') #{prefix}_digit = (int)(#{prefix}_ch - 'A' + 10);",
+            "            else if (#{prefix}_ch >= 'a' && #{prefix}_ch <= 'f') #{prefix}_digit = (int)(#{prefix}_ch - 'a' + 10);",
+            "            else #{prefix}_digit = -1;",
+            "            if (#{prefix}_digit < 0 || #{prefix}_digit >= #{prefix}_base) break;",
+            "            #{prefix}_value = (#{prefix}_value * (unsigned long long)#{prefix}_base) + (unsigned long long)#{prefix}_digit;",
+            "            #{prefix}_any = 1;",
+            "            #{prefix}_i++;",
+            "        }",
+            "        if (#{prefix}_src + #{prefix}_i >= #{source.limit}) {",
+            "            fprintf(stderr, \"pfc runtime error: strtol missing null terminator\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        if (!#{prefix}_any) #{prefix}_value = 0ull;",
+            "        if (#{prefix}_sign < 0) #{prefix}_value = (unsigned long long)(-(long long)#{prefix}_value);",
+            "        #{target} = #{unsigned_cast(target_bits)}(#{prefix}_value & #{integer_mask_literal(target_bits)});",
             "    }"
           ]
         end

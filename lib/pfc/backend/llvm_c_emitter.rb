@@ -29,9 +29,16 @@ module PFC
       GlobalStringPointer = Struct.new(:name, :offset, keyword_init: true)
       GlobalMemoryPointer = Struct.new(:name, :offset, keyword_init: true)
       EncodedPointer = Struct.new(:value, keyword_init: true)
+      FunctionPointer = Struct.new(:name, keyword_init: true)
+      FunctionPointerValue = Struct.new(:signature, :value, keyword_init: true)
       MemoryAddress = Struct.new(:invalid_expression, :limit, :memory, :name, :offset, :readonly, :readonly_expression, keyword_init: true)
       BUILTIN_FUNCTION_SIGNATURES = {
+        "atoi" => { return_type: "i32", parameter_types: %w[ptr], varargs: false },
         "getchar" => { return_type: "i32", parameter_types: [], varargs: false },
+        "isalnum" => { return_type: "i32", parameter_types: %w[i32], varargs: false },
+        "isalpha" => { return_type: "i32", parameter_types: %w[i32], varargs: false },
+        "isdigit" => { return_type: "i32", parameter_types: %w[i32], varargs: false },
+        "isspace" => { return_type: "i32", parameter_types: %w[i32], varargs: false },
         "memcpy" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
         "memmove" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
         "memset" => { return_type: "ptr", parameter_types: %w[ptr i32 i64], varargs: false },
@@ -52,7 +59,10 @@ module PFC
         "strrchr" => { return_type: "ptr", parameter_types: %w[ptr i32], varargs: false },
         "strncmp" => { return_type: "i32", parameter_types: %w[ptr ptr i64], varargs: false },
         "strspn" => { return_type: "i64", parameter_types: %w[ptr ptr], varargs: false },
-        "strlen" => { return_type: "i64", parameter_types: ["ptr"], varargs: false }
+        "strlen" => { return_type: "i64", parameter_types: ["ptr"], varargs: false },
+        "strtol" => { return_type: "i64", parameter_types: %w[ptr ptr i32], varargs: false },
+        "tolower" => { return_type: "i32", parameter_types: %w[i32], varargs: false },
+        "toupper" => { return_type: "i32", parameter_types: %w[i32], varargs: false }
       }.freeze
 
       def initialize(source, tape_size: DEFAULT_TAPE_SIZE)
@@ -75,6 +85,8 @@ module PFC
         @slots = {}
         @slot_count = 0
         @pointers = {}
+        @function_pointers = {}
+        @function_pointer_ids = {}
         @strdup_slots = {}
         @global_numeric_offsets, raw_global_numeric_bytes = build_global_numeric_layout
         @aggregate_registers = {}
@@ -144,7 +156,7 @@ module PFC
 
       private
 
-      attr_reader :aggregate_registers, :blocks, :block_order, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :i128_high_registers, :internal_functions, :pointers, :registers, :slot_count, :source, :strdup_slots, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
+      attr_reader :aggregate_registers, :blocks, :block_order, :function_pointer_ids, :function_pointers, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :i128_high_registers, :internal_functions, :pointers, :registers, :slot_count, :source, :strdup_slots, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -986,7 +998,7 @@ module PFC
           left = line.left
           right = line.right
         else
-          match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+          match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact|disjoint))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
           raise Frontend::LLVMSubset::ParseError, unsupported_instruction_message(line) unless match
 
           destination = match[1]
@@ -1005,6 +1017,29 @@ module PFC
         return emit_vector_select(line) if line.respond_to?(:vector_type) && line.vector_type
 
         if line.respond_to?(:value_type) && line.value_type == "ptr"
+          true_function = begin
+            function_pointer_binding(line.true_value)
+          rescue Frontend::LLVMSubset::ParseError
+            nil
+          end
+          false_function = begin
+            function_pointer_binding(line.false_value)
+          rescue Frontend::LLVMSubset::ParseError
+            nil
+          end
+          if true_function || false_function
+            raise Frontend::LLVMSubset::ParseError, "mixed data/function pointer select is unsupported: #{line}" unless true_function && false_function
+            unless same_function_signature?(true_function.fetch(:signature), false_function.fetch(:signature))
+              raise Frontend::LLVMSubset::ParseError, "function pointer select signature mismatch: #{line}"
+            end
+            condition = llvm_value(line.condition)
+            function_pointers[line.destination] = FunctionPointerValue.new(
+              signature: true_function.fetch(:signature),
+              value: "(((#{condition}) != 0u) ? (#{true_function.fetch(:value)}) : (#{false_function.fetch(:value)}))"
+            )
+            return []
+          end
+
           condition = llvm_value(line.condition)
           true_value = encoded_pointer_value(line.true_value)
           false_value = encoded_pointer_value(line.false_value)
@@ -1280,6 +1315,15 @@ module PFC
       end
 
       def emit_pointer_bitcast(destination, value, context: nil)
+        begin
+          binding = function_pointer_binding(value, context:)
+          function_map = context && context.key?(:function_pointers) ? context.fetch(:function_pointers) : function_pointers
+          function_map[destination] = FunctionPointerValue.new(signature: binding.fetch(:signature), value: binding.fetch(:value))
+          return []
+        rescue Frontend::LLVMSubset::ParseError
+          nil
+        end
+
         pointer_map = context ? context.fetch(:pointers) : pointers
         pointer_map[destination] = pointer_binding(value, context:)
         []
@@ -1427,7 +1471,12 @@ module PFC
       def emit_call(line)
         call = parsed_call(line)
         validate_call_signature!(call, line)
+        return emit_indirect_call(call) if call.fetch(:callee, nil)
         return [] if llvm_noop_intrinsic?(call.fetch(:function_name))
+        return emit_objectsize_intrinsic(call) if llvm_objectsize_intrinsic?(call.fetch(:function_name))
+        return emit_is_constant_intrinsic(call) if llvm_is_constant_intrinsic?(call.fetch(:function_name))
+        return emit_annotation_intrinsic(call) if llvm_annotation_intrinsic?(call.fetch(:function_name))
+        return emit_invariant_start_intrinsic(call) if llvm_invariant_start_intrinsic?(call.fetch(:function_name))
         return emit_expect_intrinsic(call) if llvm_expect_intrinsic?(call.fetch(:function_name))
         return emit_memory_intrinsic_call(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
         return emit_numeric_intrinsic_call(call) if llvm_numeric_intrinsic?(call.fetch(:function_name))
@@ -1436,9 +1485,7 @@ module PFC
         return emit_strlen_call(call) if call.fetch(:function_name) == "strlen"
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
-          output = ["    pf_ch = getchar();"]
-          output << "    #{register(match[1])} = pf_ch == EOF ? 0u : (unsigned int)(unsigned char)pf_ch;" if match[1]
-          return output
+          return emit_getchar_call(match[1])
         end
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@puts\(ptr(?:\s+\w+)*\s+(.+)\)\z/))
@@ -1452,10 +1499,7 @@ module PFC
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@putchar\(i32\s+(.+)\)\z/)
         return emit_internal_call(line) unless match
 
-        value = llvm_value(match[2])
-        output = ["    if (pf_output_cell((unsigned char)(#{value})) != 0) PF_ABORT();"]
-        output << "    #{register(match[1])} = (unsigned int)(unsigned char)(#{value});" if match[1]
-        output
+        emit_putchar_call(match[1], match[2])
       end
 
       def emit_internal_call(line)
@@ -1491,6 +1535,104 @@ module PFC
 
       def parse_call_arguments(raw)
         parse_typed_call_arguments(raw).map { |argument| argument.fetch(:value) }
+      end
+
+      def emit_indirect_call(call, context: nil)
+        signature = call_signature(call)
+        callee = function_pointer_expression(call.fetch(:callee), expected_signature: signature, context:)
+        candidates = indirect_dispatch_candidates(signature)
+        raise Frontend::LLVMSubset::ParseError, "unsupported indirect call signature: #{function_signature_description(signature)}" if candidates.empty?
+
+        prefix = next_memory_intrinsic_prefix
+        lines = [
+          "    {",
+          "        unsigned long long #{prefix}_callee = (unsigned long long)(#{callee});"
+        ]
+        candidates.each_with_index do |name, index|
+          branch = index.zero? ? "if" : "else if"
+          lines << "        #{branch} (#{prefix}_callee == #{function_pointer_id(name)}ull) {"
+          lines.concat(emit_indirect_dispatch_body(name, call, context:))
+          lines << "        }"
+        end
+        lines.concat([
+          "        else {",
+          "            fprintf(stderr, \"pfc runtime error: unsupported indirect function pointer\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "    }"
+        ])
+        lines
+      end
+
+      def indirect_dispatch_candidates(signature)
+        (BUILTIN_FUNCTION_SIGNATURES.keys + function_signatures.keys).uniq.select do |name|
+          indirect_dispatch_supported?(name) && same_function_signature?(function_signature(name), signature)
+        end
+      end
+
+      def indirect_dispatch_supported?(name)
+        name == "getchar" || name == "putchar" || name == "puts" || name == "strlen" || libc_string_memory_function?(name)
+      end
+
+      def emit_indirect_dispatch_body(name, call, context:)
+        dispatched = call.merge(function_name: name, callee: nil)
+        case name
+        when "getchar" then emit_getchar_call(call.fetch(:destination), context:)
+        when "putchar"
+          argument = parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(0)
+          emit_putchar_call(call.fetch(:destination), argument.fetch(:value), context:)
+        when "puts"
+          argument = parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(0)
+          emit_puts_call(call.fetch(:destination), argument.fetch(:value), context:)
+        when "strlen" then emit_strlen_call(dispatched, context:)
+        else emit_libc_string_memory_call(dispatched, context:)
+        end
+      end
+
+      def function_pointer_id(name)
+        function_pointer_ids[name] ||= function_pointer_ids.length + 1
+      end
+
+      def function_pointer_expression(raw, expected_signature:, context: nil)
+        pointer = function_pointer_binding(raw, context:)
+        unless same_function_signature?(pointer.fetch(:signature), expected_signature)
+          raise Frontend::LLVMSubset::ParseError, "indirect call signature mismatch for #{raw}: expected #{function_signature_description(pointer.fetch(:signature))}, got #{function_signature_description(expected_signature)}"
+        end
+
+        pointer.fetch(:value)
+      end
+
+      def function_pointer_binding(raw, context: nil)
+        stripped = strip_value_attributes(raw)
+        token = stripped.split(/\s+/).last
+        if token.start_with?("@") && (signature = function_signature(token.delete_prefix("@")))
+          return { signature:, value: "#{function_pointer_id(token.delete_prefix('@'))}ull" }
+        end
+        if context && context.key?(:function_pointers) && context.fetch(:function_pointers).key?(token)
+          pointer = context.fetch(:function_pointers).fetch(token)
+          return { signature: pointer.signature, value: pointer.value }
+        end
+        if function_pointers.key?(token)
+          pointer = function_pointers.fetch(token)
+          return { signature: pointer.signature, value: pointer.value }
+        end
+
+        raise Frontend::LLVMSubset::ParseError, "unsupported function pointer: #{raw}"
+      end
+
+      def emit_getchar_call(destination, context: nil)
+        target = context && destination ? inline_register(context, destination) : (destination ? register(destination) : nil)
+        output = ["    pf_ch = getchar();"]
+        output << "    #{target} = pf_ch == EOF ? 0u : (unsigned int)(unsigned char)pf_ch;" if destination
+        output
+      end
+
+      def emit_putchar_call(destination, value, context: nil)
+        c_value = context ? inline_value(value, context) : llvm_value(value)
+        target = context && destination ? inline_register(context, destination) : (destination ? register(destination) : nil)
+        output = ["    if (pf_output_cell((unsigned char)(#{c_value})) != 0) PF_ABORT();"]
+        output << "    #{target} = (unsigned int)(unsigned char)(#{c_value});" if destination
+        output
       end
 
       def inline_function_call(destination, function, arguments, caller_context: nil)
@@ -1646,6 +1788,7 @@ module PFC
             return_destination.start_with?("#{prefix}_ignored_return"),
           aggregates:,
           function:,
+          function_pointers: {},
           i128_high_values:,
           pointers:,
           prefix:,
@@ -1939,7 +2082,7 @@ module PFC
           left = line.left
           right = line.right
         else
-          match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+          match = line.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact|disjoint))*\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
           raise Frontend::LLVMSubset::ParseError, unsupported_instruction_message(line) unless match
 
           destination = match[1]
@@ -2546,6 +2689,9 @@ module PFC
       end
 
       def llvm_value(raw)
+        expression = constant_scalar_expression(raw, context: nil)
+        return expression if expression
+
         tokens = raw.strip.split(/\s+/)
         token = tokens.last
         return "1u" if token == "true"
@@ -2557,6 +2703,9 @@ module PFC
       end
 
       def inline_value(raw, context)
+        expression = constant_scalar_expression(raw, context:)
+        return expression if expression
+
         token = raw.strip.split(/\s+/).last
         return "1u" if token == "true"
         return "0u" if token == "false" || token == "undef" || token == "poison" || token == "zeroinitializer"
@@ -2565,6 +2714,66 @@ module PFC
         return register(token) if token.match?(/\A#{NAME}\z/)
 
         raise Frontend::LLVMSubset::ParseError, "unsupported value: #{raw}"
+      end
+
+      def constant_scalar_expression(raw, context:)
+        stripped = strip_value_attributes(raw)
+        return nil unless stripped.match?(/\A(?:add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr|select|icmp|zext|sext|trunc)\b/)
+
+        if (match = stripped.match(/\A(select)\s*\((.*)\)\z/))
+          operands = split_call_arguments(match[2])
+          return nil unless operands.length == 3
+
+          condition = typed_scalar_expression(operands.fetch(0), context:).fetch(:value)
+          true_operand = typed_scalar_expression(operands.fetch(1), context:)
+          false_operand = typed_scalar_expression(operands.fetch(2), context:)
+          return nil unless true_operand.fetch(:type) == false_operand.fetch(:type)
+
+          bits = true_operand.fetch(:bits)
+          return "#{unsigned_cast(bits)}((((#{condition}) != 0u) ? (#{true_operand.fetch(:value)}) : (#{false_operand.fetch(:value)})) & #{integer_mask_literal(bits)})"
+        end
+
+        if (match = stripped.match(/\Aicmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s*\((.*)\)\z/))
+          operands = split_call_arguments(match[2])
+          return nil unless operands.length == 2
+
+          left = typed_scalar_expression(operands.fetch(0), context:)
+          right = typed_scalar_expression(operands.fetch(1), context:)
+          return nil unless left.fetch(:type) == right.fetch(:type)
+
+          expression = icmp_expression(match[1], left.fetch(:bits), left.fetch(:value), right.fetch(:value))
+          return "((#{expression}) ? 1u : 0u)"
+        end
+
+        if (match = stripped.match(/\A(zext|sext|trunc)\s*\((i(?:1|8|16|32|64))\s+(.+?)\s+to\s+i(1|8|16|32|64)\)\z/))
+          from_bits = match[2].delete_prefix("i").to_i
+          value = context ? inline_value(match[3], context) : llvm_value(match[3])
+          return cast_expression(match[1], from_bits, match[4].to_i, value)
+        end
+
+        match = stripped.match(/\A(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)(?:\s+(?:nuw|nsw|exact|disjoint))*\s*\((.*)\)\z/)
+        return nil unless match
+
+        operands = split_call_arguments(match[2])
+        return nil unless operands.length == 2
+
+        left = typed_scalar_expression(operands.fetch(0), context:)
+        right = typed_scalar_expression(operands.fetch(1), context:)
+        return nil unless left.fetch(:type) == right.fetch(:type)
+
+        bits = left.fetch(:bits)
+        "#{unsigned_cast(bits)}((#{binary_expression(match[1], bits, left.fetch(:value), right.fetch(:value))}) & #{integer_mask_literal(bits)})"
+      end
+
+      def typed_scalar_expression(raw, context:)
+        match = raw.strip.match(/\A(i(1|8|16|32|64))\s+(.+)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported scalar constant expression operand: #{raw}" unless match
+
+        {
+          bits: match[2].to_i,
+          type: match[1],
+          value: context ? inline_value(match[3], context) : llvm_value(match[3])
+        }
       end
 
       def inline_label(context, label)
@@ -3058,10 +3267,22 @@ module PFC
 
       def parsed_call(line)
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|(?:<)?\{.*\}(?:>)?|ptr|void)\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)(?:\s+\[.*\])?\z/)
-        raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless match
+        unless match
+          indirect = line.match(/\A(?:(#{NAME})\s*=\s*)?(?:tail\s+|musttail\s+|notail\s+)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|(?:<)?\{.*\}(?:>)?|ptr|void)\s+(?:\([^)]*\)\s+)?(.+?)\((.*)\)(?:\s+\[.*\])?\z/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported call: #{line}" unless indirect
+
+          return {
+            callee: strip_value_attributes(indirect[3]),
+            destination: indirect[1],
+            function_name: nil,
+            raw_arguments: indirect[4],
+            return_type: indirect[2]
+          }
+        end
 
         {
           destination: match[1],
+          callee: nil,
           function_name: match[3],
           raw_arguments: match[4],
           return_type: match[2]
@@ -3086,8 +3307,13 @@ module PFC
       end
 
       def validate_call_signature!(call, line)
+        return validate_indirect_call_signature!(call) if call.fetch(:callee, nil)
         return validate_memory_intrinsic_signature!(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
         return validate_noop_intrinsic_signature!(call) if llvm_noop_intrinsic?(call.fetch(:function_name))
+        return validate_objectsize_intrinsic_signature!(call) if llvm_objectsize_intrinsic?(call.fetch(:function_name))
+        return validate_is_constant_intrinsic_signature!(call) if llvm_is_constant_intrinsic?(call.fetch(:function_name))
+        return validate_annotation_intrinsic_signature!(call) if llvm_annotation_intrinsic?(call.fetch(:function_name))
+        return validate_invariant_start_intrinsic_signature!(call) if llvm_invariant_start_intrinsic?(call.fetch(:function_name))
         return validate_expect_intrinsic_signature!(call) if llvm_expect_intrinsic?(call.fetch(:function_name))
         return validate_numeric_intrinsic_signature!(call) if llvm_numeric_intrinsic?(call.fetch(:function_name))
 
@@ -3131,6 +3357,20 @@ module PFC
         function_signatures[name] || BUILTIN_FUNCTION_SIGNATURES[name]
       end
 
+      def call_signature(call)
+        {
+          return_type: call.fetch(:return_type),
+          parameter_types: parse_typed_call_arguments(call.fetch(:raw_arguments)).map { |argument| argument.fetch(:type) },
+          varargs: false
+        }
+      end
+
+      def validate_indirect_call_signature!(call)
+        raise Frontend::LLVMSubset::ParseError, "varargs indirect call is unsupported" if call.fetch(:raw_arguments).include?("...")
+
+        function_pointer_expression(call.fetch(:callee), expected_signature: call_signature(call))
+      end
+
       def local_pointer_argument?(argument)
         return false unless argument.fetch(:type) == "ptr"
 
@@ -3143,7 +3383,7 @@ module PFC
       end
 
       def llvm_noop_intrinsic?(name)
-        llvm_lifetime_intrinsic?(name) || llvm_assume_intrinsic?(name) || llvm_debug_intrinsic?(name)
+        llvm_lifetime_intrinsic?(name) || llvm_assume_intrinsic?(name) || llvm_debug_intrinsic?(name) || llvm_void_marker_intrinsic?(name)
       end
 
       def llvm_lifetime_intrinsic?(name)
@@ -3156,6 +3396,26 @@ module PFC
 
       def llvm_debug_intrinsic?(name)
         name.start_with?("llvm.dbg.")
+      end
+
+      def llvm_void_marker_intrinsic?(name)
+        name == "llvm.sideeffect" || name == "llvm.donothing" || name.start_with?("llvm.invariant.end")
+      end
+
+      def llvm_objectsize_intrinsic?(name)
+        name.start_with?("llvm.objectsize.")
+      end
+
+      def llvm_is_constant_intrinsic?(name)
+        name.start_with?("llvm.is.constant.")
+      end
+
+      def llvm_annotation_intrinsic?(name)
+        name.start_with?("llvm.annotation.") || name.start_with?("llvm.ptr.annotation.")
+      end
+
+      def llvm_invariant_start_intrinsic?(name)
+        name.start_with?("llvm.invariant.start")
       end
 
       def llvm_expect_intrinsic?(name)
@@ -3203,7 +3463,7 @@ module PFC
       end
 
       def libc_string_memory_function?(name)
-        %w[memchr memcmp strcat strchr strcmp strcpy strcspn strdup strncat strncmp strncpy strpbrk strrchr strspn].include?(name)
+        %w[atoi isalnum isalpha isdigit isspace memchr memcmp strcat strchr strcmp strcpy strcspn strdup strncat strncmp strncpy strpbrk strrchr strspn strtol tolower toupper].include?(name)
       end
 
       def validate_noop_intrinsic_signature!(call)
@@ -3218,11 +3478,82 @@ module PFC
         return if llvm_debug_intrinsic?(name)
 
         arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        return if llvm_void_marker_intrinsic?(name)
+
         if llvm_assume_intrinsic?(name)
           validate_memory_intrinsic_arguments!(name, arguments, ["i1"])
         else
           validate_memory_intrinsic_arguments!(name, arguments, [%w[i32 i64], "ptr"])
         end
+      end
+
+      def validate_objectsize_intrinsic_signature!(call)
+        name = call.fetch(:function_name)
+        bits = call.fetch(:return_type)[/\Ai(32|64)\z/, 1]
+        raise Frontend::LLVMSubset::ParseError, "#{name} must return i32 or i64" unless bits
+
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        expected = ["ptr", "i1", "i1", "i1"].first(arguments.length)
+        validate_memory_intrinsic_arguments!(name, arguments, expected)
+        raise Frontend::LLVMSubset::ParseError, "#{name} result must be assigned" unless call.fetch(:destination)
+      end
+
+      def validate_is_constant_intrinsic_signature!(call)
+        name = call.fetch(:function_name)
+        raise Frontend::LLVMSubset::ParseError, "#{name} must return i1" unless call.fetch(:return_type) == "i1"
+
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        raise Frontend::LLVMSubset::ParseError, "wrong argument count for @#{name}: expected 1, got #{arguments.length}" unless arguments.length == 1
+        raise Frontend::LLVMSubset::ParseError, "#{name} result must be assigned" unless call.fetch(:destination)
+      end
+
+      def validate_annotation_intrinsic_signature!(call)
+        name = call.fetch(:function_name)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        raise Frontend::LLVMSubset::ParseError, "wrong argument count for @#{name}: expected at least 1, got #{arguments.length}" if arguments.empty?
+        unless call.fetch(:return_type) == arguments.fetch(0).fetch(:type)
+          raise Frontend::LLVMSubset::ParseError, "call return type mismatch for @#{name}: expected #{arguments.fetch(0).fetch(:type)}, got #{call.fetch(:return_type)}"
+        end
+        raise Frontend::LLVMSubset::ParseError, "#{name} result must be assigned" unless call.fetch(:destination)
+      end
+
+      def validate_invariant_start_intrinsic_signature!(call)
+        name = call.fetch(:function_name)
+        unless call.fetch(:return_type) == "ptr"
+          raise Frontend::LLVMSubset::ParseError, "call return type mismatch for @#{name}: expected ptr, got #{call.fetch(:return_type)}"
+        end
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        validate_memory_intrinsic_arguments!(name, arguments, [%w[i32 i64], "ptr"])
+        raise Frontend::LLVMSubset::ParseError, "#{name} result must be assigned" unless call.fetch(:destination)
+      end
+
+      def emit_objectsize_intrinsic(call)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        bits = call.fetch(:return_type).delete_prefix("i").to_i
+        min = arguments.length > 1 && arguments.fetch(1).fetch(:value) == "true"
+        value = min ? "0u" : integer_mask_literal(bits)
+        ["    #{register(call.fetch(:destination))} = #{unsigned_cast(bits)}(#{value});"]
+      end
+
+      def emit_is_constant_intrinsic(call)
+        ["    #{register(call.fetch(:destination))} = 0u;"]
+      end
+
+      def emit_annotation_intrinsic(call)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        first = arguments.fetch(0)
+        if first.fetch(:type) == "ptr"
+          pointers[call.fetch(:destination)] = pointer_binding(first.fetch(:value))
+          return []
+        end
+
+        bits = first.fetch(:type).delete_prefix("i").to_i
+        ["    #{register(call.fetch(:destination))} = #{unsigned_cast(bits)}((#{llvm_value(first.fetch(:value))}) & #{integer_mask_literal(bits)});"]
+      end
+
+      def emit_invariant_start_intrinsic(call)
+        pointers[call.fetch(:destination)] = EncodedPointer.new(value: "0ull")
+        []
       end
 
       def validate_expect_intrinsic_signature!(call)
@@ -3616,8 +3947,11 @@ module PFC
                       raise Frontend::LLVMSubset::ParseError, "unsupported external global reference: #{stripped}"
                     end
                     resolve_pointer(stripped, context:)
-                  end
+        end
         return encoded_memory_address(pointer.value) if pointer.is_a?(EncodedPointer)
+        if pointer.is_a?(FunctionPointer) || pointer.is_a?(FunctionPointerValue)
+          raise Frontend::LLVMSubset::ParseError, "function pointer cannot be dereferenced as memory: #{stripped}"
+        end
 
         if pointer.is_a?(GlobalStringPointer)
           return MemoryAddress.new(
@@ -3711,6 +4045,7 @@ module PFC
 
         pointer = pointer_binding(stripped, context:)
         return pointer.value if pointer.is_a?(EncodedPointer)
+        raise Frontend::LLVMSubset::ParseError, "function pointer cannot be used as data pointer: #{stripped}" if pointer.is_a?(FunctionPointer) || pointer.is_a?(FunctionPointerValue)
         return "((unsigned long long)(#{pointer}))" unless pointer.is_a?(GlobalMemoryPointer) || pointer.is_a?(GlobalStringPointer)
 
         if pointer.is_a?(GlobalStringPointer)
@@ -3741,6 +4076,7 @@ module PFC
 
         token = stripped.split(/\s+/).last
         return EncodedPointer.new(value: "0ull") if token == "null"
+        return FunctionPointer.new(name: token.delete_prefix("@")) if token.start_with?("@") && function_signature(token.delete_prefix("@"))
         return GlobalStringPointer.new(name: token, offset: 0) if global_strings.key?(token)
         if external_global_declaration?(token)
           raise Frontend::LLVMSubset::ParseError, "unsupported external global reference: #{token}"
@@ -4035,6 +4371,13 @@ module PFC
         when "ult", "slt" then "<"
         when "ule", "sle" then "<="
         end
+      end
+
+      def icmp_expression(predicate, bits, left, right)
+        signed = predicate.start_with?("s")
+        left_value = signed ? signed_expression(left, bits) : "((#{left}) & #{integer_mask_literal(bits)})"
+        right_value = signed ? signed_expression(right, bits) : "((#{right}) & #{integer_mask_literal(bits)})"
+        "(#{left_value}) #{icmp_operator(predicate)} (#{right_value})"
       end
     end
   end

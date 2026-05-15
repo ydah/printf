@@ -158,7 +158,16 @@ module PFC
           def initialize(text)
             super
             match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+(?:\([^)]*\)\s+)?@([-A-Za-z$._0-9]+)\((.*)\)(?:\s+\[.*\])?\z/)
-            return unless match
+            unless match
+              match = text.match(/\A(?:(#{NAME})\s*=\s*)?call\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+(?:\([^)]*\)\s+)?(.+?)\((.*)\)(?:\s+\[.*\])?\z/)
+              if match
+                @destination = match[1]
+                @return_type = match[2]
+                @function_name = nil
+                @arguments = Instruction.split_arguments(match[4]).freeze
+              end
+              return
+            end
 
             @destination = match[1]
             @return_type = match[2]
@@ -244,7 +253,7 @@ module PFC
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact))*)\s+(<\d+\s+x\s+i(8|16|32|64)>)\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact|disjoint))*)\s+(<\d+\s+x\s+i(8|16|32|64)>)\s+(.+)\z/))
               operands = Instruction.split_arguments(match[6])
               return unless operands.length == 2
 
@@ -259,18 +268,18 @@ module PFC
               return
             end
 
-            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|and|or|xor|shl|lshr|ashr)\s+i128\s+(.+?),\s+(.+)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*(add|sub|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact|disjoint))*)\s+i128\s+(.+?),\s+(.+)\z/))
               @destination = match[1]
               @operator = match[2]
-              @flags = [].freeze
+              @flags = match[3].split.freeze
               @value_type = "i128"
               @bits = 128
-              @left = match[3]
-              @right = match[4]
+              @left = match[4]
+              @right = match[5]
               return
             end
 
-            match = text.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact))*)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)((?:\s+(?:nuw|nsw|exact|disjoint))*)\s+i(1|8|16|32|64)\s+(.+?),\s+(.+)\z/)
             return unless match
 
             @destination = match[1]
