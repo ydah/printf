@@ -29,7 +29,7 @@ Commands:
 - `dump-cfg INPUT`
 - `dump-c INPUT`
 - `llvm-capabilities [--json]`
-- `llvm-capabilities --check INPUT.ll`
+- `llvm-capabilities --check [--json] INPUT.ll`
 
 Common examples:
 
@@ -53,7 +53,10 @@ bin/pfc run samples/clang_smoke.ll
 bin/pfc llvm-capabilities
 bin/pfc llvm-capabilities --json
 bin/pfc llvm-capabilities --check samples/clang_smoke.ll
+bin/pfc llvm-capabilities --check --json samples/clang_smoke.ll
 CLANG="clang" ruby script/generate_clang_fixture.rb samples/example.c samples/example.ll
+make fixtures
+make fixtures-check
 ```
 
 Options:
@@ -72,13 +75,15 @@ Options:
 
 `.ll` inputs are detected by extension and compiled through the experimental LLVM IR subset frontend.
 
-Use `bin/pfc llvm-capabilities` for the full supported subset, `bin/pfc llvm-capabilities --json` for machine-readable output, or `bin/pfc llvm-capabilities --check FILE.ll` to preflight an LLVM file. At a high level, the subset supports:
+Use `bin/pfc llvm-capabilities` for the full supported subset, `bin/pfc llvm-capabilities --json` for machine-readable output, or `bin/pfc llvm-capabilities --check [--json] FILE.ll` to preflight an LLVM file. At a high level, the subset supports:
 
-- Memory: byte-addressed local memory, integer/pointer/aggregate `alloca`/`load`/`store`, numeric globals, string globals, nested struct/array initializers, pointer fields, global initializer relocations, `getelementptr`, and `llvm.memset.*` / `llvm.memcpy.*` / `llvm.memmove.*`.
-- Values: `i1`/`i8`/`i16`/`i32`/`i64`, integer arithmetic, bitwise and shift operations, casts, pointer tagging via `ptrtoint` / `inttoptr`, pointer `bitcast`, `icmp`, `select`, `phi`, constants, `freeze`, `extractvalue`, `insertvalue`, and scalar `llvm.smax` / `llvm.smin` / `llvm.umax` / `llvm.umin` / `llvm.abs`.
+- Memory: byte-addressed local memory, integer/pointer/aggregate `alloca`/`load`/`store`, numeric globals, string globals, nested struct/array initializers, pointer fields, global initializer relocations, `getelementptr`, and `llvm.memset.*` / `llvm.memcpy.*` / `llvm.memcpy.inline.*` / `llvm.memmove.*`.
+- Values: `i1`/`i8`/`i16`/`i32`/`i64`, integer arithmetic, bitwise and shift operations, casts, pointer tagging via `ptrtoint` / `inttoptr`, pointer `bitcast`, default-address-space `addrspacecast`, `icmp`, `select`, `phi`, constants, `freeze`, `extractvalue`, `insertvalue`, and scalar `llvm.smax` / `llvm.smin` / `llvm.umax` / `llvm.umin` / `llvm.abs` / `llvm.bswap` / `llvm.ctpop` / `llvm.ctlz` / `llvm.cttz`.
 - Control flow: `br`, `switch`, scalar and pointer `phi`, `ret`, `unreachable`, and nested non-recursive internal calls with integer, pointer, and void returns.
-- Clang tolerance: typed-pointer-style syntax, common `noundef` / `nonnull` / `dereferenceable`-style value attributes, trailing metadata, module-level metadata, attributes blocks, `target datalayout`, aliases, no-op `llvm.assume` / `llvm.dbg.*`, and identity `llvm.expect.*`.
+- Clang tolerance: typed-pointer-style syntax, common `noundef` / `nonnull` / `dereferenceable`-style value attributes, `getelementptr` no-op flags, trailing metadata, module-level metadata, attributes blocks, `target datalayout`, aliases, no-op `llvm.assume` / `llvm.dbg.*`, and identity `llvm.expect.*`.
 - Libc surface: `putchar`, `getchar`, `puts`, and static `printf` formats for integer, character, string, pointer, width, precision, flags, and escaped percent cases.
+
+Out-of-scope LLVM features should fail with explicit diagnostics rather than silently compiling. This includes vector and floating-point types, `i128`, `blockaddress`, declaration-only external globals, and non-zero address spaces.
 
 The generated program still uses C control flow as the scheduler. It does not claim a single-call `printf` execution model, which would require implementation-dependent or undefined behavior outside this project's safety scope.
 
