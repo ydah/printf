@@ -20,6 +20,7 @@ class ClangFixtureGeneratorTest < Minitest::Test
         ret i32 %2, !dbg !25
       }
 
+      declare i32 @printf(ptr, ...) #1
       attributes #0 = { nofree nounwind "target-cpu"="apple-m1" }
 
       !llvm.module.flags = !{!0}
@@ -42,6 +43,7 @@ class ClangFixtureGeneratorTest < Minitest::Test
         ret i32 %2, !dbg !54
       }
 
+      declare i32 @printf(ptr readonly, ...) #6
       declare void @llvm.dbg.value(metadata, metadata, metadata) #4
       declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg) #5
       attributes #3 = { mustprogress nofree nounwind "target-cpu"="apple-m4" }

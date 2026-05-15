@@ -42,9 +42,10 @@ module ClangFixtureGenerator
       .gsub(/\bnoundef\s+/, "")
       .gsub(/\brange\([^)]+\)\s+/, "")
       .gsub(/\b(?:nuw|nsw|nusw)\s+/, "")
-      .gsub(/\b(?:noalias|nocapture|readonly|readnone|writeonly|immarg)\s+/, "")
+      .gsub(/\b(?:noalias|nocapture|readonly|readnone|writeonly|immarg)\b\s*/, "")
       .gsub(/\bcaptures\([^)]*\)\s*/, "")
       .gsub(/\bptr\s+align\s+\d+\s+/, "ptr ")
+      .gsub(/\s+,/, ",")
   end
 
   def fixture_difference_summary(expected, actual)
