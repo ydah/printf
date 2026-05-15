@@ -31,6 +31,7 @@ module PFC
       EncodedPointer = Struct.new(:value, keyword_init: true)
       FunctionPointer = Struct.new(:name, keyword_init: true)
       FunctionPointerValue = Struct.new(:signature, :value, keyword_init: true)
+      FunctionPointerTableSlot = Struct.new(:name, :index, keyword_init: true)
       MemoryAddress = Struct.new(:invalid_expression, :limit, :memory, :name, :offset, :readonly, :readonly_expression, keyword_init: true)
       BUILTIN_FUNCTION_SIGNATURES = {
         "atoi" => { return_type: "i32", parameter_types: %w[ptr], varargs: false },
@@ -39,6 +40,9 @@ module PFC
         "isalpha" => { return_type: "i32", parameter_types: %w[i32], varargs: false },
         "isdigit" => { return_type: "i32", parameter_types: %w[i32], varargs: false },
         "isspace" => { return_type: "i32", parameter_types: %w[i32], varargs: false },
+        "calloc" => { return_type: "ptr", parameter_types: %w[i64 i64], varargs: false },
+        "free" => { return_type: "void", parameter_types: %w[ptr], varargs: false },
+        "malloc" => { return_type: "ptr", parameter_types: %w[i64], varargs: false },
         "memcpy" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
         "memmove" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
         "memset" => { return_type: "ptr", parameter_types: %w[ptr i32 i64], varargs: false },
@@ -87,6 +91,8 @@ module PFC
         @pointers = {}
         @function_pointers = {}
         @function_pointer_ids = {}
+        @function_pointer_table_slots = {}
+        @global_function_pointer_tables = build_global_function_pointer_tables
         @strdup_slots = {}
         @global_numeric_offsets, raw_global_numeric_bytes = build_global_numeric_layout
         @aggregate_registers = {}
@@ -156,7 +162,7 @@ module PFC
 
       private
 
-      attr_reader :aggregate_registers, :blocks, :block_order, :function_pointer_ids, :function_pointers, :function_signatures, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :i128_high_registers, :internal_functions, :pointers, :registers, :slot_count, :source, :strdup_slots, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
+      attr_reader :aggregate_registers, :blocks, :block_order, :function_pointer_ids, :function_pointer_table_slots, :function_pointers, :function_signatures, :global_function_pointer_tables, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :i128_high_registers, :internal_functions, :pointers, :registers, :slot_count, :source, :strdup_slots, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -168,6 +174,8 @@ module PFC
         offsets = {}
         bytes = []
         global_numeric_data.each do |name, global_bytes|
+          next if global_function_pointer_tables.key?(name)
+
           offsets[name] = bytes.length
           bytes.concat(global_bytes)
         end
@@ -191,6 +199,8 @@ module PFC
         source.each_line.flat_map do |line|
           stripped = line.sub(/;.*/, "").strip
           next [] if stripped.empty?
+          global_name = stripped[/\A(@[-A-Za-z$._0-9]+)\s*=/, 1]
+          next [] if global_name && global_function_pointer_tables.key?(global_name)
 
           if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+ptr\s+(.+?)(?:,\s+align\s+\d+)?\z/))
             next global_pointer_initializer_relocations(match[1], "ptr", match[2], 0)
@@ -270,6 +280,58 @@ module PFC
         end
       end
 
+      def build_global_function_pointer_tables
+        source.each_line.each_with_object({}) do |line, tables|
+          stripped = line.sub(/;.*/, "").strip
+          match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s=.*?\b(?:global|constant)\s+\[(\d+)\s+x\s+ptr\]\s+\[(.*)\]/)
+          next unless match
+
+          entries = split_call_arguments(match[3]).map do |entry|
+            entry_match = entry.match(/\Aptr\s+(@[-A-Za-z$._0-9]+)\z/)
+            raise Frontend::LLVMSubset::ParseError, "unsupported function pointer table entry: #{entry}" unless entry_match
+
+            name = entry_match[1].delete_prefix("@")
+            signature = function_signature(name)
+            raise Frontend::LLVMSubset::ParseError, "unsupported function pointer table target: @#{name}" unless signature
+
+            FunctionPointerValue.new(signature:, value: "#{function_pointer_id(name)}ull")
+          end
+          raise Frontend::LLVMSubset::ParseError, "function pointer table size mismatch: #{match[1]}" unless entries.length == match[2].to_i
+
+          tables[match[1]] = entries.freeze
+        end
+      end
+
+      def function_pointer_phi_signature(line)
+        return nil unless line.respond_to?(:value_type) && line.value_type == "ptr" && line.respond_to?(:incoming) && line.incoming
+
+        signatures = line.incoming.filter_map do |value, _label|
+          function_pointer_binding(value).fetch(:signature)
+        rescue Frontend::LLVMSubset::ParseError
+          nil
+        end
+        return nil if signatures.empty?
+        unless signatures.length == line.incoming.length && signatures.all? { |signature| same_function_signature?(signature, signatures.first) }
+          raise Frontend::LLVMSubset::ParseError, "function pointer phi signature mismatch: #{line}"
+        end
+
+        signatures.first
+      end
+
+      def register_function_pointer_table_slot!(line)
+        unless line.indices.length == 2 && line.indices.all? { |index| index.match?(/\A-?\d+\z/) }
+          raise Frontend::LLVMSubset::ParseError, "dynamic function pointer table index is unsupported: #{line}"
+        end
+
+        index = line.indices.fetch(1).to_i
+        table = global_function_pointer_tables.fetch(line.base_pointer)
+        unless index.between?(0, table.length - 1)
+          raise Frontend::LLVMSubset::ParseError, "function pointer table index out of range: #{line}"
+        end
+
+        function_pointer_table_slots[line.destination] = FunctionPointerTableSlot.new(name: line.base_pointer, index:)
+      end
+
       def analyze_allocations
         all_lines.each do |line|
           analyze_alloca_line!(line)
@@ -329,6 +391,10 @@ module PFC
           lhs = line.destination if lhs.nil? && line.respond_to?(:destination)
           next if lhs.nil?
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*alloca\b/)
+          if line.respond_to?(:destination) && line.respond_to?(:base_pointer) && global_function_pointer_tables.key?(line.base_pointer)
+            register_function_pointer_table_slot!(line)
+            next
+          end
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*getelementptr\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*inttoptr\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*bitcast\s+(?:ptr|.+?\*)\b/)
@@ -336,6 +402,13 @@ module PFC
           pointer_result = line.respond_to?(:value_type) && line.value_type == "ptr" && line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|extractvalue|freeze)\b/)
           pointer_result ||= line.respond_to?(:return_type) && line.return_type == "ptr"
           pointer_result ||= line.respond_to?(:value_type) && line.value_type == "ptr" && line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*extractelement\b/)
+          if line.respond_to?(:pointer) && line.respond_to?(:value_type) && line.value_type == "ptr" && function_pointer_table_slots.key?(line.pointer)
+            slot = function_pointer_table_slots.fetch(line.pointer)
+            pointer = global_function_pointer_tables.fetch(slot.name).fetch(slot.index)
+            registers[lhs] = c_value_name(lhs)
+            function_pointers[lhs] = FunctionPointerValue.new(signature: pointer.signature, value: registers.fetch(lhs))
+            next
+          end
           if (match = line.match(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|insertvalue|insertelement)\s+(.+?)(?:,|\s+)/)) && aggregate_type?(match[1])
             aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(match[1]), type: match[1] }
             next
@@ -374,7 +447,11 @@ module PFC
 
           registers[lhs] = c_value_name(lhs)
           i128_high_registers[lhs] = "#{c_value_name(lhs)}_hi" if (line.respond_to?(:bits) && line.bits == 128) || (line.respond_to?(:to_bits) && line.to_bits == 128) || (line.respond_to?(:return_type) && line.return_type == "i128")
-          pointers[lhs] = EncodedPointer.new(value: registers.fetch(lhs)) if pointer_result || line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*phi\s+(?:ptr|.+?\*)\b/)
+          if (signature = function_pointer_phi_signature(line))
+            function_pointers[lhs] = FunctionPointerValue.new(signature:, value: registers.fetch(lhs))
+          elsif pointer_result || line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*phi\s+(?:ptr|.+?\*)\b/)
+            pointers[lhs] = EncodedPointer.new(value: registers.fetch(lhs))
+          end
         end
       end
 
@@ -755,6 +832,10 @@ module PFC
         bytes.map { |byte| "#{byte}u" }.join(", ")
       end
 
+      def heap_capacity
+        source.include?("@malloc(") || source.include?("@calloc(") ? tape_size : 0
+      end
+
       def main_prelude
         lines = [
           "    FILE *pf_sink = tmpfile();",
@@ -763,7 +844,7 @@ module PFC
           "        return 1;",
           "    }",
           "",
-          "    enum { PF_LLVM_MEMORY_SIZE = #{[slot_count, 1].max} };",
+          "    enum { PF_LLVM_MEMORY_SIZE = #{[slot_count + heap_capacity, 1].max} };",
           "    enum { PF_LLVM_GLOBAL_MEMORY_SIZE = #{[global_numeric_bytes.length, 1].max} };",
           "    enum { PF_LLVM_STRING_MEMORY_SIZE = #{[global_string_bytes.length, 1].max} };",
           "    const unsigned long long PF_LLVM_GLOBAL_POINTER_TAG = 9223372036854775808ull;",
@@ -777,6 +858,7 @@ module PFC
           "    int pf_slot_index = 0;",
           "    int pf_ch = 0;"
         ]
+        lines << "    int pf_llvm_heap_next = #{slot_count};" if heap_capacity.positive?
         registers.each_value do |name|
           lines << "    unsigned long long #{name} = 0;"
         end
@@ -790,6 +872,7 @@ module PFC
         lines << "    (void)llvm_global_memory;"
         lines << "    (void)llvm_string_memory;"
         lines << "    (void)pf_slot_index;"
+        lines << "    (void)pf_llvm_heap_next;" if heap_capacity.positive?
         lines << "    (void)pf_ch;"
         registers.each_value do |name|
           lines << "    (void)#{name};"
@@ -842,6 +925,7 @@ module PFC
           when :select then return emit_select(line)
           when :cast then return emit_cast(line)
           when :freeze then return emit_freeze(line)
+          when :shufflevector then return emit_shufflevector(line)
           when :extractelement then return emit_extractelement(line)
           when :insertelement then return emit_insertelement(line)
           when :extractvalue then return emit_extractvalue(line)
@@ -849,6 +933,8 @@ module PFC
           when :icmp then return emit_icmp(line)
           when :call then return emit_call(line)
           when :switch then return emit_switch(label, line)
+          when :invoke then return emit_invoke(label, line)
+          when :fence then return []
           when :branch then return emit_branch(label, line)
           when :return then return emit_return(line)
           when :unreachable then return emit_unreachable
@@ -883,6 +969,11 @@ module PFC
         end
 
         if line.respond_to?(:destination) && line.respond_to?(:base_pointer) && line.respond_to?(:source_type)
+          if global_function_pointer_tables.key?(line.base_pointer)
+            register_function_pointer_table_slot!(line)
+            return []
+          end
+
           base_address = memory_address(line.base_pointer)
           offset = gep_offset_expression(line.source_type, line.indices, base_address.offset)
           pointers[line.destination] = pointer_from_address(base_address, offset)
@@ -1241,6 +1332,53 @@ module PFC
         ]
       end
 
+      def emit_shufflevector(line, context: nil)
+        unless supported_shuffle_mask?(line.mask_indices, vector_element_count(line.left_type))
+          raise Frontend::LLVMSubset::ParseError, "unsupported vector shuffle instruction: #{line}"
+        end
+
+        aggregate = aggregate_register(line.destination, context:)
+        left = aggregate_value_bytes(line.left_value, line.left_type, context:)
+        right = aggregate_value_bytes(line.right_value, line.left_type, context:)
+        width = vector_element_width(line.left_type)
+        left_count = vector_element_count(line.left_type)
+        prefix = next_aggregate_copy_prefix
+        lines = [
+          "    {",
+          "        int #{prefix}_i = 0;",
+          "        for (#{prefix}_i = 0; #{prefix}_i < #{aggregate.fetch(:size)}; #{prefix}_i++) {",
+          "            #{aggregate.fetch(:name)}[#{prefix}_i] = 0u;",
+          "        }"
+        ]
+        line.mask_indices.each_with_index do |source_index, destination_index|
+          next if source_index.nil? || source_index.negative?
+
+          source = source_index < left_count ? left : right
+          next unless source
+
+          lane = source_index < left_count ? source_index : source_index - left_count
+          width.times do |byte_offset|
+            lines << "        #{aggregate.fetch(:name)}[#{(destination_index * width) + byte_offset}] = #{source}[#{(lane * width) + byte_offset}];"
+          end
+        end
+        lines << "    }"
+        lines
+      end
+
+      def supported_shuffle_mask?(indices, source_count)
+        compact = indices.compact
+        return true if compact.empty?
+        return true if compact.uniq.length == 1
+
+        expected_identity = (0...indices.length).to_a
+        return true if indices == expected_identity
+
+        expected_concat = (0...(source_count * 2)).to_a
+        return true if indices == expected_concat
+
+        compact == (compact.first...(compact.first + compact.length)).to_a
+      end
+
       def emit_insertvalue(line, context: nil)
         aggregate = aggregate_register(line.destination, context:)
         source = aggregate_value_bytes(line.aggregate, line.aggregate_type, context:)
@@ -1338,6 +1476,12 @@ module PFC
       end
 
       def emit_pointer_load(destination, pointer)
+        if function_pointer_table_slots.key?(pointer)
+          slot = function_pointer_table_slots.fetch(pointer)
+          function_pointers[destination] = global_function_pointer_tables.fetch(slot.name).fetch(slot.index)
+          return []
+        end
+
         address = memory_address(pointer)
         pointers[destination] = EncodedPointer.new(value: register(destination))
         slot_lines(address, pointer_size) + [
@@ -1480,6 +1624,7 @@ module PFC
         return emit_expect_intrinsic(call) if llvm_expect_intrinsic?(call.fetch(:function_name))
         return emit_memory_intrinsic_call(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
         return emit_numeric_intrinsic_call(call) if llvm_numeric_intrinsic?(call.fetch(:function_name))
+        return emit_heap_call(call) if libc_heap_function?(call.fetch(:function_name))
         return emit_libc_memory_call(call) if libc_memory_function?(call.fetch(:function_name))
         return emit_libc_string_memory_call(call) if libc_string_memory_function?(call.fetch(:function_name))
         return emit_strlen_call(call) if call.fetch(:function_name) == "strlen"
@@ -1533,6 +1678,23 @@ module PFC
         inline_function_call(destination, function, parse_call_arguments(match[4]))
       end
 
+      def emit_invoke(_label, line)
+        unless line.to_s.include?(" nounwind ") || line.to_s.match?(/\A(?:#{NAME}\s*=\s*)?invoke\s+nounwind\b/)
+          raise Frontend::LLVMSubset::ParseError, "unsupported exception handling instruction: #{line}"
+        end
+
+        match = line.to_s.match(/\A(?:(#{NAME})\s*=\s*)?invoke\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(i(?:1|8|16|32|64|128)|<\d+\s+x\s+(?:i(?:1|8|16|32|64)|ptr)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|(?:<)?\{.*\}(?:>)?|ptr|void)\s+(.+?)\((.*)\)\s+to\s+label\s+%([-A-Za-z$._0-9]+)\s+unwind\s+label\s+%([-A-Za-z$._0-9]+)\z/)
+        raise Frontend::LLVMSubset::ParseError, "unsupported invoke: #{line}" unless match
+
+        callee = match[3].strip
+        call_line = if callee.start_with?("@")
+                      "#{match[1] ? "#{match[1]} = " : ""}call #{match[2]} #{callee}(#{match[4]})"
+                    else
+                      "#{match[1] ? "#{match[1]} = " : ""}call #{match[2]} #{callee}(#{match[4]})"
+                    end
+        emit_call(call_line) + ["    goto #{c_label(match[5])};"]
+      end
+
       def parse_call_arguments(raw)
         parse_typed_call_arguments(raw).map { |argument| argument.fetch(:value) }
       end
@@ -1571,11 +1733,13 @@ module PFC
       end
 
       def indirect_dispatch_supported?(name)
-        name == "getchar" || name == "putchar" || name == "puts" || name == "strlen" || libc_string_memory_function?(name)
+        internal_functions.key?(name) || name == "getchar" || name == "putchar" || name == "puts" || name == "strlen" || libc_string_memory_function?(name)
       end
 
       def emit_indirect_dispatch_body(name, call, context:)
         dispatched = call.merge(function_name: name, callee: nil)
+        return inline_function_call(call.fetch(:destination), internal_functions.fetch(name), parse_call_arguments(call.fetch(:raw_arguments)), caller_context: context) if internal_functions.key?(name)
+
         case name
         when "getchar" then emit_getchar_call(call.fetch(:destination), context:)
         when "putchar"
@@ -1778,9 +1942,16 @@ module PFC
                  end
           aggregates[lhs] ||= { name: "#{prefix}_#{c_aggregate_name(lhs)}", size: type_size(type), type: } if type
         end
+        inline_function_pointers = {}
         function.fetch(:blocks).values.flatten.each do |line|
           lhs = line[/\A(#{NAME})\s*=\s*phi\s+(?:ptr|.+?\*)\b/, 1]
-          pointers[lhs] = EncodedPointer.new(value: values.fetch(lhs)) if lhs
+          next unless lhs
+
+          if (signature = function_pointer_phi_signature(line))
+            inline_function_pointers[lhs] = FunctionPointerValue.new(signature:, value: values.fetch(lhs))
+          else
+            pointers[lhs] = EncodedPointer.new(value: values.fetch(lhs))
+          end
         end
         {
           call_stack:,
@@ -1788,7 +1959,7 @@ module PFC
             return_destination.start_with?("#{prefix}_ignored_return"),
           aggregates:,
           function:,
-          function_pointers: {},
+          function_pointers: inline_function_pointers,
           i128_high_values:,
           pointers:,
           prefix:,
@@ -1880,6 +2051,7 @@ module PFC
           when :select then return emit_inline_select(line, context)
           when :cast then return emit_inline_cast(line, context)
           when :freeze then return emit_inline_freeze(line, context)
+          when :shufflevector then return emit_shufflevector(line, context:)
           when :extractelement then return emit_extractelement(line, context:)
           when :insertelement then return emit_insertelement(line, context:)
           when :extractvalue then return emit_extractvalue(line, context:)
@@ -1887,6 +2059,7 @@ module PFC
           when :icmp then return emit_inline_icmp(line, context)
           when :call then return emit_inline_call(line, context)
           when :switch then return emit_inline_switch(line, context, label)
+          when :fence then return []
           when :branch then return emit_inline_branch(line, context, label)
           when :return then return emit_inline_return(line, context)
           when :unreachable then return emit_unreachable
@@ -1921,6 +2094,14 @@ module PFC
         end
 
         if line.respond_to?(:destination) && line.respond_to?(:base_pointer) && line.respond_to?(:source_type)
+          if global_function_pointer_tables.key?(line.base_pointer)
+            unless line.indices.length == 2 && line.indices.all? { |index| index.match?(/\A-?\d+\z/) }
+              raise Frontend::LLVMSubset::ParseError, "dynamic function pointer table index is unsupported: #{line}"
+            end
+            context.fetch(:function_pointers)[line.destination] = global_function_pointer_tables.fetch(line.base_pointer).fetch(line.indices.fetch(1).to_i)
+            return []
+          end
+
           base_address = memory_address(line.base_pointer, context:)
           offset = gep_offset_expression(line.source_type, line.indices, base_address.offset, context:)
           context.fetch(:pointers)[line.destination] = pointer_from_address(base_address, offset)
@@ -2102,6 +2283,29 @@ module PFC
         return emit_vector_select(line, context:) if line.respond_to?(:vector_type) && line.vector_type
 
         if line.respond_to?(:value_type) && line.value_type == "ptr"
+          true_function = begin
+            function_pointer_binding(line.true_value, context:)
+          rescue Frontend::LLVMSubset::ParseError
+            nil
+          end
+          false_function = begin
+            function_pointer_binding(line.false_value, context:)
+          rescue Frontend::LLVMSubset::ParseError
+            nil
+          end
+          if true_function || false_function
+            raise Frontend::LLVMSubset::ParseError, "mixed data/function pointer select is unsupported: #{line}" unless true_function && false_function
+            unless same_function_signature?(true_function.fetch(:signature), false_function.fetch(:signature))
+              raise Frontend::LLVMSubset::ParseError, "function pointer select signature mismatch: #{line}"
+            end
+            condition = inline_value(line.condition, context)
+            context.fetch(:function_pointers)[line.destination] = FunctionPointerValue.new(
+              signature: true_function.fetch(:signature),
+              value: "(((#{condition}) != 0u) ? (#{true_function.fetch(:value)}) : (#{false_function.fetch(:value)}))"
+            )
+            return []
+          end
+
           condition = inline_value(line.condition, context)
           true_value = encoded_pointer_value(line.true_value, context:)
           false_value = encoded_pointer_value(line.false_value, context:)
@@ -2182,6 +2386,11 @@ module PFC
       end
 
       def emit_inline_pointer_load(destination, pointer, context)
+        if context.fetch(:function_pointers).key?(pointer)
+          context.fetch(:function_pointers)[destination] = context.fetch(:function_pointers).fetch(pointer)
+          return []
+        end
+
         address = memory_address(pointer, context:)
         context.fetch(:pointers)[destination] = EncodedPointer.new(value: inline_register(context, destination))
         inline_slot_lines(address, pointer_size) + [
@@ -2508,6 +2717,15 @@ module PFC
           value = line.incoming.find { |_value, label| label == from_label }&.first
           return nil if value.nil?
 
+          begin
+            return {
+              expression: function_pointer_binding(value).fetch(:value),
+              target: register(line.destination)
+            }
+          rescue Frontend::LLVMSubset::ParseError
+            nil
+          end
+
           return {
             expression: encoded_pointer_value(value),
             target: register(line.destination)
@@ -2584,6 +2802,15 @@ module PFC
         if line.respond_to?(:value_type) && line.value_type == "ptr"
           value = line.incoming.find { |_value, label| label == from_label }&.first
           return nil if value.nil?
+
+          begin
+            return {
+              expression: function_pointer_binding(value, context:).fetch(:value),
+              target: inline_register(context, line.destination)
+            }
+          rescue Frontend::LLVMSubset::ParseError
+            nil
+          end
 
           return {
             expression: encoded_pointer_value(value, context:),
@@ -3423,7 +3650,7 @@ module PFC
       end
 
       def llvm_numeric_intrinsic?(name)
-        llvm_minmax_intrinsic?(name) || llvm_abs_intrinsic?(name) || llvm_bit_count_intrinsic?(name) || llvm_bswap_intrinsic?(name) || llvm_overflow_intrinsic?(name)
+        llvm_minmax_intrinsic?(name) || llvm_abs_intrinsic?(name) || llvm_bit_count_intrinsic?(name) || llvm_bswap_intrinsic?(name) || llvm_bitreverse_intrinsic?(name) || llvm_saturating_intrinsic?(name) || llvm_funnel_shift_intrinsic?(name) || llvm_vector_reduce_intrinsic?(name) || llvm_overflow_intrinsic?(name)
       end
 
       def llvm_overflow_intrinsic?(name)
@@ -3446,6 +3673,22 @@ module PFC
         name.match?(/\Allvm\.bswap\.i(?:16|32|64)\z/)
       end
 
+      def llvm_bitreverse_intrinsic?(name)
+        name.match?(/\Allvm\.bitreverse\.i(?:1|8|16|32|64)\z/)
+      end
+
+      def llvm_saturating_intrinsic?(name)
+        name.match?(/\Allvm\.[us](?:add|sub)\.sat\.i(?:1|8|16|32|64)\z/)
+      end
+
+      def llvm_funnel_shift_intrinsic?(name)
+        name.match?(/\Allvm\.fsh[lr]\.i(?:1|8|16|32|64)\z/)
+      end
+
+      def llvm_vector_reduce_intrinsic?(name)
+        name.match?(/\Allvm\.vector\.reduce\.(?:add|and|or|xor|smax|smin|umax|umin)\.v\d+i(?:1|8|16|32|64)\z/)
+      end
+
       def llvm_memset_intrinsic?(name)
         name.start_with?("llvm.memset.")
       end
@@ -3460,6 +3703,10 @@ module PFC
 
       def libc_memory_function?(name)
         %w[memcpy memmove memset].include?(name)
+      end
+
+      def libc_heap_function?(name)
+        %w[calloc free malloc].include?(name)
       end
 
       def libc_string_memory_function?(name)
@@ -3582,6 +3829,7 @@ module PFC
       def validate_numeric_intrinsic_signature!(call)
         name = call.fetch(:function_name)
         return validate_overflow_intrinsic_signature!(call) if llvm_overflow_intrinsic?(name)
+        return validate_vector_reduce_intrinsic_signature!(call) if llvm_vector_reduce_intrinsic?(name)
 
         bits = name[/\.i(1|8|16|32|64)\z/, 1]&.to_i
         unless bits && call.fetch(:return_type) == "i#{bits}"
@@ -3591,8 +3839,10 @@ module PFC
         arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
         expected = if llvm_abs_intrinsic?(name) || name.include?(".ctlz.") || name.include?(".cttz.")
                      ["i#{bits}", "i1"]
-                   elsif llvm_bit_count_intrinsic?(name) || llvm_bswap_intrinsic?(name)
+                   elsif llvm_bit_count_intrinsic?(name) || llvm_bswap_intrinsic?(name) || llvm_bitreverse_intrinsic?(name)
                      ["i#{bits}"]
+                   elsif llvm_funnel_shift_intrinsic?(name)
+                     ["i#{bits}", "i#{bits}", "i#{bits}"]
                    else
                      ["i#{bits}", "i#{bits}"]
                    end
@@ -3618,9 +3868,26 @@ module PFC
         end
       end
 
+      def validate_vector_reduce_intrinsic_signature!(call)
+        name = call.fetch(:function_name)
+        match = name.match(/\.v(\d+)i(1|8|16|32|64)\z/)
+        count = match[1].to_i
+        bits = match[2].to_i
+        unless call.fetch(:return_type) == "i#{bits}"
+          raise Frontend::LLVMSubset::ParseError, "call return type mismatch for @#{name}: expected i#{bits}, got #{call.fetch(:return_type)}"
+        end
+
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        validate_memory_intrinsic_arguments!(name, arguments, ["<#{count} x i#{bits}>"])
+        raise Frontend::LLVMSubset::ParseError, "numeric intrinsic must assign a result: @#{name}" unless call.fetch(:destination)
+      end
+
       def emit_numeric_intrinsic_call(call, context: nil)
         name = call.fetch(:function_name)
         return emit_overflow_intrinsic_call(call, context:) if llvm_overflow_intrinsic?(name)
+        return emit_vector_reduce_intrinsic_call(call, context:) if llvm_vector_reduce_intrinsic?(name)
+        return emit_saturating_intrinsic_call(call, context:) if llvm_saturating_intrinsic?(name)
+        return emit_funnel_shift_intrinsic_call(call, context:) if llvm_funnel_shift_intrinsic?(name)
 
         bits = name[/\.i(1|8|16|32|64)\z/, 1].to_i
         arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
@@ -3629,6 +3896,8 @@ module PFC
                        abs_expression(bits, left)
                      elsif llvm_bswap_intrinsic?(name)
                        bswap_expression(bits, left)
+                     elsif llvm_bitreverse_intrinsic?(name)
+                       bitreverse_expression(bits, left)
                      elsif llvm_bit_count_intrinsic?(name)
                        bit_count_expression(name, bits, left)
                      else
@@ -3660,6 +3929,88 @@ module PFC
           "        pf_llvm_store(#{aggregate.fetch(:name)}, #{width}, (unsigned long long)#{prefix}_overflow, 1);",
           "    }"
         ]
+      end
+
+      def emit_saturating_intrinsic_call(call, context:)
+        name = call.fetch(:function_name)
+        bits = name[/\.i(1|8|16|32|64)\z/, 1].to_i
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        left = scalar_value(arguments.fetch(0).fetch(:value), context:)
+        right = scalar_value(arguments.fetch(1).fetch(:value), context:)
+        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
+        prefix = next_memory_intrinsic_prefix
+        if name.start_with?("llvm.u")
+          expression = unsigned_saturating_expression(name, bits, left, right)
+          return ["    #{target} = #{unsigned_cast(bits)}(#{expression});"]
+        end
+
+        [
+          "    {",
+          "        __int128 #{prefix}_left = (__int128)(#{signed_expression(left, bits)});",
+          "        __int128 #{prefix}_right = (__int128)(#{signed_expression(right, bits)});",
+          "        __int128 #{prefix}_raw = #{name.match?(/\Allvm\.sadd\.sat\./) ? "#{prefix}_left + #{prefix}_right" : "#{prefix}_left - #{prefix}_right"};",
+          "        __int128 #{prefix}_min = -((__int128)1 << #{bits - 1});",
+          "        __int128 #{prefix}_max = (((__int128)1 << #{bits - 1}) - 1);",
+          "        if (#{prefix}_raw < #{prefix}_min) #{prefix}_raw = #{prefix}_min;",
+          "        if (#{prefix}_raw > #{prefix}_max) #{prefix}_raw = #{prefix}_max;",
+          "        #{target} = #{unsigned_cast(bits)}(((unsigned long long)#{prefix}_raw) & #{integer_mask_literal(bits)});",
+          "    }"
+        ]
+      end
+
+      def emit_funnel_shift_intrinsic_call(call, context:)
+        name = call.fetch(:function_name)
+        bits = name[/\.i(1|8|16|32|64)\z/, 1].to_i
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        left = scalar_value(arguments.fetch(0).fetch(:value), context:)
+        right = scalar_value(arguments.fetch(1).fetch(:value), context:)
+        amount = scalar_value(arguments.fetch(2).fetch(:value), context:)
+        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
+        prefix = next_memory_intrinsic_prefix
+        [
+          "    {",
+          "        unsigned long long #{prefix}_shift = ((unsigned long long)(#{amount})) & #{bits - 1}ull;",
+          "        unsigned long long #{prefix}_left = ((unsigned long long)(#{left})) & #{integer_mask_literal(bits)};",
+          "        unsigned long long #{prefix}_right = ((unsigned long long)(#{right})) & #{integer_mask_literal(bits)};",
+          "        unsigned long long #{prefix}_result = #{name.include?('.fshl.') ? "((#{prefix}_left << #{prefix}_shift) | (#{prefix}_right >> ((#{bits} - #{prefix}_shift) & #{bits - 1}ull)))" : "((#{prefix}_left << ((#{bits} - #{prefix}_shift) & #{bits - 1}ull)) | (#{prefix}_right >> #{prefix}_shift))"};",
+          "        #{target} = #{unsigned_cast(bits)}(#{prefix}_result & #{integer_mask_literal(bits)});",
+          "    }"
+        ]
+      end
+
+      def emit_vector_reduce_intrinsic_call(call, context:)
+        name = call.fetch(:function_name)
+        match = name.match(/\Allvm\.vector\.reduce\.(add|and|or|xor|smax|smin|umax|umin)\.v(\d+)i(1|8|16|32|64)\z/)
+        operation = match[1]
+        count = match[2].to_i
+        bits = match[3].to_i
+        vector_type = "<#{count} x i#{bits}>"
+        source = aggregate_value_bytes(parse_typed_call_arguments(call.fetch(:raw_arguments)).fetch(0).fetch(:value), vector_type, context:) || aggregate_zero_bytes_literal(type_size(vector_type))
+        target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
+        prefix = next_aggregate_copy_prefix
+        width = byte_width(bits)
+        minmax = %w[smax smin umax umin].include?(operation)
+        initial = if minmax
+                    "(pf_llvm_load(#{source}, 0, #{width}) & #{integer_mask_literal(bits)})"
+                  elsif operation == "and"
+                    integer_mask_literal(bits)
+                  else
+                    "0ull"
+                  end
+        lines = [
+          "    {",
+          "        int #{prefix}_i = #{minmax ? 1 : 0};",
+          "        unsigned long long #{prefix}_acc = #{initial};",
+          "        for (; #{prefix}_i < #{count}; #{prefix}_i++) {",
+          "            unsigned long long #{prefix}_lane = pf_llvm_load(#{source}, #{prefix}_i * #{width}, #{width}) & #{integer_mask_literal(bits)};"
+        ]
+        lines << vector_reduce_step(operation, bits, prefix)
+        lines.concat([
+          "        }",
+          "        #{target} = #{unsigned_cast(bits)}(#{prefix}_acc & #{integer_mask_literal(bits)});",
+          "    }"
+        ])
+        lines
       end
 
       def validate_memory_intrinsic_signature!(call)
@@ -3704,6 +4055,61 @@ module PFC
         end
 
         emit_memcpy_intrinsic(arguments, context:)
+      end
+
+      def emit_heap_call(call, context: nil)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        case call.fetch(:function_name)
+        when "malloc" then emit_malloc_call(call.fetch(:destination), scalar_value(arguments.fetch(0).fetch(:value), context:), context:)
+        when "calloc" then emit_calloc_call(call.fetch(:destination), scalar_value(arguments.fetch(0).fetch(:value), context:), scalar_value(arguments.fetch(1).fetch(:value), context:), context:)
+        else []
+        end
+      end
+
+      def emit_malloc_call(destination, size, context:)
+        raise Frontend::LLVMSubset::ParseError, "malloc result must be assigned" unless destination
+
+        target = context ? inline_register(context, destination) : register(destination)
+        pointer_map = context ? context.fetch(:pointers) : pointers
+        pointer_map[destination] = EncodedPointer.new(value: target)
+        prefix = next_memory_intrinsic_prefix
+        [
+          "    {",
+          "        long long #{prefix}_size = (long long)(#{size});",
+          "        if (#{prefix}_size < 0 || pf_llvm_heap_next + #{prefix}_size > PF_LLVM_MEMORY_SIZE) {",
+          "            fprintf(stderr, \"pfc runtime error: malloc out of memory\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        #{target} = (unsigned long long)pf_llvm_heap_next;",
+          "        pf_llvm_heap_next += (int)#{prefix}_size;",
+          "    }"
+        ]
+      end
+
+      def emit_calloc_call(destination, count, size, context:)
+        raise Frontend::LLVMSubset::ParseError, "calloc result must be assigned" unless destination
+
+        target = context ? inline_register(context, destination) : register(destination)
+        pointer_map = context ? context.fetch(:pointers) : pointers
+        pointer_map[destination] = EncodedPointer.new(value: target)
+        prefix = next_memory_intrinsic_prefix
+        [
+          "    {",
+          "        long long #{prefix}_count = (long long)(#{count});",
+          "        long long #{prefix}_size = (long long)(#{size});",
+          "        long long #{prefix}_total = #{prefix}_count * #{prefix}_size;",
+          "        long long #{prefix}_i = 0;",
+          "        if (#{prefix}_count < 0 || #{prefix}_size < 0 || (#{prefix}_size != 0 && #{prefix}_total / #{prefix}_size != #{prefix}_count) || pf_llvm_heap_next + #{prefix}_total > PF_LLVM_MEMORY_SIZE) {",
+          "            fprintf(stderr, \"pfc runtime error: calloc out of memory\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        #{target} = (unsigned long long)pf_llvm_heap_next;",
+          "        for (#{prefix}_i = 0; #{prefix}_i < #{prefix}_total; #{prefix}_i++) {",
+          "            llvm_memory[pf_llvm_heap_next + #{prefix}_i] = 0u;",
+          "        }",
+          "        pf_llvm_heap_next += (int)#{prefix}_total;",
+          "    }"
+        ]
       end
 
       def emit_libc_memory_call(call, context: nil)
@@ -4307,6 +4713,30 @@ module PFC
         "(#{prefix}_raw > #{max})"
       end
 
+      def unsigned_saturating_expression(name, bits, left, right)
+        max = integer_mask_literal(bits)
+        left_value = "((#{left}) & #{max})"
+        right_value = "((#{right}) & #{max})"
+        if name.match?(/\Allvm\.uadd\.sat\./)
+          "((#{left_value}) > (#{max} - (#{right_value})) ? #{max} : (((#{left_value}) + (#{right_value})) & #{max}))"
+        else
+          "((#{left_value}) < (#{right_value}) ? 0ull : (((#{left_value}) - (#{right_value})) & #{max}))"
+        end
+      end
+
+      def vector_reduce_step(operation, bits, prefix)
+        case operation
+        when "add" then "            #{prefix}_acc = (#{prefix}_acc + #{prefix}_lane) & #{integer_mask_literal(bits)};"
+        when "and" then "            #{prefix}_acc &= #{prefix}_lane;"
+        when "or" then "            #{prefix}_acc |= #{prefix}_lane;"
+        when "xor" then "            #{prefix}_acc ^= #{prefix}_lane;"
+        when "umax" then "            if (#{prefix}_lane > #{prefix}_acc) #{prefix}_acc = #{prefix}_lane;"
+        when "umin" then "            if (#{prefix}_lane < #{prefix}_acc) #{prefix}_acc = #{prefix}_lane;"
+        when "smax" then "            if (#{signed_expression("#{prefix}_lane", bits)} > #{signed_expression("#{prefix}_acc", bits)}) #{prefix}_acc = #{prefix}_lane;"
+        when "smin" then "            if (#{signed_expression("#{prefix}_lane", bits)} < #{signed_expression("#{prefix}_acc", bits)}) #{prefix}_acc = #{prefix}_lane;"
+        end
+      end
+
       def minmax_expression(name, bits, left, right)
         signed = name.include?(".smax.") || name.include?(".smin.")
         minimum = name.include?("min")
@@ -4326,6 +4756,13 @@ module PFC
           source_shift = index * 8
           target_shift = (byte_count - index - 1) * 8
           "(((#{value}) >> #{source_shift}) & 255ull) << #{target_shift}"
+        end
+        "(#{terms.join(') | (')})"
+      end
+
+      def bitreverse_expression(bits, value)
+        terms = bits.times.map do |index|
+          "(((#{value}) >> #{index}) & 1ull) << #{bits - index - 1}"
         end
         "(#{terms.join(') | (')})"
       end

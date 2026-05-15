@@ -144,6 +144,7 @@ module PFC
       include_patterns = []
       json = false
       max_warnings = nil
+      suggest_next = false
       validate_schema = false
       while @argv.first&.start_with?("--")
         case @argv.first
@@ -155,6 +156,10 @@ module PFC
         when "--coverage-report", "--coverage"
           check = true
           coverage_report = true
+        when "--suggest-next"
+          check = true
+          coverage_report = true
+          suggest_next = true
         when "--explain"
           check = true
           explain = true
@@ -198,7 +203,7 @@ module PFC
         raise ArgumentError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
         check_dir = true if coverage_report && File.directory?(path)
         raise ArgumentError, "--include/--exclude are only supported with --check-dir" if !check_dir && (!include_patterns.empty? || !exclude_patterns.empty?)
-        raise ArgumentError, "--coverage-report is incompatible with --format=sarif" if coverage_report && format == "sarif"
+        raise ArgumentError, "--coverage-report/--suggest-next is incompatible with --format=sarif" if coverage_report && format == "sarif"
         if check_dir
           raise ArgumentError, "llvm-capabilities --check-dir requires a directory" unless File.directory?(path)
           result = llvm_check_directory_result(path, include_patterns:, exclude_patterns:, fail_on:, max_warnings:)
@@ -208,7 +213,15 @@ module PFC
         end
         llvm_validate_result_schema!(result) if validate_schema
 
-        if coverage_report
+        if suggest_next
+          report = llvm_coverage_report(path, result)
+          suggestions = llvm_next_suggestions(report)
+          if json || format == "json"
+            puts JSON.pretty_generate(suggestions)
+          else
+            print_llvm_next_suggestions(suggestions)
+          end
+        elsif coverage_report
           report = llvm_coverage_report(path, result)
           if json || format == "json"
             puts JSON.pretty_generate(report)
@@ -394,6 +407,61 @@ module PFC
 
     def llvm_rank_counts(counts)
       counts.sort_by { |name, count| [-count, name] }.map { |name, count| { name:, count: } }
+    end
+
+    def llvm_next_suggestions(report)
+      candidates = []
+      report.fetch(:top_unsupported_intrinsics).each do |entry|
+        candidates << llvm_intrinsic_suggestion(entry.fetch(:name), entry.fetch(:count))
+      end
+      report.fetch(:top_unsupported_opcodes).each do |entry|
+        candidates << llvm_opcode_suggestion(entry.fetch(:name), entry.fetch(:count))
+      end
+      candidates.compact!
+      {
+        schema_version: 1,
+        path: report.fetch(:path),
+        supported: report.fetch(:supported),
+        summary: report.fetch(:summary),
+        suggestions: candidates.uniq { |candidate| candidate.fetch(:feature) }.first(10)
+      }
+    end
+
+    def llvm_intrinsic_suggestion(name, count)
+      feature = if name.include?("vector.reduce")
+                  "vector reduction intrinsic"
+                elsif name.match?(/\.sat\./)
+                  "saturating integer intrinsic"
+                elsif name.include?("fsh")
+                  "funnel shift intrinsic"
+                else
+                  "LLVM intrinsic #{name}"
+                end
+      { feature:, count:, rationale: "Observed unsupported intrinsic @#{name}. Add the smallest integer-only lowering or keep a targeted diagnostic." }
+    end
+
+    def llvm_opcode_suggestion(name, count)
+      feature = case name
+                when "shufflevector" then "limited shufflevector lowering"
+                when "invoke" then "nounwind invoke lowering"
+                when "fence" then "single-thread fence no-op"
+                when "atomicrmw", "cmpxchg" then "single-thread atomic read-modify-write lowering"
+                else "LLVM opcode #{name}"
+                end
+      { feature:, count:, rationale: "Observed unsupported opcode #{name}. Prioritize only common patterns before adding general semantics." }
+    end
+
+    def print_llvm_next_suggestions(suggestions)
+      puts "suggest-next: #{suggestions.fetch(:path)}"
+      if suggestions.fetch(:suggestions).empty?
+        puts "  no unsupported opcodes or intrinsics found"
+        return
+      end
+
+      suggestions.fetch(:suggestions).each do |entry|
+        puts "  #{entry.fetch(:feature)}: count=#{entry.fetch(:count)}"
+        puts "    #{entry.fetch(:rationale)}"
+      end
     end
 
     def print_llvm_coverage_report(report)
@@ -831,7 +899,9 @@ module PFC
     end
 
     def llvm_static_supported_line?(line)
-      line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?(?:(?:tail|musttail|notail)\s+)?(?:alloca|getelementptr|load|store|extractelement|insertelement|extractvalue|insertvalue|add|sub|mul|udiv|sdiv|urem|srem|and|or|xor|shl|lshr|ashr|zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast|freeze|icmp|select|phi|call|switch|br|ret|unreachable)\b/) ||
+      return true if line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?invoke\b/) && line.match?(/\bnounwind\b/)
+
+      line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?(?:(?:tail|musttail|notail)\s+)?(?:alloca|getelementptr|load|store|extractelement|insertelement|extractvalue|insertvalue|shufflevector|add|sub|mul|udiv|sdiv|urem|srem|and|or|xor|shl|lshr|ashr|zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast|freeze|icmp|select|phi|call|switch|br|ret|fence|unreachable)\b/) ||
         line.match?(/\A[@%][-A-Za-z$._0-9]+\s*=.*\b(?:global|constant|alias)\b/)
     end
 
@@ -839,8 +909,9 @@ module PFC
       type_message = llvm_static_unsupported_type_message(line)
       return type_message if type_message
       return "unsupported blockaddress constant expression" if line.include?("blockaddress")
-      return "unsupported atomic operation" if line.match?(/\b(?:fence|atomicrmw|cmpxchg)\b/)
-      return "unsupported exception handling instruction" if line.match?(/\b(?:invoke|landingpad|resume|catchswitch|catchpad|cleanuppad|cleanupret|catchret)\b/)
+      return "unsupported atomic operation" if line.match?(/\b(?:atomicrmw|cmpxchg)\b/)
+      return "unsupported exception handling instruction" if line.match?(/\binvoke\b/) && !line.match?(/\bnounwind\b/)
+      return "unsupported exception handling instruction" if line.match?(/\b(?:landingpad|resume|catchswitch|catchpad|cleanuppad|cleanupret|catchret)\b/)
       return "unsupported vector shuffle instruction" if line.match?(/\bshufflevector\b/)
       return "unsupported varargs instruction" if line.match?(/\bva_arg\b/)
 
@@ -989,6 +1060,7 @@ module PFC
           pfc llvm-capabilities --check [--json] [--format=json|sarif] [--fix-suggestions] [--emit-lowering-plan] [--validate-schema] [--fail-on=error|warning|none] [--max-warnings=N] INPUT.ll
           pfc llvm-capabilities --check-dir [--json] [--format=json|sarif] [--emit-lowering-plan] [--validate-schema] [--include=GLOB] [--exclude=GLOB] [--fail-on=error|warning|none] [--max-warnings=N] DIR
           pfc llvm-capabilities --coverage-report [--json] INPUT.ll|DIR
+          pfc llvm-capabilities --suggest-next [--json] INPUT.ll|DIR
           pfc llvm-capabilities --explain INPUT.ll
 
         Options:
@@ -1032,7 +1104,8 @@ module PFC
             - integer, pointer, and aggregate select
             - pointer phi
             - freeze
-            - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, llvm.cttz, and llvm.[su]{add,sub,mul}.with.overflow scalar intrinsics
+            - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.bitreverse, llvm.ctpop, llvm.ctlz, llvm.cttz, llvm.fshl/fshr, llvm.[su]{add,sub}.sat, and llvm.[su]{add,sub,mul}.with.overflow scalar intrinsics
+            - integer llvm.vector.reduce add/and/or/xor/min/max intrinsics over fixed-length integer vectors
             - aggregate byte equality/compare helpers for libc and future aggregate lowering
             - extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values
             - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks
@@ -1042,7 +1115,8 @@ module PFC
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
             - void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments
-            - limited indirect calls through known builtin function pointers with matching signatures
+            - limited indirect calls through known builtin/internal function pointers, pointer phi, and constant global function pointer tables with matching signatures
+            - nounwind invoke lowered to call plus normal-label branch
             - sret-style aggregate returns through the first pointer parameter and byval pointer arguments with callee-local copies
           tolerance:
             - common value attributes accepted as no-ops
@@ -1056,6 +1130,7 @@ module PFC
             - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode
             - llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output
             - llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, severities, and top unsupported opcode/intrinsic rankings
+            - llvm-capabilities --suggest-next proposes next implementation candidates from coverage rankings
             - llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning
             - docs/llvm-capabilities.schema.json publishes the check JSON contract
             - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
@@ -1063,9 +1138,10 @@ module PFC
             - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
             - llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics
+            - single-thread atomic load/store accepted as normal memory access, and fence accepted as a no-op
             - llvm.expect.* accepted as identity intrinsic
           libc:
-            - putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, atoi, strtol with null endptr, isdigit, isalpha, isalnum, isspace, tolower, toupper, memcpy, memmove, memset, memcmp, memchr
+            - putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, atoi, strtol with null endptr, isdigit, isalpha, isalnum, isspace, tolower, toupper, malloc, calloc, free as no-op, memcpy, memmove, memset, memcmp, memchr
             - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags
       TEXT
     end
@@ -1101,7 +1177,8 @@ module PFC
           "integer, pointer, and aggregate select",
           "pointer phi",
           "freeze",
-          "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, llvm.cttz, and llvm.[su]{add,sub,mul}.with.overflow scalar intrinsics",
+          "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.bitreverse, llvm.ctpop, llvm.ctlz, llvm.cttz, llvm.fshl/fshr, llvm.[su]{add,sub}.sat, and llvm.[su]{add,sub,mul}.with.overflow scalar intrinsics",
+          "integer llvm.vector.reduce add/and/or/xor/min/max intrinsics over fixed-length integer vectors",
           "aggregate byte equality/compare helpers for libc and future aggregate lowering",
           "extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values",
           "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, vector icmp/select, extractelement, and insertelement with runtime index checks",
@@ -1112,7 +1189,8 @@ module PFC
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
           "void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments",
-          "limited indirect calls through known builtin function pointers with matching signatures",
+          "limited indirect calls through known builtin/internal function pointers, pointer phi, and constant global function pointer tables with matching signatures",
+          "nounwind invoke lowered to call plus normal-label branch",
           "sret-style aggregate returns through the first pointer parameter and byval pointer arguments with callee-local copies"
         ],
         tolerance: [
@@ -1127,6 +1205,7 @@ module PFC
           "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode",
           "llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output",
           "llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, severities, and top unsupported opcode/intrinsic rankings",
+          "llvm-capabilities --suggest-next proposes next implementation candidates from coverage rankings",
           "llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning",
           "docs/llvm-capabilities.schema.json publishes the check JSON contract",
           "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
@@ -1134,10 +1213,11 @@ module PFC
           "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics",
+          "single-thread atomic load/store accepted as normal memory access, and fence accepted as a no-op",
           "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [
-          "putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, atoi, strtol with null endptr, isdigit, isalpha, isalnum, isspace, tolower, toupper, memcpy, memmove, memset, memcmp, memchr",
+          "putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, atoi, strtol with null endptr, isdigit, isalpha, isalnum, isspace, tolower, toupper, malloc, calloc, free as no-op, memcpy, memmove, memset, memcmp, memchr",
           "static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags"
         ]
       }

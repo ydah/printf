@@ -12,8 +12,13 @@ class LLVMConformanceTest < Minitest::Test
   SUPPORTED_FIXTURES = {
     "aggregate_phi_fields.ll" => "B",
     "aggregate_argument_abi.ll" => "B",
+    "atomic_fence_single_thread.ll" => "B",
     "clang_noop_intrinsics.ll" => "B",
     "compound_gep_lifetime.ll" => "B",
+    "function_pointer_tables.ll" => "B",
+    "heap_alloc.ll" => "B",
+    "integer_intrinsics_extended.ll" => "B",
+    "invoke_nounwind.ll" => "B",
     "indirect_function_pointer.ll" => "B",
     "internal_array_abi.ll" => "B",
     "minimal_return.ll" => "",
@@ -32,6 +37,7 @@ class LLVMConformanceTest < Minitest::Test
     "aggregate_icmp.ll" => "B",
     "sret_multiple_byval_abi.ll" => "B",
     "sret_byval_abi.ll" => "B",
+    "shufflevector_limited.ll" => "B",
     "overflow_intrinsics.ll" => "B",
     "select_phi_matrix.ll" => "B",
     "vector_add.ll" => "B",
@@ -245,6 +251,17 @@ class LLVMConformanceTest < Minitest::Test
     assert report.fetch("top_unsupported_intrinsics").any? { |entry| entry.fetch("name") == "llvm.experimental.unsupported.i32" }
   end
 
+  def test_suggest_next_reports_ranked_implementation_candidates
+    out, err = capture_io do
+      assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--suggest-next", "--json", File.join(FIXTURE_ROOT, "unsupported")]).run
+    end
+
+    assert_empty err
+    result = JSON.parse(out)
+    assert_equal 1, result.fetch("schema_version")
+    assert result.fetch("suggestions").any? { |entry| entry.fetch("feature").include?("LLVM intrinsic") || entry.fetch("feature").include?("opcode") }
+  end
+
   def test_check_dir_json_summary_filters_and_fail_on_warning
     Dir.mktmpdir("pfc-check-dir") do |dir|
       File.write(File.join(dir, "warn.ll"), <<~LLVM)
@@ -345,7 +362,7 @@ class LLVMConformanceTest < Minitest::Test
   end
 
   def test_static_preflight_fuzz_reports_explicit_diagnostics
-    unsupported_opcodes = %w[fence atomicrmw cmpxchg landingpad va_arg]
+    unsupported_opcodes = %w[atomicrmw cmpxchg landingpad va_arg]
     unsupported_opcodes.each do |opcode|
       Dir.mktmpdir("pfc-fuzz") do |dir|
         path = File.join(dir, "#{opcode}.ll")
@@ -369,7 +386,7 @@ class LLVMConformanceTest < Minitest::Test
 
   def test_static_preflight_classifies_unsupported_feature_families
     cases = {
-      "atomic.ll" => ["fence seq_cst", "unsupported atomic operation"],
+      "atomic.ll" => ["%old = atomicrmw add ptr null, i32 1 seq_cst", "unsupported atomic operation"],
       "eh.ll" => ["landingpad { ptr, i32 } cleanup", "unsupported exception handling instruction"],
       "shuffle.ll" => ["%x = shufflevector <2 x i32> <i32 1, i32 2>, <2 x i32> <i32 3, i32 4>, <2 x i32> <i32 0, i32 2>", "unsupported vector shuffle instruction"],
       "varargs.ll" => ["%x = va_arg ptr null, i32", "unsupported varargs instruction"]

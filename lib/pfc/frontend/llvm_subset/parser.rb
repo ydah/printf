@@ -33,6 +33,7 @@ module PFC
             when :select then SelectInstruction.new(text)
             when :cast then CastInstruction.new(text)
             when :freeze then FreezeInstruction.new(text)
+            when :shufflevector then ShuffleVectorInstruction.new(text)
             when :extractelement then ExtractElementInstruction.new(text)
             when :insertelement then InsertElementInstruction.new(text)
             when :extractvalue then ExtractValueInstruction.new(text)
@@ -137,6 +138,7 @@ module PFC
             return :select if text.match?(/\A#{NAME}\s*=\s*select\b/)
             return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast)\b/)
             return :freeze if text.match?(/\A#{NAME}\s*=\s*freeze\b/)
+            return :shufflevector if text.match?(/\A#{NAME}\s*=\s*shufflevector\b/)
             return :gep if text.match?(/\A#{NAME}\s*=\s*getelementptr\b/)
             return :extractelement if text.match?(/\A#{NAME}\s*=\s*extractelement\b/)
             return :insertelement if text.match?(/\A#{NAME}\s*=\s*insertelement\b/)
@@ -144,6 +146,8 @@ module PFC
             return :insertvalue if text.match?(/\A#{NAME}\s*=\s*insertvalue\b/)
             return :icmp if text.match?(/\A#{NAME}\s*=\s*icmp\b/)
             return :switch if text.start_with?("switch ")
+            return :invoke if text.match?(/\A(?:#{NAME}\s*=\s*)?invoke\b/)
+            return :fence if text.start_with?("fence ")
             return :branch if text.start_with?("br ")
             return :return if text.start_with?("ret ")
             return :unreachable if text == "unreachable"
@@ -223,7 +227,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*load\s+(.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*load\s+(?:volatile\s+)?(?:atomic\s+)?(.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)(?:\s+(?:syncscope\("[^"]+"\)\s+)?(?:unordered|monotonic|acquire|release|acq_rel|seq_cst))?(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @destination = match[1]
@@ -238,7 +242,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\Astore\s+(.+?)\s+(.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)(?:,\s+align\s+\d+)?\z/)
+            match = text.match(/\Astore\s+(?:volatile\s+)?(?:atomic\s+)?(.+?)\s+(.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)(?:\s+(?:syncscope\("[^"]+"\)\s+)?(?:unordered|monotonic|acquire|release|acq_rel|seq_cst))?(?:,\s+align\s+\d+)?\z/)
             return unless match
 
             @value_type = (match[1] == "ptr" || match[1].start_with?("ptr addrspace(") || match[1].end_with?("*")) ? "ptr" : match[1]
@@ -499,6 +503,50 @@ module PFC
 
           def pointer_type?(type)
             type == "ptr" || type.end_with?("*")
+          end
+        end
+
+        class ShuffleVectorInstruction < Instruction
+          attr_reader :bits, :destination, :left_type, :left_value, :mask_indices, :right_value, :value, :value_type, :vector_type
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*shufflevector\s+(#{VECTOR_TYPE})\s+(.+)\z/)
+            return unless match
+
+            operands = Instruction.split_arguments(match[3])
+            return unless operands.length == 3
+
+            right_match = operands.fetch(1).match(/\A#{Regexp.escape(match[2])}\s+(.+)\z/)
+            mask_match = operands.fetch(2).match(/\A<(\d+)\s+x\s+i32>\s+(.+)\z/)
+            return unless right_match && mask_match
+
+            count = mask_match[1].to_i
+            mask = mask_match[2].strip
+            indices = if %w[zeroinitializer undef poison].include?(mask)
+                        Array.new(count, mask == "zeroinitializer" ? 0 : nil)
+                      else
+                        elements = Instruction.split_arguments(mask.delete_prefix("<").delete_suffix(">"))
+                        return unless elements.length == count
+
+                        elements.map do |element|
+                          element_match = element.match(/\Ai32\s+(-?\d+|undef|poison)\z/)
+                          return unless element_match
+
+                          %w[undef poison].include?(element_match[1]) ? nil : element_match[1].to_i
+                        end
+                      end
+
+            element_type = match[2][/<\d+\s+x\s+(.+)>\z/, 1]
+            @destination = match[1]
+            @left_type = match[2]
+            @left_value = operands.fetch(0)
+            @right_value = right_match[1]
+            @mask_indices = indices.freeze
+            @value_type = "<#{count} x #{element_type}>"
+            @vector_type = @value_type
+            @value = @left_value
+            @bits = element_type.delete_prefix("i").to_i if element_type.start_with?("i")
           end
         end
 
@@ -1250,16 +1298,17 @@ module PFC
         end
 
         def outgoing_labels(lines)
-          terminator = lines.reverse.find { |line| line.start_with?("br ") || line.start_with?("switch ") || line.start_with?("ret ") || line == "unreachable" }
+          terminator = lines.reverse.find { |line| line.start_with?("br ") || line.start_with?("switch ") || line.match?(/\A(?:#{NAME}\s*=\s*)?invoke\b/) || line.start_with?("ret ") || line == "unreachable" }
           return [] if terminator.nil? || terminator.start_with?("ret ") || terminator == "unreachable"
 
-          branch_labels(terminator) + switch_labels(terminator)
+          branch_labels(terminator) + switch_labels(terminator) + invoke_labels(terminator)
         end
 
         def referenced_labels(line)
           return phi_labels(line) if line.match?(/\A#{NAME}\s*=\s*phi\b/)
           return branch_labels(line) if line.start_with?("br ")
           return switch_labels(line) if line.start_with?("switch ")
+          return invoke_labels(line) if line.match?(/\A(?:#{NAME}\s*=\s*)?invoke\b/)
 
           []
         end
@@ -1282,6 +1331,11 @@ module PFC
           return [] unless match
 
           [match[1]] + match[2].scan(/label\s+%([-A-Za-z$._0-9]+)/).flatten
+        end
+
+        def invoke_labels(line)
+          match = line.match(/\bto\s+label\s+%([-A-Za-z$._0-9]+)\s+unwind\s+label\s+%([-A-Za-z$._0-9]+)\z/)
+          match ? [match[1], match[2]] : []
         end
 
         def parse_error(message, line)
