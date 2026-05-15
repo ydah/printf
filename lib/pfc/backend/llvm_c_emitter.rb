@@ -252,6 +252,7 @@ module PFC
       def analyze_registers
         all_lines.each do |line|
           lhs = line[/\A(#{NAME})\s*=/, 1]
+          lhs = line.destination if lhs.nil? && line.respond_to?(:destination)
           next if lhs.nil?
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*alloca\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*getelementptr\b/)
@@ -259,8 +260,16 @@ module PFC
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*bitcast\s+(?:ptr|.+?\*)\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*select\s+i1\s+.+?,\s+ptr\b/)
           pointer_result = line.respond_to?(:value_type) && line.value_type == "ptr" && line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|extractvalue|freeze)\b/)
-          if (match = line.match(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|insertvalue)\s+(.+?)(?:,|\s+)/)) && aggregate_type?(match[1])
+          if (match = line.match(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|insertvalue|insertelement)\s+(.+?)(?:,|\s+)/)) && aggregate_type?(match[1])
             aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(match[1]), type: match[1] }
+            next
+          end
+          if line.respond_to?(:destination) && line.respond_to?(:value_type) && line.destination == lhs && aggregate_type?(line.value_type)
+            aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(line.value_type), type: line.value_type }
+            next
+          end
+          if line.respond_to?(:destination) && line.respond_to?(:vector_type) && line.respond_to?(:value) && line.destination == lhs && aggregate_type?(line.vector_type)
+            aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(line.vector_type), type: line.vector_type }
             next
           end
 
@@ -300,8 +309,14 @@ module PFC
       def type_size(raw_type)
         type = raw_type.strip
         return byte_width(Regexp.last_match(1).to_i) if type.match(/\Ai(1|8|16|32|64)\z/)
+        return 16 if type == "i128"
         return pointer_size if pointer_type_name?(type)
         if type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+          count = Regexp.last_match(1).to_i
+          element = Regexp.last_match(2)
+          return type_size(element) * count
+        end
+        if type.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
           count = Regexp.last_match(1).to_i
           element = Regexp.last_match(2)
           return type_size(element) * count
@@ -331,7 +346,7 @@ module PFC
 
       def type_align(raw_type)
         type = raw_type.strip
-        return integer_align(Regexp.last_match(1).to_i) if type.match(/\Ai(1|8|16|32|64)\z/)
+        return integer_align(Regexp.last_match(1).to_i) if type.match(/\Ai(1|8|16|32|64|128)\z/)
         return pointer_align if pointer_type_name?(type)
         return type_align(Regexp.last_match(2)) if type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
         return struct_layout(type).fetch(:align) if struct_type?(type)
@@ -412,6 +427,11 @@ module PFC
           element_size = type_size(element)
           return Array.new(count) { |index| index * element_size }
         end
+        if stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
+          count = Regexp.last_match(1).to_i
+          element_size = type_size(Regexp.last_match(2))
+          return Array.new(count) { |index| index * element_size }
+        end
         return struct_layout(stripped).fetch(:field_offsets) if struct_type?(stripped)
 
         offset = 0
@@ -465,12 +485,15 @@ module PFC
 
       def aggregate_type?(type)
         stripped = type.to_s.strip
-        struct_type?(stripped) || stripped.match?(/\A\[\d+\s+x\s+.+\]\z/)
+        struct_type?(stripped) || stripped.match?(/\A\[\d+\s+x\s+.+\]\z/) || stripped.match?(/\A<\d+\s+x\s+i(?:1|8|16|32|64)>\z/)
       end
 
       def aggregate_fields(type)
         stripped = type.strip
         if stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+          return Array.new(Regexp.last_match(1).to_i, Regexp.last_match(2))
+        end
+        if stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
           return Array.new(Regexp.last_match(1).to_i, Regexp.last_match(2))
         end
 
@@ -488,6 +511,9 @@ module PFC
         current_type = type.strip
         indices.each do |index|
           if current_type.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+            current_type = Regexp.last_match(2)
+            offset += index * type_size(current_type)
+          elsif current_type.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
             current_type = Regexp.last_match(2)
             offset += index * type_size(current_type)
           elsif struct_type?(current_type)
@@ -623,7 +649,7 @@ module PFC
       end
 
       def body_lines(_label, lines)
-        lines.reject { |line| phi?(line) }
+        lines.reject { |line| phi?(line) || debug_record?(line) }
       end
 
       def emit_statement(label, line)
@@ -637,6 +663,8 @@ module PFC
           when :select then return emit_select(line)
           when :cast then return emit_cast(line)
           when :freeze then return emit_freeze(line)
+          when :extractelement then return emit_extractelement(line)
+          when :insertelement then return emit_insertelement(line)
           when :extractvalue then return emit_extractvalue(line)
           when :insertvalue then return emit_insertvalue(line)
           when :icmp then return emit_icmp(line)
@@ -721,6 +749,9 @@ module PFC
         elsif line.respond_to?(:value_type) && line.value_type && aggregate_type?(line.value_type)
           return emit_aggregate_store(line.value_type, line.value, line.pointer)
         else
+          if (vector_match = line.match(/\Astore\s+(<\d+\s+x\s+i(?:8|16|32|64)>)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/))
+            return emit_aggregate_store(vector_match[1], vector_match[2], vector_match[3])
+          end
           if (aggregate_match = line.match(/\Astore\s+(.+?)\s+(.+?),\s+(?:ptr|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME})(?:,\s+align\s+\d+)?\z/)) && aggregate_type?(aggregate_match[1])
             return emit_aggregate_store(aggregate_match[1], aggregate_match[2], aggregate_match[3])
           end
@@ -735,6 +766,8 @@ module PFC
           value = match[2]
           pointer = match[3]
         end
+        return emit_i128_store(value, pointer) if bits == 128
+
         width = byte_width(bits)
         address = memory_address(pointer)
         ensure_writable_address!(address)
@@ -767,6 +800,8 @@ module PFC
           bits = match[2].to_i
           pointer = match[3]
         end
+        return emit_i128_load(destination, pointer) if bits == 128
+
         width = byte_width(bits)
         address = memory_address(pointer)
         slot_lines(address, width) + [
@@ -854,6 +889,7 @@ module PFC
           to_bits = match[5].to_i
         end
         raise Frontend::LLVMSubset::ParseError, "unsupported cast: #{line}" unless from_bits
+        raise Frontend::LLVMSubset::ParseError, "unsupported i128 cast: #{line}" if from_bits == 128 && operator != "trunc"
 
         ["    #{register(destination)} = #{cast_expression(operator, from_bits, to_bits, llvm_value(value))};"]
       end
@@ -892,6 +928,34 @@ module PFC
         aggregate = aggregate_register(line.aggregate)
         [
           "    #{register(line.destination)} = #{unsigned_cast(bits)}(pf_llvm_load(#{aggregate.fetch(:name)}, #{offset}, #{byte_width(bits)}) & #{integer_mask_literal(bits)});"
+        ]
+      end
+
+      def emit_extractelement(line)
+        vector = aggregate_register(line.vector)
+        index = llvm_value(line.index)
+        width = byte_width(line.bits)
+        offset = "((#{index}) * #{width})"
+        [
+          "    #{register(line.destination)} = #{unsigned_cast(line.bits)}(pf_llvm_load(#{vector.fetch(:name)}, #{offset}, #{width}) & #{integer_mask_literal(line.bits)});"
+        ]
+      end
+
+      def emit_insertelement(line)
+        aggregate = aggregate_register(line.destination)
+        source = aggregate_value_bytes(line.vector, line.vector_type)
+        index = llvm_value(line.index)
+        width = byte_width(line.bits)
+        offset = "((#{index}) * #{width})"
+        copy_prefix = next_aggregate_copy_prefix
+        [
+          "    {",
+          "        int #{copy_prefix}_i = 0;",
+          "        for (#{copy_prefix}_i = 0; #{copy_prefix}_i < #{aggregate.fetch(:size)}; #{copy_prefix}_i++) {",
+          "            #{aggregate.fetch(:name)}[#{copy_prefix}_i] = #{source ? "#{source}[#{copy_prefix}_i]" : '0u'};",
+          "        }",
+          "        pf_llvm_store(#{aggregate.fetch(:name)}, #{offset}, (unsigned long long)(#{llvm_value(line.value)} & #{integer_mask_literal(line.bits)}), #{width});",
+          "    }"
         ]
       end
 
@@ -963,6 +1027,23 @@ module PFC
         ensure_writable_address!(address)
         dynamic_writable_address_lines(address) + slot_lines(address, pointer_size) + [
           "    pf_llvm_store(#{address.memory}, pf_slot_index, #{encoded_pointer_value(value)}, #{pointer_size});"
+        ]
+      end
+
+      def emit_i128_load(destination, pointer)
+        address = memory_address(pointer)
+        slot_lines(address, 16) + [
+          "    #{register(destination)} = pf_llvm_load(#{address.memory}, pf_slot_index, 8);"
+        ]
+      end
+
+      def emit_i128_store(value, pointer)
+        address = memory_address(pointer)
+        ensure_writable_address!(address)
+        low = i128_low64_value(value)
+        dynamic_writable_address_lines(address) + slot_lines(address, 16) + [
+          "    pf_llvm_store(#{address.memory}, pf_slot_index, #{low}, 8);",
+          "    pf_llvm_store(#{address.memory}, pf_slot_index + 8, 0ull, 8);"
         ]
       end
 
@@ -1064,8 +1145,9 @@ module PFC
         match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@putchar\(i32\s+(.+)\)\z/)
         return emit_internal_call(line) unless match
 
-        output = ["    if (pf_output_cell((unsigned char)(#{llvm_value(match[2])})) != 0) PF_ABORT();"]
-        output << "    #{register(match[1])} = 0u;" if match[1]
+        value = llvm_value(match[2])
+        output = ["    if (pf_output_cell((unsigned char)(#{value})) != 0) PF_ABORT();"]
+        output << "    #{register(match[1])} = (unsigned int)(unsigned char)(#{value});" if match[1]
         output
       end
 
@@ -1218,6 +1300,8 @@ module PFC
           when :select then return emit_inline_select(line, context)
           when :cast then return emit_inline_cast(line, context)
           when :freeze then return emit_inline_freeze(line, context)
+          when :extractelement then return emit_extractelement(line)
+          when :insertelement then return emit_insertelement(line)
           when :icmp then return emit_inline_icmp(line, context)
           when :call then return emit_inline_call(line, context)
           when :switch then return emit_inline_switch(line, context, label)
@@ -1527,8 +1611,9 @@ module PFC
           return inline_function_call(match[1], function, parse_call_arguments(match[4]), caller_context: context)
         end
 
-        output = ["    if (pf_output_cell((unsigned char)(#{inline_value(match[2], context)})) != 0) PF_ABORT();"]
-        output << "    #{inline_register(context, match[1])} = 0u;" if match[1]
+        value = inline_value(match[2], context)
+        output = ["    if (pf_output_cell((unsigned char)(#{value})) != 0) PF_ABORT();"]
+        output << "    #{inline_register(context, match[1])} = (unsigned int)(unsigned char)(#{value});" if match[1]
         output
       end
 
@@ -1840,6 +1925,14 @@ module PFC
         return register(token) if token.match?(/\A#{NAME}\z/)
 
         raise Frontend::LLVMSubset::ParseError, "unsupported value: #{raw}"
+      end
+
+      def i128_low64_value(raw)
+        token = raw.to_s.strip.split(/\s+/).last
+        return "#{token.to_i & integer_mask(64)}ull" if token.match?(/\A-?\d+\z/)
+        return register(token) if token.match?(/\A#{NAME}\z/)
+
+        llvm_value(raw)
       end
 
       def inline_value(raw, context)
@@ -2970,9 +3063,14 @@ module PFC
         line.match?(/\A#{NAME}\s*=\s*phi\b/)
       end
 
+      def debug_record?(line)
+        line.to_s.match?(/\A#dbg_[A-Za-z0-9_.]+\b/)
+      end
+
       def unsupported_instruction_message(line)
         opcode = line.to_s[/\A(?:#{NAME}\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
-        return "unsupported vector type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/(?:^|\s)<(?:vscale\s+x\s+)?\d+\s+x\s+[^>]+>/)
+        return "unsupported scalable vector type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/(?:^|\s)<vscale\s+x\s+/)
+        return "unsupported vector type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/(?:^|\s)<\d+\s+x\s+(?!i(?:1|8|16|32|64)\b)[^>]+>/)
         return "unsupported floating-point type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/\b(?:half|float|double|fp128|x86_fp80|ppc_fp128)\b/)
         return "unsupported i128 type in LLVM instruction #{opcode}: #{line}" if line.to_s.match?(/\bi128\b/)
         return "unsupported blockaddress constant expression: #{line}" if line.to_s.include?("blockaddress")

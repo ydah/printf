@@ -379,6 +379,75 @@ class LLVMCompatibilityTest < Minitest::Test
     assert_equal "B", compile_llvm_source_and_run(source)
   end
 
+  def test_integer_vector_extractelement_and_insertelement
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %vec0 = insertelement <2 x i8> zeroinitializer, i8 65, i32 0
+        %vec1 = insertelement <2 x i8> %vec0, i8 66, i32 1
+        %slot = alloca <2 x i8>, align 1
+        store <2 x i8> %vec1, ptr %slot, align 1
+        %loaded = load <2 x i8>, ptr %slot, align 1
+        %value = extractelement <2 x i8> %loaded, i32 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_i128_load_store_and_trunc_to_low_bits
+    source = <<~LLVM
+      @wide = global i128 66, align 16
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %slot = alloca i128, align 16
+        %loaded = load i128, ptr @wide, align 16
+        store i128 %loaded, ptr %slot, align 16
+        %again = load i128, ptr %slot, align 16
+        %narrow = trunc i128 %again to i32
+        call i32 @putchar(i32 %narrow)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_llvm_global_ctors_and_dtors_are_ignored
+    source = <<~LLVM
+      @llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32 65535, ptr @ctor, ptr null }]
+      @llvm.global_dtors = appending global [1 x { i32, ptr, ptr }] [{ i32 65535, ptr @dtor, ptr null }]
+
+      declare i32 @putchar(i32)
+
+      define internal void @ctor() {
+      entry:
+        ret void
+      }
+
+      define internal void @dtor() {
+      entry:
+        ret void
+      }
+
+      define i32 @main() {
+      entry:
+        call i32 @putchar(i32 66)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
   def test_clang_smoke_fixture
     assert_equal "B", compile_llvm_and_run("samples/clang_smoke.ll")
   end

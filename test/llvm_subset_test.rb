@@ -711,7 +711,7 @@ class LLVMSubsetTest < Minitest::Test
     vector_source = <<~LLVM
       define i32 @main() {
       entry:
-        %x = add <2 x i32> <i32 1, i32 2>, <i32 3, i32 4>
+        %x = add <vscale x 2 x i32> zeroinitializer, zeroinitializer
         ret i32 0
       }
     LLVM
@@ -719,7 +719,7 @@ class LLVMSubsetTest < Minitest::Test
     vector_error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
       PFC::Backend::LLVMCEmitter.new(vector_source).emit
     end
-    assert_includes vector_error.message, "unsupported vector type"
+    assert_includes vector_error.message, "unsupported scalable vector type"
 
     float_source = <<~LLVM
       define i32 @main() {

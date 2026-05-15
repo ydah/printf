@@ -29,6 +29,8 @@ module PFC
             when :select then SelectInstruction.new(text)
             when :cast then CastInstruction.new(text)
             when :freeze then FreezeInstruction.new(text)
+            when :extractelement then ExtractElementInstruction.new(text)
+            when :insertelement then InsertElementInstruction.new(text)
             when :extractvalue then ExtractValueInstruction.new(text)
             when :insertvalue then InsertValueInstruction.new(text)
             when :switch then SwitchInstruction.new(text)
@@ -130,6 +132,8 @@ module PFC
             return :cast if text.match?(/\A#{NAME}\s*=\s*(zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast)\b/)
             return :freeze if text.match?(/\A#{NAME}\s*=\s*freeze\b/)
             return :gep if text.match?(/\A#{NAME}\s*=\s*getelementptr\b/)
+            return :extractelement if text.match?(/\A#{NAME}\s*=\s*extractelement\b/)
+            return :insertelement if text.match?(/\A#{NAME}\s*=\s*insertelement\b/)
             return :extractvalue if text.match?(/\A#{NAME}\s*=\s*extractvalue\b/)
             return :insertvalue if text.match?(/\A#{NAME}\s*=\s*insertvalue\b/)
             return :icmp if text.match?(/\A#{NAME}\s*=\s*icmp\b/)
@@ -209,7 +213,7 @@ module PFC
 
             @destination = match[1]
             @value_type = (match[2] == "ptr" || match[2].start_with?("ptr addrspace(") || match[2].end_with?("*")) ? "ptr" : match[2]
-            @bits = @value_type.delete_prefix("i").to_i if @value_type.match?(/\Ai(?:1|8|16|32|64)\z/)
+            @bits = @value_type.delete_prefix("i").to_i if @value_type.match?(/\Ai(?:1|8|16|32|64|128)\z/)
             @pointer = match[3].strip
           end
         end
@@ -223,7 +227,7 @@ module PFC
             return unless match
 
             @value_type = (match[1] == "ptr" || match[1].start_with?("ptr addrspace(") || match[1].end_with?("*")) ? "ptr" : match[1]
-            @bits = @value_type.delete_prefix("i").to_i if @value_type.match?(/\Ai(?:1|8|16|32|64)\z/)
+            @bits = @value_type.delete_prefix("i").to_i if @value_type.match?(/\Ai(?:1|8|16|32|64|128)\z/)
             @value = match[2]
             @pointer = match[3].strip
           end
@@ -303,7 +307,7 @@ module PFC
 
           def initialize(text)
             super
-            if (match = text.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
+            if (match = text.match(/\A(#{NAME})\s*=\s*(zext|sext|trunc)\s+i(1|8|16|32|64|128)\s+(.+?)\s+to\s+i(1|8|16|32|64)\z/))
               @destination = match[1]
               @operator = match[2]
               @from_bits = match[3].to_i
@@ -372,6 +376,39 @@ module PFC
 
           def pointer_type?(type)
             type == "ptr" || type.end_with?("*")
+          end
+        end
+
+        class ExtractElementInstruction < Instruction
+          attr_reader :bits, :destination, :index, :vector, :vector_type
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*extractelement\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(#{NAME}),\s+i(?:32|64)\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @vector_type = match[2]
+            @vector = match[3]
+            @index = match[4]
+            @bits = vector_type[/i(1|8|16|32|64)>/, 1].to_i
+          end
+        end
+
+        class InsertElementInstruction < Instruction
+          attr_reader :bits, :destination, :index, :value, :vector, :vector_type
+
+          def initialize(text)
+            super
+            match = text.match(/\A(#{NAME})\s*=\s*insertelement\s+(<\d+\s+x\s+i(?:1|8|16|32|64)>)\s+(#{NAME}|zeroinitializer|undef|poison),\s+i(1|8|16|32|64)\s+(.+?),\s+i(?:32|64)\s+(.+)\z/)
+            return unless match
+
+            @destination = match[1]
+            @vector_type = match[2]
+            @vector = match[3]
+            @bits = match[4].to_i
+            @value = match[5]
+            @index = match[6]
           end
         end
 
@@ -590,8 +627,9 @@ module PFC
           source.each_line.each_with_object({}) do |line, globals|
             stripped = line.sub(/;.*/, "").strip
             next if stripped.empty?
+            next if stripped.start_with?("@llvm.global_ctors =") || stripped.start_with?("@llvm.global_dtors =")
 
-            if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+i(1|8|16|32|64)\s+(-?\d+|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+            if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+i(1|8|16|32|64|128)\s+(-?\d+|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = integer_bytes(match[3], match[2].to_i)
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(?:global|constant)\s+i(1|8|16|32|64)\s+ptrtoint\s*\(.+\)(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = Array.new(byte_width(match[2].to_i), 0)
@@ -609,8 +647,9 @@ module PFC
           source.each_line.each_with_object({}) do |line, globals|
             stripped = line.sub(/;.*/, "").strip
             next if stripped.empty?
+            next if stripped.start_with?("@llvm.global_ctors =") || stripped.start_with?("@llvm.global_dtors =")
 
-            if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+i(?:1|8|16|32|64)\s+(?:-?\d+|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
+            if (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+i(?:1|8|16|32|64|128)\s+(?:-?\d+|zeroinitializer)(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = match[2] == "global"
             elsif (match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\b(global|constant)\s+i(?:1|8|16|32|64)\s+ptrtoint\s*\(.+\)(?:,\s+align\s+\d+)?\z/))
               globals[match[1]] = match[2] == "global"
@@ -648,6 +687,9 @@ module PFC
           if (match = type.match(/\Ai(1|8|16|32|64)\z/))
             return integer_bytes(value, match[1].to_i)
           end
+          if (match = type.match(/\Ai128\z/))
+            return integer_bytes(value, 128)
+          end
           return Array.new(pointer_size, 0) if pointer_type?(type)
           return aggregate_initializer_bytes(type, value, line) if aggregate_type?(type)
 
@@ -655,12 +697,15 @@ module PFC
         end
 
         def aggregate_type?(type)
-          type.strip.match?(/\A(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|(?:<)?\{.*\}(?:>)?)\z/)
+          type.strip.match?(/\A(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\]|<\d+\s+x\s+i(?:1|8|16|32|64)>|(?:<)?\{.*\}(?:>)?)\z/)
         end
 
         def aggregate_fields(type)
           stripped = type.strip
           if (match = stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/))
+            return Array.new(match[1].to_i, match[2])
+          end
+          if (match = stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/))
             return Array.new(match[1].to_i, match[2])
           end
           return parse_struct_types.fetch(stripped) if parse_struct_types.key?(stripped)
@@ -684,9 +729,14 @@ module PFC
 
         def type_size(type)
           stripped = type.strip
-          return byte_width(Regexp.last_match(1).to_i) if stripped.match(/\Ai(1|8|16|32|64)\z/)
+          return byte_width(Regexp.last_match(1).to_i) if stripped.match(/\Ai(1|8|16|32|64|128)\z/)
           return pointer_size if pointer_type?(stripped)
           if stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
+            count = Regexp.last_match(1).to_i
+            element = Regexp.last_match(2)
+            return type_size(element) * count
+          end
+          if stripped.match(/\A<(\d+)\s+x\s+(i(?:1|8|16|32|64))>\z/)
             count = Regexp.last_match(1).to_i
             element = Regexp.last_match(2)
             return type_size(element) * count
@@ -698,7 +748,7 @@ module PFC
 
         def type_align(type)
           stripped = type.strip
-          return integer_align(Regexp.last_match(1).to_i) if stripped.match(/\Ai(1|8|16|32|64)\z/)
+          return integer_align(Regexp.last_match(1).to_i) if stripped.match(/\Ai(1|8|16|32|64|128)\z/)
           return pointer_align if pointer_type?(stripped)
           return type_align(Regexp.last_match(2)) if stripped.match(/\A\[(\d+)\s+x\s+(.+)\]\z/)
           return struct_layout(stripped).fetch(:align) if struct_type?(stripped)
