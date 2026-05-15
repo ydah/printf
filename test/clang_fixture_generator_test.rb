@@ -12,7 +12,7 @@ class ClangFixtureGeneratorTest < Minitest::Test
       target triple = "arm64-apple-macosx26.0.0"
 
       ; Function Attrs: nofree nounwind
-      define i32 @main() #0 !dbg !12 {
+      define range(i32 0, 2) i32 @main() #0 !dbg !12 {
           #dbg_value(i32 1, !15, !DIExpression(), !22)
         %1 = add i32 1, 2, !dbg !23
         %2 = call i32 @putchar(i32 %1), !dbg !24
@@ -33,7 +33,7 @@ class ClangFixtureGeneratorTest < Minitest::Test
       target triple = "arm64-apple-macosx15.0.0"
 
       ; Function Attrs: mustprogress nofree nounwind
-      define i32 @main() #3 !dbg !99 {
+      define range(i32 0, 3) i32 @main() #3 !dbg !99 {
         call void @llvm.dbg.value(metadata i32 1, metadata !50, metadata !DIExpression()), !dbg !51
         %1 = add i32 1, 2, !dbg !52
         %2 = call i32 @putchar(i32 noundef %1), !dbg !53

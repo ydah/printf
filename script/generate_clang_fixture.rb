@@ -40,6 +40,7 @@ module ClangFixtureGenerator
   def normalize_llvm_value_attributes(line)
     line
       .gsub(/\bnoundef\s+/, "")
+      .gsub(/\brange\([^)]+\)\s+/, "")
       .gsub(/\b(?:noalias|nocapture|readonly|readnone|writeonly|immarg)\s+/, "")
       .gsub(/\bcaptures\([^)]*\)\s*/, "")
       .gsub(/\bptr\s+align\s+\d+\s+/, "ptr ")
