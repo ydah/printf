@@ -132,6 +132,17 @@ module PFC
     end
 
     def llvm_capabilities_command
+      if @argv.first == "--check"
+        @argv.shift
+        path = require_input_path!
+        raise ArgumentError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
+        raise ArgumentError, "llvm-capabilities --check only supports LLVM inputs" unless llvm_source?(path)
+
+        Backend::LLVMCEmitter.new(File.read(path)).emit
+        puts "supported: #{path}"
+        return 0
+      end
+
       json = @argv.first == "--json"
       @argv.shift if json
       raise ArgumentError, "unexpected arguments: #{@argv.join(' ')}" unless @argv.empty?
@@ -271,6 +282,7 @@ module PFC
           pfc dump-cfg INPUT
           pfc dump-c INPUT
           pfc llvm-capabilities [--json]
+          pfc llvm-capabilities --check INPUT.ll
 
         Options:
           --backend=printf-c-scheduler|printf-threaded
@@ -289,9 +301,10 @@ module PFC
             - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64
             - byte-addressed numeric globals, with global writable and constant read-only
             - struct/array global initializers and aggregate load/store byte copies
+            - pointer load/store and pointer fields inside aggregates
             - read-only global string byte memory for load/getelementptr/ptrtoint
             - constant and dynamic getelementptr for integer, array, and struct element sizes
-            - constant-expression getelementptr pointer operands
+            - constant-expression getelementptr pointer operands and global initializer relocations
             - named struct alloca and struct field getelementptr
             - constant-count alloca, with dynamic-count alloca reserving tape-size capacity
             - volatile load/store accepted as backend-equivalent memory access
@@ -307,6 +320,8 @@ module PFC
             - integer and pointer icmp, including null pointer equality
             - integer and pointer select
             - pointer phi
+            - freeze
+            - llvm.smax/smin/umax/umin and llvm.abs scalar intrinsics
             - extractvalue and insertvalue for scalar integer fields in aggregate values
           control:
             - br, switch, phi, ret
@@ -319,6 +334,7 @@ module PFC
             - typed-pointer-style syntax accepted as ptr
             - target datalayout used for pointer width and struct layout
             - module-level metadata and attributes blocks accepted as no-ops
+            - common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops
             - llvm.assume and llvm.dbg.* accepted as no-op intrinsics
             - llvm.expect.* accepted as identity intrinsic
           libc:
@@ -333,9 +349,10 @@ module PFC
           "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64",
           "byte-addressed numeric globals with global writable and constant read-only semantics",
           "struct/array global initializers and aggregate load/store byte copies",
+          "pointer load/store and pointer fields inside aggregates",
           "read-only global string byte memory for load/getelementptr/ptrtoint",
           "constant and dynamic getelementptr for integer, array, and struct element sizes",
-          "constant-expression getelementptr pointer operands",
+          "constant-expression getelementptr pointer operands and global initializer relocations",
           "named struct alloca and struct field getelementptr",
           "constant-count alloca, with dynamic-count alloca reserving tape-size capacity",
           "volatile load/store accepted as backend-equivalent memory access",
@@ -352,6 +369,8 @@ module PFC
           "integer and pointer icmp, including null pointer equality",
           "integer and pointer select",
           "pointer phi",
+          "freeze",
+          "llvm.smax/smin/umax/umin and llvm.abs scalar intrinsics",
           "extractvalue and insertvalue for scalar integer fields in aggregate values"
         ],
         control: [
@@ -366,6 +385,7 @@ module PFC
           "typed-pointer-style syntax accepted as ptr",
           "target datalayout used for pointer width and struct layout",
           "module-level metadata and attributes blocks accepted as no-ops",
+          "common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops",
           "llvm.assume and llvm.dbg.* accepted as no-op intrinsics",
           "llvm.expect.* accepted as identity intrinsic"
         ],

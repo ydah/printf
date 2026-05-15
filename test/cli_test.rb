@@ -68,6 +68,8 @@ class CLITest < Minitest::Test
     assert_includes out, "LLVM subset capabilities:"
     assert_includes out, "ptrtoint"
     assert_includes out, "extractvalue"
+    assert_includes out, "llvm.smax"
+    assert_includes out, "freeze"
     assert_includes out, "target datalayout"
     assert_includes out, "static printf"
   end
@@ -81,15 +83,28 @@ class CLITest < Minitest::Test
     capabilities = JSON.parse(out)
     assert_includes capabilities.fetch("memory").join("\n"), "global string byte memory"
     assert_includes capabilities.fetch("memory").join("\n"), "aggregate load/store"
+    assert_includes capabilities.fetch("memory").join("\n"), "pointer fields"
     assert_includes capabilities.fetch("memory").join("\n"), "struct field getelementptr"
     assert_includes capabilities.fetch("values").join("\n"), "bitcast ptr-to-ptr"
     assert_includes capabilities.fetch("values").join("\n"), "insertvalue"
+    assert_includes capabilities.fetch("values").join("\n"), "llvm.abs"
     assert_includes capabilities.fetch("values").join("\n"), "pointer phi"
     assert_includes capabilities.fetch("control").join("\n"), "pointer/void returns"
     assert_includes capabilities.fetch("tolerance").join("\n"), "metadata"
     assert_includes capabilities.fetch("tolerance").join("\n"), "datalayout"
     assert_includes capabilities.fetch("tolerance").join("\n"), "llvm.expect"
     assert_includes capabilities.fetch("libc").join("\n"), "%p"
+  end
+
+  def test_llvm_capabilities_check_reports_supported_file
+    with_llvm_source do |path|
+      out, err = capture_io do
+        assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check", path]).run
+      end
+
+      assert_empty err
+      assert_includes out, "supported: #{path}"
+    end
   end
 
   private
