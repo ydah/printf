@@ -12,7 +12,7 @@ module PFC
         POINTER_NAME = /(?:#{NAME}|#{GLOBAL_NAME})/
         INTEGER_TYPE = /i(?:1|8|16|32|64)/
         VECTOR_TYPE = /<\d+\s+x\s+i(?:1|8|16|32|64)>/
-        AGGREGATE_TYPE = /(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+(?:i(?:1|8|16|32|64|128)|ptr|#{VECTOR_TYPE}|%[-A-Za-z$._0-9]+)\])/
+        AGGREGATE_TYPE = /(?:%[-A-Za-z$._0-9]+|\[\d+\s+x\s+.+\])/
         RETURN_TYPE = /(?:#{INTEGER_TYPE}|i128|#{VECTOR_TYPE}|#{AGGREGATE_TYPE}|ptr|void)/
         ATTRIBUTE_TOKEN = /[-\w]+(?:\([^)]*\))?/
 
@@ -366,6 +366,22 @@ module PFC
               return
             end
 
+            if (match = text.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+(.+)\z/))
+              operands = Instruction.split_arguments(match[3])
+              if operands.length == 2
+                true_match = operands.fetch(0).match(/\A(#{AGGREGATE_TYPE})\s+(.+)\z/)
+                false_match = operands.fetch(1).match(/\A#{Regexp.escape(true_match[1])}\s+(.+)\z/) if true_match
+                if true_match && false_match
+                  @destination = match[1]
+                  @condition = match[2]
+                  @value_type = true_match[1]
+                  @true_value = true_match[2]
+                  @false_value = false_match[1]
+                  return
+                end
+              end
+            end
+
             if (match = text.match(/\A(#{NAME})\s*=\s*select\s+i1\s+(.+?),\s+i(1|8|16|32|64)\s+(.+?),\s+i(?:1|8|16|32|64)\s+(.+)\z/))
               @destination = match[1]
               @condition = match[2]
@@ -677,7 +693,7 @@ module PFC
 
           while index < lines.length
             header = lines[index].strip
-            match = header.match(/\Adefine\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+[^{}]+)?\s*\{\z/)
+            match = header.match(/\Adefine\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*)\)(?:\s+[^{}]+)?\s*\{\z/)
             unless match
               index += 1
               next
@@ -1009,13 +1025,13 @@ module PFC
             stripped = line.sub(/;.*/, "").strip
             next if stripped.empty?
 
-            if (match = stripped.match(/\Adeclare\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+#[0-9]+)?\z/))
+            if (match = stripped.match(/\Adeclare\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*)\)(?:\s+#[0-9]+)?\z/))
               add_function_signature!(
                 signatures,
                 build_function_signature(match[2], match[1], match[3], defined: false),
                 stripped
               )
-            elsif (match = stripped.match(/\Adefine\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*?)\)(?:\s+[^{}]+)?\s*\{\z/))
+            elsif (match = stripped.match(/\Adefine\s+(?:#{ATTRIBUTE_TOKEN}\s+)*(#{RETURN_TYPE})\s+@([-A-Za-z$._0-9]+)\((.*)\)(?:\s+[^{}]+)?\s*\{\z/))
               add_function_signature!(
                 signatures,
                 build_function_signature(match[2], match[1], match[3], defined: true),
@@ -1120,7 +1136,7 @@ module PFC
             type_pattern = allow_pointer ? /i(?:1|8|16|32|64|128)|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+|\[\d+\s+x\s+(?:i(?:1|8|16|32|64|128)|ptr|<\d+\s+x\s+i(?:1|8|16|32|64)>|%[-A-Za-z$._0-9]+)\]|ptr(?:\s+addrspace\(\d+\))?|metadata|.+?\*/ : /i(?:1|8|16|32|64)/
             match = stripped.match(/\A(#{type_pattern})(?:\s+(.+))?\z/)
             raise ParseError, "unsupported function parameter: #{parameter}" unless match
-            name = match[2]&.match(/#{NAME}/)&.[](0)
+            name = match[2]&.scan(/#{NAME}/)&.last
             if require_names && name.nil?
               raise ParseError, "unsupported function parameter: #{parameter}"
             end

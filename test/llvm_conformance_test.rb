@@ -11,6 +11,7 @@ class LLVMConformanceTest < Minitest::Test
 
   SUPPORTED_FIXTURES = {
     "aggregate_phi_fields.ll" => "B",
+    "aggregate_argument_abi.ll" => "B",
     "internal_array_abi.ll" => "B",
     "minimal_return.ll" => "",
     "i128_add_signed_cmp.ll" => "B",
@@ -18,6 +19,9 @@ class LLVMConformanceTest < Minitest::Test
     "internal_aggregate_calls.ll" => "B",
     "internal_memory_aggregate.ll" => "B",
     "internal_memory_intrinsics.ll" => "B",
+    "libc_memory_strlen.ll" => "B",
+    "nested_aggregate_select.ll" => "B",
+    "sret_byval_abi.ll" => "B",
     "vector_add.ll" => "B",
     "vector_scalarized_ops.ll" => "B",
     "vector_literal.ll" => "B",
@@ -135,8 +139,24 @@ class LLVMConformanceTest < Minitest::Test
   def test_public_check_result_schema_is_available
     schema = JSON.parse(File.read(File.expand_path("../docs/llvm-capabilities.schema.json", __dir__)))
     assert_equal "pfc llvm-capabilities check result", schema.fetch("title")
-    assert_includes schema.fetch("required"), "policy"
+    assert schema.fetch("$defs").key?("check_result")
+    assert_includes schema.fetch("$defs").fetch("check_result").fetch("required"), "policy"
     assert schema.fetch("$defs").key?("diagnostic")
+  end
+
+  def test_check_result_schema_validation_accepts_file_and_directory_results
+    file_path = supported_path("minimal_return.ll")
+    out, err = capture_io do
+      assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check", "--json", "--validate-schema", file_path]).run
+    end
+    assert_empty err
+    assert JSON.parse(out).fetch("supported")
+
+    out, err = capture_io do
+      assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check-dir", "--json", "--validate-schema", "--include=minimal_return.ll", File.join(FIXTURE_ROOT, "supported")]).run
+    end
+    assert_empty err
+    assert JSON.parse(out).fetch("supported")
   end
 
   def test_check_dir_can_emit_sarif
@@ -152,6 +172,8 @@ class LLVMConformanceTest < Minitest::Test
     rule = sarif.fetch("runs").first.fetch("tool").fetch("driver").fetch("rules").first
     assert_includes rule.fetch("properties").fetch("tags"), "llvm"
     assert rule.key?("helpUri")
+    result = sarif.fetch("runs").first.fetch("results").first
+    assert_includes result.fetch("properties").fetch("docs_url"), "#llvm-ir-subset"
     rule_ids = sarif.fetch("runs").first.fetch("tool").fetch("driver").fetch("rules").map { |entry| entry.fetch("id") }
     assert_includes rule_ids, "pfc.llvm.error.floating-point"
     assert_includes rule_ids, "pfc.llvm.error.vector"

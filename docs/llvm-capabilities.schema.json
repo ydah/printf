@@ -2,11 +2,47 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/ydah/printf/blob/main/docs/llvm-capabilities.schema.json",
   "title": "pfc llvm-capabilities check result",
-  "type": "object",
-  "required": ["schema_version", "path", "policy", "supported", "summary", "diagnostics", "errors"],
-  "properties": {
-    "schema_version": { "const": 1 },
-    "path": { "type": "string" },
+  "oneOf": [
+    { "$ref": "#/$defs/check_result" },
+    { "$ref": "#/$defs/directory_result" }
+  ],
+  "$defs": {
+    "check_result": {
+      "type": "object",
+      "required": ["schema_version", "path", "policy", "supported", "summary", "diagnostics", "errors"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "path": { "type": "string" },
+        "policy": { "$ref": "#/$defs/policy" },
+        "supported": { "type": "boolean" },
+        "summary": { "$ref": "#/$defs/summary" },
+        "diagnostics": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/diagnostic" }
+        },
+        "errors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/diagnostic" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "directory_result": {
+      "type": "object",
+      "required": ["schema_version", "path", "policy", "supported", "summary", "files"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "path": { "type": "string" },
+        "policy": { "$ref": "#/$defs/policy" },
+        "supported": { "type": "boolean" },
+        "summary": { "$ref": "#/$defs/summary" },
+        "files": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/check_result" }
+        }
+      },
+      "additionalProperties": false
+    },
     "policy": {
       "type": "object",
       "required": ["fail_on", "max_warnings"],
@@ -16,7 +52,6 @@
       },
       "additionalProperties": false
     },
-    "supported": { "type": "boolean" },
     "summary": {
       "type": "object",
       "required": ["files", "supported_files", "unsupported_files", "diagnostics", "errors", "warnings"],
@@ -30,19 +65,9 @@
       },
       "additionalProperties": false
     },
-    "diagnostics": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/diagnostic" }
-    },
-    "errors": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/diagnostic" }
-    }
-  },
-  "$defs": {
     "diagnostic": {
       "type": "object",
-      "required": ["severity", "line", "opcode", "message", "hint", "explanation", "fix_suggestions", "line_text"],
+      "required": ["severity", "line", "opcode", "message", "hint", "explanation", "suggestion", "fix_suggestions", "docs_url", "minimal_repro_hint", "line_text"],
       "properties": {
         "severity": { "enum": ["error", "warning", "info"] },
         "line": { "type": ["integer", "null"], "minimum": 1 },
@@ -50,14 +75,16 @@
         "message": { "type": "string" },
         "hint": { "type": "string" },
         "explanation": { "type": "string" },
+        "suggestion": { "type": "string" },
         "fix_suggestions": {
           "type": "array",
           "items": { "type": "string" }
         },
+        "docs_url": { "type": "string" },
+        "minimal_repro_hint": { "type": "string" },
         "line_text": { "type": ["string", "null"] }
       },
       "additionalProperties": false
     }
-  },
-  "additionalProperties": false
+  }
 }

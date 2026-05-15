@@ -139,10 +139,13 @@ class CLITest < Minitest::Test
 
       first_error = result.fetch("errors").first
       assert_equal "error", first_error.fetch("severity")
-      assert_equal %w[explanation fix_suggestions hint line line_text message opcode severity], first_error.keys.sort
+      assert_equal %w[docs_url explanation fix_suggestions hint line line_text message minimal_repro_hint opcode severity suggestion], first_error.keys.sort
       assert_includes first_error.fetch("hint"), "Lower floating-point"
       assert_includes first_error.fetch("explanation"), "floating-point semantics"
       assert_includes first_error.fetch("fix_suggestions").join("\n"), "fixed-point"
+      assert_includes first_error.fetch("suggestion"), "fixed-point"
+      assert_includes first_error.fetch("docs_url"), "#llvm-ir-subset"
+      assert_includes first_error.fetch("minimal_repro_hint"), "llvm-capabilities --check"
     end
   end
 

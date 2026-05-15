@@ -38,14 +38,17 @@ fixtures:
 
 fixtures-check:
 	@if command -v "$(CLANG)" >/dev/null 2>&1; then \
+		"$(CLANG)" --version | sed -n '1p'; \
+		status=0; \
 		for spec in $(CLANG_FIXTURE_SPECS); do \
 			opt="$${spec%%:*}"; \
 			rest="$${spec#*:}"; \
 			source="$${rest%%:*}"; \
 			fixture="$${rest#*:}"; \
-			CLANG="$(CLANG)" $(RUBY) script/generate_clang_fixture.rb --check --opt="$$opt" "$$source" "$$fixture" || exit $$?; \
-			$(RUBY) -Ilib bin/pfc llvm-capabilities --check "$$fixture" >/dev/null || exit $$?; \
+			CLANG="$(CLANG)" $(RUBY) script/generate_clang_fixture.rb --check --opt="$$opt" "$$source" "$$fixture" || status=1; \
+			$(RUBY) -Ilib bin/pfc llvm-capabilities --check "$$fixture" >/dev/null || status=1; \
 		done; \
+		exit $$status; \
 	else \
 		echo "skip fixtures-check: $(CLANG) not found"; \
 	fi

@@ -143,6 +143,7 @@ module PFC
       include_patterns = []
       json = false
       max_warnings = nil
+      validate_schema = false
       while @argv.first&.start_with?("--")
         case @argv.first
         when "--check"
@@ -168,6 +169,9 @@ module PFC
         when /\A--max-warnings=(\d+)\z/
           check = true
           max_warnings = Regexp.last_match(1).to_i
+        when "--validate-schema"
+          check = true
+          validate_schema = true
         when /\A--format=(json|sarif)\z/
           check = true
           format = Regexp.last_match(1)
@@ -196,6 +200,7 @@ module PFC
           raise ArgumentError, "llvm-capabilities --check only supports LLVM inputs" unless llvm_source?(path)
           result = llvm_check_result(path, fail_on:, max_warnings:)
         end
+        llvm_validate_result_schema!(result) if validate_schema
 
         if format == "sarif"
           puts JSON.pretty_generate(llvm_sarif(result))
@@ -405,6 +410,11 @@ module PFC
           ruleId: llvm_sarif_rule_id(diagnostic),
           level: diagnostic.fetch(:severity) == "warning" ? "warning" : "error",
           message: { text: diagnostic.fetch(:message) },
+          properties: {
+            suggestion: diagnostic.fetch(:suggestion),
+            docs_url: diagnostic.fetch(:docs_url),
+            minimal_repro_hint: diagnostic.fetch(:minimal_repro_hint)
+          },
           locations: [
             {
               physicalLocation: {
@@ -524,6 +534,7 @@ module PFC
     end
 
     def llvm_check_diagnostic(line:, line_text:, message:)
+      fix_suggestions = llvm_fix_suggestions(message, line_text)
       {
         severity: llvm_diagnostic_severity(message, line_text),
         line:,
@@ -531,7 +542,10 @@ module PFC
         message:,
         hint: llvm_diagnostic_hint(message, line_text),
         explanation: llvm_diagnostic_explanation(message, line_text),
-        fix_suggestions: llvm_fix_suggestions(message, line_text),
+        suggestion: fix_suggestions.first,
+        fix_suggestions:,
+        docs_url: llvm_diagnostic_docs_url(message, line_text),
+        minimal_repro_hint: llvm_minimal_repro_hint(message, line_text),
         line_text:
       }
     end
@@ -588,6 +602,41 @@ module PFC
       return ["lower non-zero address-space pointers to default address-space pointers before pfc"] if text.include?("address space")
 
       ["lower this construct to the documented scalar integer, pointer, aggregate, or libc subset"]
+    end
+
+    def llvm_diagnostic_docs_url(_message, _line_text)
+      "https://github.com/ydah/printf#llvm-ir-subset"
+    end
+
+    def llvm_minimal_repro_hint(message, line_text)
+      opcode = llvm_diagnostic_opcode(line_text || message) || "instruction"
+      "Keep a single function containing the #{opcode} line and run `pfc llvm-capabilities --check --json repro.ll`."
+    end
+
+    def llvm_validate_result_schema!(result)
+      if result.key?(:files)
+        llvm_validate_common_result_keys!(result, %i[schema_version path policy supported summary files])
+        result.fetch(:files).each { |file| llvm_validate_result_schema!(file) }
+        return true
+      end
+
+      llvm_validate_common_result_keys!(result, %i[schema_version path policy supported summary diagnostics errors])
+      result.fetch(:diagnostics).each { |diagnostic| llvm_validate_diagnostic_schema!(diagnostic) }
+      result.fetch(:errors).each { |diagnostic| llvm_validate_diagnostic_schema!(diagnostic) }
+      true
+    end
+
+    def llvm_validate_common_result_keys!(result, required_keys)
+      required_keys.each do |key|
+        raise ArgumentError, "llvm-capabilities schema validation failed: missing #{key}" unless result.key?(key)
+      end
+      raise ArgumentError, "llvm-capabilities schema validation failed: schema_version must be 1" unless result.fetch(:schema_version) == 1
+    end
+
+    def llvm_validate_diagnostic_schema!(diagnostic)
+      %i[severity line opcode message hint explanation suggestion fix_suggestions docs_url minimal_repro_hint line_text].each do |key|
+        raise ArgumentError, "llvm-capabilities schema validation failed: missing diagnostic #{key}" unless diagnostic.key?(key)
+      end
     end
 
     def llvm_static_supported_line?(line)
@@ -746,8 +795,8 @@ module PFC
           pfc dump-cfg INPUT
           pfc dump-c INPUT
           pfc llvm-capabilities [--json]
-          pfc llvm-capabilities --check [--json] [--format=json|sarif] [--fix-suggestions] [--emit-lowering-plan] [--fail-on=error|warning|none] [--max-warnings=N] INPUT.ll
-          pfc llvm-capabilities --check-dir [--json] [--format=json|sarif] [--emit-lowering-plan] [--include=GLOB] [--exclude=GLOB] [--fail-on=error|warning|none] [--max-warnings=N] DIR
+          pfc llvm-capabilities --check [--json] [--format=json|sarif] [--fix-suggestions] [--emit-lowering-plan] [--validate-schema] [--fail-on=error|warning|none] [--max-warnings=N] INPUT.ll
+          pfc llvm-capabilities --check-dir [--json] [--format=json|sarif] [--emit-lowering-plan] [--validate-schema] [--include=GLOB] [--exclude=GLOB] [--fail-on=error|warning|none] [--max-warnings=N] DIR
           pfc llvm-capabilities --explain INPUT.ll
 
         Options:
@@ -788,7 +837,7 @@ module PFC
             - bitcast ptr-to-ptr
             - addrspacecast for default address-space pointers
             - integer and pointer icmp, including null pointer equality
-            - integer and pointer select
+            - integer, pointer, and aggregate select
             - pointer phi
             - freeze
             - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
@@ -808,15 +857,16 @@ module PFC
             - module-level metadata and attributes blocks accepted as no-ops
             - common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops
             - llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals
-            - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode
+            - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode
             - llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output
+            - llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning
             - docs/llvm-capabilities.schema.json publishes the check JSON contract
             - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
             - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
             - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.expect.* accepted as identity intrinsic
           libc:
-            - putchar, getchar, puts
+            - putchar, getchar, puts, strlen, memcpy, memmove, memset
             - static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags
       TEXT
     end
@@ -849,7 +899,7 @@ module PFC
           "bitcast ptr-to-ptr",
           "addrspacecast for default address-space pointers",
           "integer and pointer icmp, including null pointer equality",
-          "integer and pointer select",
+          "integer, pointer, and aggregate select",
           "pointer phi",
           "freeze",
           "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
@@ -871,8 +921,9 @@ module PFC
           "module-level metadata and attributes blocks accepted as no-ops",
           "common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops",
           "llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals",
-          "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/fix_suggestions/line_text in JSON mode",
+          "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode",
           "llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output",
+          "llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning",
           "docs/llvm-capabilities.schema.json publishes the check JSON contract",
           "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
           "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
@@ -880,7 +931,7 @@ module PFC
           "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [
-          "putchar, getchar, puts",
+          "putchar, getchar, puts, strlen, memcpy, memmove, memset",
           "static printf with %d/%i/%u/%x/%X/%o/%c/%s/%p/%%, hh/h/l/ll integer length modifiers, static or dynamic width and precision, and 0/-/+/space/# flags"
         ]
       }

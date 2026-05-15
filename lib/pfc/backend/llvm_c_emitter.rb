@@ -30,9 +30,13 @@ module PFC
       MemoryAddress = Struct.new(:invalid_expression, :limit, :memory, :name, :offset, :readonly, :readonly_expression, keyword_init: true)
       BUILTIN_FUNCTION_SIGNATURES = {
         "getchar" => { return_type: "i32", parameter_types: [], varargs: false },
+        "memcpy" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
+        "memmove" => { return_type: "ptr", parameter_types: %w[ptr ptr i64], varargs: false },
+        "memset" => { return_type: "ptr", parameter_types: %w[ptr i32 i64], varargs: false },
         "printf" => { return_type: "i32", parameter_types: ["ptr"], varargs: true },
         "putchar" => { return_type: "i32", parameter_types: ["i32"], varargs: false },
-        "puts" => { return_type: "i32", parameter_types: ["ptr"], varargs: false }
+        "puts" => { return_type: "i32", parameter_types: ["ptr"], varargs: false },
+        "strlen" => { return_type: "i64", parameter_types: ["ptr"], varargs: false }
       }.freeze
 
       def initialize(source, tape_size: DEFAULT_TAPE_SIZE)
@@ -272,6 +276,7 @@ module PFC
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*bitcast\s+(?:ptr|.+?\*)\b/)
           next if line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*select\s+i1\s+.+?,\s+ptr\b/)
           pointer_result = line.respond_to?(:value_type) && line.value_type == "ptr" && line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|extractvalue|freeze)\b/)
+          pointer_result ||= line.respond_to?(:return_type) && line.return_type == "ptr"
           if (match = line.match(/\A#{Regexp.escape(lhs)}\s*=\s*(?:load|insertvalue|insertelement)\s+(.+?)(?:,|\s+)/)) && aggregate_type?(match[1])
             aggregate_registers[lhs] = { name: c_aggregate_name(lhs), size: type_size(match[1]), type: match[1] }
             next
@@ -925,6 +930,7 @@ module PFC
           pointers[line.destination] = EncodedPointer.new(value: "(((#{condition}) != 0u) ? (#{true_value}) : (#{false_value}))")
           return []
         end
+        return emit_aggregate_select(line) if line.respond_to?(:value_type) && aggregate_type?(line.value_type)
 
         if line.respond_to?(:destination) && line.respond_to?(:condition) && line.respond_to?(:bits) && line.bits
           return emit_i128_select(line.destination, line.condition, line.true_value, line.false_value) if line.bits == 128
@@ -943,6 +949,24 @@ module PFC
         true_value = llvm_value(match[4])
         false_value = llvm_value(match[5])
         ["    #{register(match[1])} = #{unsigned_cast(bits)}(((#{condition}) != 0u ? (#{true_value}) : (#{false_value})) & #{integer_mask_literal(bits)});"]
+      end
+
+      def emit_aggregate_select(line, context: nil)
+        aggregate = aggregate_register(line.destination, context:)
+        condition = context ? inline_value(line.condition, context) : llvm_value(line.condition)
+        true_source = aggregate_value_bytes(line.true_value, line.value_type, context:)
+        false_source = aggregate_value_bytes(line.false_value, line.value_type, context:)
+        prefix = next_aggregate_copy_prefix
+        true_byte = true_source ? "#{true_source}[#{prefix}_i]" : "0u"
+        false_byte = false_source ? "#{false_source}[#{prefix}_i]" : "0u"
+        [
+          "    {",
+          "        int #{prefix}_i = 0;",
+          "        for (#{prefix}_i = 0; #{prefix}_i < #{aggregate.fetch(:size)}; #{prefix}_i++) {",
+          "            #{aggregate.fetch(:name)}[#{prefix}_i] = ((#{condition}) != 0u) ? #{true_byte} : #{false_byte};",
+          "        }",
+          "    }"
+        ]
       end
 
       def emit_cast(line)
@@ -1292,6 +1316,8 @@ module PFC
         return emit_expect_intrinsic(call) if llvm_expect_intrinsic?(call.fetch(:function_name))
         return emit_memory_intrinsic_call(call) if llvm_memory_intrinsic?(call.fetch(:function_name))
         return emit_numeric_intrinsic_call(call) if llvm_numeric_intrinsic?(call.fetch(:function_name))
+        return emit_libc_memory_call(call) if libc_memory_function?(call.fetch(:function_name))
+        return emit_strlen_call(call) if call.fetch(:function_name) == "strlen"
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
           output = ["    pf_ch = getchar();"]
@@ -1781,6 +1807,7 @@ module PFC
           context.fetch(:pointers)[line.destination] = EncodedPointer.new(value: "(((#{condition}) != 0u) ? (#{true_value}) : (#{false_value}))")
           return []
         end
+        return emit_aggregate_select(line, context:) if line.respond_to?(:value_type) && aggregate_type?(line.value_type)
 
         if line.respond_to?(:destination) && line.respond_to?(:condition) && line.respond_to?(:bits) && line.bits
           return emit_i128_select(line.destination, line.condition, line.true_value, line.false_value, context:) if line.bits == 128
@@ -1911,6 +1938,8 @@ module PFC
         return emit_expect_intrinsic(call, context:) if llvm_expect_intrinsic?(call.fetch(:function_name))
         return emit_memory_intrinsic_call(call, context:) if llvm_memory_intrinsic?(call.fetch(:function_name))
         return emit_numeric_intrinsic_call(call, context:) if llvm_numeric_intrinsic?(call.fetch(:function_name))
+        return emit_libc_memory_call(call, context:) if libc_memory_function?(call.fetch(:function_name))
+        return emit_strlen_call(call, context:) if call.fetch(:function_name) == "strlen"
 
         if (match = line.match(/\A(?:(#{NAME})\s*=\s*)?call\s+i32\s+@getchar\(\)\z/))
           output = ["    pf_ch = getchar();"]
@@ -2819,12 +2848,23 @@ module PFC
       end
 
       def pointer_argument_value(stripped)
-        return stripped.delete_prefix("ptr ").strip if stripped.start_with?("ptr ")
+        return strip_pointer_argument_attributes(stripped.delete_prefix("ptr ").strip) if stripped.start_with?("ptr ")
 
         match = stripped.match(/\A.+?\*\s+(.+)\z/)
-        return match[1] if match
+        return strip_pointer_argument_attributes(match[1].strip) if match
 
         stripped.split(/\s+/).last
+      end
+
+      def strip_pointer_argument_attributes(value)
+        stripped = value.strip
+        loop do
+          before = stripped
+          stripped = stripped.sub(/\A(?:noundef|nonnull|readonly|readnone|writeonly|nocapture|noalias)\s+/, "")
+          stripped = stripped.sub(/\A(?:sret|byval|align|dereferenceable|dereferenceable_or_null|captures)\([^)]*\)\s+/, "")
+          stripped = stripped.sub(/\Aalign\s+\d+\s+/, "")
+          return stripped if stripped == before
+        end
       end
 
       def split_call_arguments(raw_arguments)
@@ -2983,6 +3023,10 @@ module PFC
         name.start_with?("llvm.memmove.")
       end
 
+      def libc_memory_function?(name)
+        %w[memcpy memmove memset].include?(name)
+      end
+
       def validate_noop_intrinsic_signature!(call)
         name = call.fetch(:function_name)
         unless call.fetch(:return_type) == "void"
@@ -3107,6 +3151,55 @@ module PFC
         end
 
         emit_memcpy_intrinsic(arguments, context:)
+      end
+
+      def emit_libc_memory_call(call, context: nil)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        lines = case call.fetch(:function_name)
+                when "memset" then emit_memset_intrinsic(arguments, context:)
+                when "memmove" then emit_memmove_intrinsic(arguments + [{ type: "i1", value: "false" }], context:)
+                else emit_memcpy_intrinsic(arguments + [{ type: "i1", value: "false" }], context:)
+                end
+        lines + emit_pointer_return_assignment(call.fetch(:destination), arguments.fetch(0).fetch(:value), context:)
+      end
+
+      def emit_pointer_return_assignment(destination, value, context:)
+        return [] unless destination
+
+        pointer_map = context ? context.fetch(:pointers) : pointers
+        target = context ? inline_register(context, destination) : register(destination)
+        encoded = encoded_pointer_value(value, context:)
+        pointer_map[destination] = EncodedPointer.new(value: target)
+        ["    #{target} = #{encoded};"]
+      end
+
+      def emit_strlen_call(call, context: nil)
+        arguments = parse_typed_call_arguments(call.fetch(:raw_arguments))
+        pointer = memory_address(arguments.fetch(0).fetch(:value), context:)
+        prefix = next_memory_intrinsic_prefix
+        lines = [
+          "    {",
+          "        long long #{prefix}_base = (long long)(#{pointer.offset});",
+          "        unsigned long long #{prefix}_len = 0ull;",
+          *dynamic_valid_address_lines(pointer),
+          "        if (#{prefix}_base < 0 || #{prefix}_base >= #{pointer.limit}) {",
+          "            fprintf(stderr, \"pfc runtime error: strlen pointer out of range\\n\");",
+          "            PF_ABORT();",
+          "        }",
+          "        while (#{prefix}_base + (long long)#{prefix}_len < #{pointer.limit} && #{pointer.memory}[#{prefix}_base + (long long)#{prefix}_len] != 0u) {",
+          "            #{prefix}_len++;",
+          "        }",
+          "        if (#{prefix}_base + (long long)#{prefix}_len >= #{pointer.limit}) {",
+          "            fprintf(stderr, \"pfc runtime error: strlen missing null terminator\\n\");",
+          "            PF_ABORT();",
+          "        }"
+        ]
+        if call.fetch(:destination)
+          target = context ? inline_register(context, call.fetch(:destination)) : register(call.fetch(:destination))
+          lines << "        #{target} = #{prefix}_len;"
+        end
+        lines << "    }"
+        lines
       end
 
       def emit_memset_intrinsic(arguments, context:)
