@@ -445,11 +445,14 @@ module PFC
 
     def llvm_opcode_suggestion(name, count)
       feature = case name
-                when "shufflevector" then "limited shufflevector lowering"
+                when "vector_i128" then "i128 vector lane scalarization"
+                when "shufflevector" then "vector shuffle shape diagnostic"
                 when "invoke" then "nounwind invoke lowering"
                 when "fence" then "single-thread fence no-op"
-                when "atomicrmw" then "advanced atomicrmw variant lowering"
+                when "atomicrmw" then "unsupported atomicrmw variant diagnostic"
                 when "cmpxchg" then "single-thread cmpxchg lowering"
+                when "addrspacecast", "nonzero_addrspace" then "non-zero address-space lowering boundary"
+                when "external_global" then "external global stub storage"
                 else "LLVM opcode #{name}"
                 end
       { feature:, count:, rationale: "Observed unsupported opcode #{name}. Prioritize only common patterns before adding general semantics." }
@@ -766,8 +769,10 @@ module PFC
       if (intrinsic = text[/\b@((?:llvm\.)[-A-Za-z$._0-9]+)\b/, 1])
         return intrinsic
       end
+      return "vector_i128" if text.match?(/<\d+\s+x\s+i128>/)
       return "external_global" if text.include?("external global")
-      return "addrspacecast" if text.include?("address space")
+      return "nonzero_addrspace" if text.include?("address space") || text.match?(/\baddrspace\((?!0\))\d+\)/)
+      return "blockaddress" if text.include?("blockaddress")
 
       text[/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
     end
@@ -1092,7 +1097,7 @@ module PFC
         LLVM subset capabilities:
           memory:
             - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus i128 load/store with high 64-bit preservation
-            - byte-addressed numeric globals, with global writable and constant read-only
+            - byte-addressed numeric globals, with global writable, constant read-only, and zero-initialized integer external-global stub storage
             - struct/array global initializers and aggregate load/store byte copies in main and internal functions
             - fixed-length integer vector alloca/load/store byte copies in main and internal functions
             - pointer load/store and pointer fields inside aggregates
@@ -1122,14 +1127,14 @@ module PFC
             - integer llvm.vector.reduce add/and/or/xor/min/max intrinsics over fixed-length integer vectors
             - aggregate byte equality/compare helpers for libc and future aggregate lowering
             - extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values
-            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, arbitrary constant-mask shufflevector, vector icmp/select, extractelement, and insertelement with runtime index checks
+            - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, arbitrary constant-mask shufflevector, pointer-vector shufflevector, vector icmp/select, extractelement, and insertelement with runtime index checks
             - fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns
           control:
             - br, switch, scalar/pointer/i128/vector/aggregate phi, ret
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
             - void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments
-            - limited indirect calls through known builtin/internal function pointers, pointer phi, and constant global function pointer tables with matching signatures
+            - limited indirect calls through known builtin/internal function pointers, pointer phi, and constant or dynamic-index global function pointer tables with matching signatures
             - nounwind invoke lowered to call plus normal-label branch
             - sret-style aggregate returns through the first pointer parameter and byval pointer arguments with callee-local copies
           tolerance:
@@ -1152,7 +1157,7 @@ module PFC
             - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
             - llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics
-            - single-thread atomic load/store plus atomicrmw/cmpxchg accepted as normal memory access, and fence accepted as a no-op
+            - single-thread atomic load/store plus atomicrmw/cmpxchg accepted as normal memory access, including uinc_wrap/udec_wrap/usub_cond/usub_sat integer atomicrmw variants, and fence accepted as a no-op
             - llvm.expect.* accepted as identity intrinsic
           libc:
             - putchar, getchar, puts, strlen, strcpy, strncpy, strcat, strncat, strdup, strcmp, strncmp, strchr, strrchr, strspn, strcspn, strpbrk, atoi, strtol with null endptr, isdigit, isalpha, isalnum, isspace, tolower, toupper, malloc, calloc, free as no-op, memcpy, memmove, memset, memcmp, memchr
@@ -1164,7 +1169,7 @@ module PFC
       {
         memory: [
           "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus i128 load/store with high 64-bit preservation",
-          "byte-addressed numeric globals with global writable and constant read-only semantics",
+          "byte-addressed numeric globals with global writable, constant read-only, and zero-initialized integer external-global stub semantics",
           "struct/array global initializers and aggregate load/store byte copies in main and internal functions",
           "fixed-length integer vector alloca/load/store byte copies in main and internal functions",
           "pointer load/store and pointer fields inside aggregates",
@@ -1195,7 +1200,7 @@ module PFC
           "integer llvm.vector.reduce add/and/or/xor/min/max intrinsics over fixed-length integer vectors",
           "aggregate byte equality/compare helpers for libc and future aggregate lowering",
           "extractvalue and insertvalue for scalar integer, pointer, i128, and vector fields in aggregate values",
-          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, arbitrary constant-mask shufflevector, vector icmp/select, extractelement, and insertelement with runtime index checks",
+          "fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, arbitrary constant-mask shufflevector, pointer-vector shufflevector, vector icmp/select, extractelement, and insertelement with runtime index checks",
           "fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns"
         ],
         control: [
@@ -1203,7 +1208,7 @@ module PFC
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
           "void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments",
-          "limited indirect calls through known builtin/internal function pointers, pointer phi, and constant global function pointer tables with matching signatures",
+          "limited indirect calls through known builtin/internal function pointers, pointer phi, and constant or dynamic-index global function pointer tables with matching signatures",
           "nounwind invoke lowered to call plus normal-label branch",
           "sret-style aggregate returns through the first pointer parameter and byval pointer arguments with callee-local copies"
         ],
@@ -1227,7 +1232,7 @@ module PFC
           "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
           "llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics",
-          "single-thread atomic load/store plus atomicrmw/cmpxchg accepted as normal memory access, and fence accepted as a no-op",
+          "single-thread atomic load/store plus atomicrmw/cmpxchg accepted as normal memory access, including uinc_wrap/udec_wrap/usub_cond/usub_sat integer atomicrmw variants, and fence accepted as a no-op",
           "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [

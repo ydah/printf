@@ -694,7 +694,7 @@ class LLVMSubsetTest < Minitest::Test
     source = <<~LLVM
       define i32 @main() {
       entry:
-        %old = atomicrmw uinc_wrap ptr null, i32 1 seq_cst
+        %old = atomicrmw fmax ptr null, i32 1 seq_cst
         ret i32 0
       }
     LLVM
@@ -703,7 +703,7 @@ class LLVMSubsetTest < Minitest::Test
       PFC::Backend::LLVMCEmitter.new(source).emit
     end
 
-    assert_includes error.message, "line 3: unsupported atomic operation: uinc_wrap"
+    assert_includes error.message, "line 3: unsupported atomic operation: fmax"
     assert_includes error.message, "llvm-capabilities --check"
   end
 
@@ -747,17 +747,16 @@ class LLVMSubsetTest < Minitest::Test
         LLVM
         "unsupported blockaddress constant expression"
       ],
-      "external global" => [
+      "unsupported external global" => [
         <<~LLVM,
-          @external = external global i8
+          @external = external global float
 
           define i32 @main() {
           entry:
-            %x = load i8, ptr @external, align 1
             ret i32 0
           }
         LLVM
-        "unsupported external global reference"
+        "unsupported external global declaration"
       ],
       "addrspace" => [
         <<~LLVM,
@@ -794,11 +793,10 @@ class LLVMSubsetTest < Minitest::Test
     assert_includes addrspace_error.message, "unsupported non-zero address space cast"
 
     external_source = <<~LLVM
-      @external = external global i8
+      @external = external global float
 
       define i32 @main() {
       entry:
-        %value = load i8, ptr @external
         ret i32 0
       }
     LLVM
@@ -806,7 +804,7 @@ class LLVMSubsetTest < Minitest::Test
     external_error = assert_raises(PFC::Frontend::LLVMSubset::ParseError) do
       PFC::Backend::LLVMCEmitter.new(external_source).emit
     end
-    assert_includes external_error.message, "unsupported external global reference"
+    assert_includes external_error.message, "unsupported external global declaration"
   end
 
   def test_rejects_wrong_call_argument_count

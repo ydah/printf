@@ -14,9 +14,12 @@ class LLVMConformanceTest < Minitest::Test
     "aggregate_argument_abi.ll" => "B",
     "atomic_cmpxchg_single_thread.ll" => "B",
     "atomic_fence_single_thread.ll" => "B",
+    "atomic_rmw_advanced_single_thread.ll" => "B",
     "atomic_rmw_single_thread.ll" => "B",
     "clang_noop_intrinsics.ll" => "B",
     "compound_gep_lifetime.ll" => "B",
+    "dynamic_function_pointer_tables.ll" => "B",
+    "external_global_stub.ll" => "B",
     "function_pointer_tables.ll" => "B",
     "heap_alloc.ll" => "B",
     "integer_intrinsics_extended.ll" => "B",
@@ -41,6 +44,7 @@ class LLVMConformanceTest < Minitest::Test
     "sret_byval_abi.ll" => "B",
     "shufflevector_arbitrary.ll" => "B",
     "shufflevector_limited.ll" => "B",
+    "shufflevector_pointer.ll" => "B",
     "overflow_intrinsics.ll" => "B",
     "select_phi_matrix.ll" => "B",
     "vector_add.ll" => "B",
@@ -58,7 +62,6 @@ class LLVMConformanceTest < Minitest::Test
     "blockaddress.ll" => "unsupported blockaddress constant expression",
     "escaped_local_pointer.ll" => "unsupported escaped local pointer",
     "exception_handling.ll" => "unsupported exception handling instruction",
-    "external_global.ll" => "unsupported external global reference",
     "float_add.ll" => "unsupported floating-point type",
     "varargs.ll" => "unsupported varargs instruction",
     "unsupported_intrinsic.ll" => "unsupported call",
@@ -350,7 +353,6 @@ class LLVMConformanceTest < Minitest::Test
       "exception_handling.ll" => ["lower_exception_handling_to_explicit_status_flow", "invoke", "%status"],
       "varargs.ll" => ["replace_varargs_with_fixed_signature", "va_arg", "fixed_args"],
       "blockaddress.ll" => ["replace_blockaddress_control_flow", "blockaddress", "br label"],
-      "external_global.ll" => ["materialize_external_global", "external global", "@external = global"],
       "addrspace.ll" => ["lower_to_default_address_space", "addrspacecast", "addrspacecast"]
     }
     expected.each do |fixture, (strategy, before, after)|
@@ -391,7 +393,7 @@ class LLVMConformanceTest < Minitest::Test
 
   def test_static_preflight_classifies_unsupported_feature_families
     cases = {
-      "atomic.ll" => ["%old = atomicrmw uinc_wrap ptr null, i32 1 seq_cst", "unsupported atomic operation"],
+      "atomic.ll" => ["%old = atomicrmw fmax ptr null, i32 1 seq_cst", "unsupported atomic operation"],
       "eh.ll" => ["landingpad { ptr, i32 } cleanup", "unsupported exception handling instruction"],
       "shuffle.ll" => ["%x = shufflevector <2 x i32> <i32 1, i32 2>, <2 x i32> <i32 3, i32 4>, <2 x i32> <i32 0, i32 4>", "unsupported vector shuffle instruction"],
       "varargs.ll" => ["%x = va_arg ptr null, i32", "unsupported varargs instruction"]

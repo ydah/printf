@@ -76,7 +76,7 @@ module PFC
         @function_signatures = parsed.fetch(:function_signatures)
         @target_datalayout = parsed.fetch(:target_datalayout)
         @global_numeric_data = parsed.fetch(:global_numeric_data)
-        @global_numeric_mutability = parsed.fetch(:global_numeric_mutability)
+        @global_numeric_mutability = parsed.fetch(:global_numeric_mutability).dup
         @global_strings = parsed.fetch(:global_strings)
         @global_string_offsets = build_global_string_offsets
         @global_string_bytes = build_global_string_memory
@@ -86,6 +86,10 @@ module PFC
         @blocks = parsed.fetch(:blocks)
         @block_order = parsed.fetch(:block_order)
         @source_line_numbers = parsed.fetch(:source_line_numbers)
+        @external_global_stubs = build_external_global_stubs
+        @external_global_stubs.each do |name, stub|
+          @global_numeric_mutability[name] = stub.fetch(:mutable)
+        end
         @slots = {}
         @slot_count = 0
         @pointers = {}
@@ -162,7 +166,7 @@ module PFC
 
       private
 
-      attr_reader :aggregate_registers, :blocks, :block_order, :function_pointer_ids, :function_pointer_table_slots, :function_pointers, :function_signatures, :global_function_pointer_tables, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :i128_high_registers, :internal_functions, :pointers, :registers, :slot_count, :source, :strdup_slots, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
+      attr_reader :aggregate_registers, :blocks, :block_order, :external_global_stubs, :function_pointer_ids, :function_pointer_table_slots, :function_pointers, :function_signatures, :global_function_pointer_tables, :global_numeric_bytes, :global_numeric_data, :global_numeric_mutability, :global_numeric_offsets, :global_string_bytes, :global_string_offsets, :global_strings, :i128_high_registers, :internal_functions, :pointers, :registers, :slot_count, :source, :strdup_slots, :struct_packed_types, :struct_types, :target_datalayout, :tape_size
 
       def validate_tape_size!
         return if tape_size.between?(1, 65_535)
@@ -178,6 +182,10 @@ module PFC
 
           offsets[name] = bytes.length
           bytes.concat(global_bytes)
+        end
+        external_global_stubs.each do |name, stub|
+          offsets[name] = bytes.length
+          bytes.concat(stub.fetch(:bytes))
         end
 
         [offsets, bytes]
@@ -302,6 +310,25 @@ module PFC
         end
       end
 
+      def build_external_global_stubs
+        source.each_line.each_with_object({}) do |line, stubs|
+          stripped = line.sub(/;.*/, "").strip
+          match = stripped.match(/\A(@[-A-Za-z$._0-9]+)\s*=.*?\bexternal\s+(global|constant)\s+(.+?)(?:,\s+align\s+\d+)?\z/)
+          next unless match
+
+          type = match[3].strip
+          unless supported_external_global_stub_type?(type)
+            raise Frontend::LLVMSubset::ParseError, "unsupported external global declaration: #{match[1]}"
+          end
+
+          stubs[match[1]] = { bytes: Array.new(type_size(type), 0), mutable: match[2] == "global" }
+        end
+      end
+
+      def supported_external_global_stub_type?(type)
+        integer_type?(type) || pointer_type_name?(type) || type.match?(/\A\[\d+\s+x\s+i(?:1|8|16|32|64)\]\z/)
+      end
+
       def function_pointer_phi_signature(line)
         return nil unless line.respond_to?(:value_type) && line.value_type == "ptr" && line.respond_to?(:incoming) && line.incoming
 
@@ -319,17 +346,24 @@ module PFC
       end
 
       def register_function_pointer_table_slot!(line)
-        unless line.indices.length == 2 && line.indices.all? { |index| index.match?(/\A-?\d+\z/) }
-          raise Frontend::LLVMSubset::ParseError, "dynamic function pointer table index is unsupported: #{line}"
+        unless line.indices.length == 2 && line.indices.fetch(0).match?(/\A-?\d+\z/) && line.indices.fetch(0).to_i.zero?
+          raise Frontend::LLVMSubset::ParseError, "unsupported function pointer table index: #{line}"
         end
 
-        index = line.indices.fetch(1).to_i
+        index = line.indices.fetch(1)
         table = global_function_pointer_tables.fetch(line.base_pointer)
-        unless index.between?(0, table.length - 1)
+        unless table.all? { |entry| same_function_signature?(entry.signature, table.first.signature) }
+          raise Frontend::LLVMSubset::ParseError, "dynamic function pointer table signature mismatch: #{line.base_pointer}"
+        end
+        if index.match?(/\A-?\d+\z/) && !index.to_i.between?(0, table.length - 1)
           raise Frontend::LLVMSubset::ParseError, "function pointer table index out of range: #{line}"
         end
 
         function_pointer_table_slots[line.destination] = FunctionPointerTableSlot.new(name: line.base_pointer, index:)
+      end
+
+      def function_pointer_table_static_index?(slot)
+        slot.index.match?(/\A-?\d+\z/)
       end
 
       def analyze_allocations
@@ -404,7 +438,7 @@ module PFC
           pointer_result ||= line.respond_to?(:value_type) && line.value_type == "ptr" && line.match?(/\A#{Regexp.escape(lhs)}\s*=\s*extractelement\b/)
           if line.respond_to?(:pointer) && line.respond_to?(:value_type) && line.value_type == "ptr" && function_pointer_table_slots.key?(line.pointer)
             slot = function_pointer_table_slots.fetch(line.pointer)
-            pointer = global_function_pointer_tables.fetch(slot.name).fetch(slot.index)
+            pointer = global_function_pointer_tables.fetch(slot.name).first
             registers[lhs] = c_value_name(lhs)
             function_pointers[lhs] = FunctionPointerValue.new(signature: pointer.signature, value: registers.fetch(lhs))
             next
@@ -1424,7 +1458,7 @@ module PFC
       end
 
       def supported_atomicrmw_operator?(operator)
-        %w[xchg add sub and nand or xor max min umax umin].include?(operator)
+        %w[xchg add sub and nand or xor max min umax umin uinc_wrap udec_wrap usub_cond usub_sat].include?(operator)
       end
 
       def atomicrmw_next_expression(operator, bits, prefix)
@@ -1441,6 +1475,10 @@ module PFC
         when "umin" then "(#{prefix}_old < #{prefix}_value ? #{prefix}_old : #{prefix}_value)"
         when "max" then "(#{signed_expression("#{prefix}_old", bits)} > #{signed_expression("#{prefix}_value", bits)} ? #{prefix}_old : #{prefix}_value)"
         when "min" then "(#{signed_expression("#{prefix}_old", bits)} < #{signed_expression("#{prefix}_value", bits)} ? #{prefix}_old : #{prefix}_value)"
+        when "uinc_wrap" then "(#{prefix}_old >= #{prefix}_value ? 0ull : ((#{prefix}_old + 1ull) & #{mask}))"
+        when "udec_wrap" then "((#{prefix}_old == 0ull || #{prefix}_old > #{prefix}_value) ? #{prefix}_value : ((#{prefix}_old - 1ull) & #{mask}))"
+        when "usub_cond" then "(#{prefix}_old >= #{prefix}_value ? ((#{prefix}_old - #{prefix}_value) & #{mask}) : #{prefix}_old)"
+        when "usub_sat" then "(#{prefix}_old >= #{prefix}_value ? ((#{prefix}_old - #{prefix}_value) & #{mask}) : 0ull)"
         end
       end
 
@@ -1543,8 +1581,30 @@ module PFC
       def emit_pointer_load(destination, pointer)
         if function_pointer_table_slots.key?(pointer)
           slot = function_pointer_table_slots.fetch(pointer)
-          function_pointers[destination] = global_function_pointer_tables.fetch(slot.name).fetch(slot.index)
-          return []
+          table = global_function_pointer_tables.fetch(slot.name)
+          if function_pointer_table_static_index?(slot)
+            function_pointers[destination] = table.fetch(slot.index.to_i)
+            return []
+          end
+
+          target = register(destination)
+          function_pointers[destination] = FunctionPointerValue.new(signature: table.first.signature, value: target)
+          index = llvm_value(slot.index)
+          prefix = next_memory_intrinsic_prefix
+          lines = [
+            "    {",
+            "        long long #{prefix}_index = (long long)(#{index});",
+            "        if (#{prefix}_index < 0 || #{prefix}_index >= #{table.length}) {",
+            "            fprintf(stderr, \"pfc runtime error: LLVM function pointer table index out of range\\n\");",
+            "            PF_ABORT();",
+            "        }",
+            "        #{target} = 0ull;"
+          ]
+          table.each_with_index do |entry, table_index|
+            lines << "        if (#{prefix}_index == #{table_index}) #{target} = #{entry.value};"
+          end
+          lines << "    }"
+          return lines
         end
 
         address = memory_address(pointer)
@@ -4416,7 +4476,7 @@ module PFC
         pointer = if global_strings.key?(stripped)
                     GlobalStringPointer.new(name: stripped, offset: 0)
                   else
-                    if external_global_declaration?(stripped)
+                    if external_global_declaration?(stripped) && !external_global_stubs.key?(stripped)
                       raise Frontend::LLVMSubset::ParseError, "unsupported external global reference: #{stripped}"
                     end
                     resolve_pointer(stripped, context:)
@@ -4551,7 +4611,7 @@ module PFC
         return EncodedPointer.new(value: "0ull") if token == "null"
         return FunctionPointer.new(name: token.delete_prefix("@")) if token.start_with?("@") && function_signature(token.delete_prefix("@"))
         return GlobalStringPointer.new(name: token, offset: 0) if global_strings.key?(token)
-        if external_global_declaration?(token)
+        if external_global_declaration?(token) && !external_global_stubs.key?(token)
           raise Frontend::LLVMSubset::ParseError, "unsupported external global reference: #{token}"
         end
 
