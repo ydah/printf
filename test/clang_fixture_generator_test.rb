@@ -15,7 +15,8 @@ class ClangFixtureGeneratorTest < Minitest::Test
       define i32 @main() #0 !dbg !12 {
           #dbg_value(i32 1, !15, !DIExpression(), !22)
         %1 = add i32 1, 2, !dbg !23
-        ret i32 %1, !dbg !24
+        %2 = call i32 @putchar(i32 %1), !dbg !24
+        ret i32 %2, !dbg !25
       }
 
       attributes #0 = { nofree nounwind "target-cpu"="apple-m1" }
@@ -35,10 +36,12 @@ class ClangFixtureGeneratorTest < Minitest::Test
       define i32 @main() #3 !dbg !99 {
         call void @llvm.dbg.value(metadata i32 1, metadata !50, metadata !DIExpression()), !dbg !51
         %1 = add i32 1, 2, !dbg !52
-        ret i32 %1, !dbg !53
+        %2 = call i32 @putchar(i32 noundef %1), !dbg !53
+        ret i32 %2, !dbg !54
       }
 
       declare void @llvm.dbg.value(metadata, metadata, metadata) #4
+      declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg) #5
       attributes #3 = { mustprogress nofree nounwind "target-cpu"="apple-m4" }
       attributes #4 = { nounwind }
 

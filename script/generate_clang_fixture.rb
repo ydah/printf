@@ -16,6 +16,7 @@ module ClangFixtureGenerator
       line = line.gsub(/, ![-A-Za-z0-9_.]+ !\d+/, "")
       line = line.gsub(/\s+![-A-Za-z0-9_.]+ !\d+/, "")
       line = line.gsub(/\s+#\d+(?=(?:\s*\{|,|\s*$))/, "")
+      line = normalize_llvm_value_attributes(line)
       normalized_lines << line.rstrip
     end
 
@@ -32,7 +33,28 @@ module ClangFixtureGenerator
       line.start_with?("attributes #") ||
       line.start_with?("!llvm.") ||
       line.match?(/\A!\d+ = /) ||
-      line.include?("llvm.dbg.")
+      line.include?("llvm.dbg.") ||
+      stripped.start_with?("declare ") && stripped.include?("@llvm.")
+  end
+
+  def normalize_llvm_value_attributes(line)
+    line
+      .gsub(/\bnoundef\s+/, "")
+      .gsub(/\b(?:noalias|nocapture|readonly|readnone|writeonly|immarg)\s+/, "")
+      .gsub(/\bcaptures\([^)]*\)\s*/, "")
+      .gsub(/\bptr\s+align\s+\d+\s+/, "ptr ")
+  end
+
+  def fixture_difference_summary(expected, actual)
+    expected_lines = expected.lines
+    actual_lines = actual.lines
+    max_length = [expected_lines.length, actual_lines.length].max
+    index = (0...max_length).find { |line_index| expected_lines[line_index] != actual_lines[line_index] }
+    return "normalized fixture contents differ" unless index
+
+    expected_line = expected_lines[index] || "<missing>\n"
+    actual_line = actual_lines[index] || "<missing>\n"
+    "normalized fixture differs at line #{index + 1}:\n- #{expected_line}+ #{actual_line}"
   end
 
   def generate_fixture(options, input, output)
@@ -84,6 +106,7 @@ module ClangFixtureGenerator
         next if generated_content == fixture_content
 
         warn "fixture is stale: #{output}"
+        warn fixture_difference_summary(fixture_content, generated_content)
         warn "regenerate with: #{options.fetch(:clang)} -S -emit-llvm -O#{options.fetch(:opt)} -g #{input} -o #{output}"
         exit 1
       end
