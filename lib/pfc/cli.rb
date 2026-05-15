@@ -169,7 +169,9 @@ module PFC
       begin
         Backend::LLVMCEmitter.new(source).emit
       rescue Frontend::LLVMSubset::ParseError, ArgumentError => e
-        errors << { line: e.message[/\Aline (\d+):/, 1]&.to_i, message: e.message }
+        line = e.message[/\Aline (\d+):/, 1]&.to_i
+        line_text = line ? source.lines.fetch(line - 1, "").strip : nil
+        errors << llvm_check_diagnostic(line:, line_text:, message: e.message)
       end
       errors = errors.uniq { |error| [error.fetch(:line), error.fetch(:message)] }
       { path:, supported: errors.empty?, errors: }
@@ -180,17 +182,47 @@ module PFC
         line = raw_line.sub(/;.*/, "").strip
         next if line.empty? || line == "}" || line.match?(/\A[-A-Za-z$._0-9]+:\z/)
         next if line.match?(/\A(?:source_filename|target|attributes|![A-Za-z0-9_.-]+|declare|define)\b/)
+        next if line.match?(/\A#dbg_[A-Za-z0-9_.]+\b/)
         next if line.match?(/\A[@%][-A-Za-z$._0-9]+\s*=/) && !line.include?(" = ")
         message = llvm_static_unsupported_type_message(line)
-        next({ line: line_number, message: }) if message
+        next(llvm_check_diagnostic(line: line_number, line_text: line, message:)) if message
         next if llvm_static_supported_line?(line)
 
-        { line: line_number, message: llvm_static_check_message(line) }
+        llvm_check_diagnostic(line: line_number, line_text: line, message: llvm_static_check_message(line))
       end
     end
 
+    def llvm_check_diagnostic(line:, line_text:, message:)
+      {
+        severity: "error",
+        line:,
+        opcode: llvm_diagnostic_opcode(line_text || message),
+        message:,
+        hint: llvm_diagnostic_hint(message, line_text),
+        line_text:
+      }
+    end
+
+    def llvm_diagnostic_opcode(text)
+      return nil if text.nil? || text.empty?
+
+      text[/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?([A-Za-z0-9_.]+)/, 1] || "unknown"
+    end
+
+    def llvm_diagnostic_hint(message, line_text)
+      text = [message, line_text].compact.join("\n")
+      return "Use scalar integer operations or explicitly lower vectors before invoking pfc." if text.include?("vector")
+      return "Lower floating-point operations to integer code before invoking pfc." if text.include?("floating-point")
+      return "Avoid i128 or truncate to a supported integer width before this operation." if text.include?("i128")
+      return "blockaddress is outside the subset; use normal labels and branches." if text.include?("blockaddress")
+      return "Provide a definition for the global or replace it with a supported local/global pointer." if text.include?("external global")
+      return "Only the default address space is supported." if text.include?("address space")
+
+      "Run `pfc llvm-capabilities` for supported syntax and lower this construct before compiling."
+    end
+
     def llvm_static_supported_line?(line)
-      line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?(?:alloca|getelementptr|load|store|add|sub|mul|udiv|sdiv|urem|srem|and|or|xor|shl|lshr|ashr|zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast|freeze|icmp|select|phi|call|switch|br|ret|unreachable)\b/) ||
+      line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?(?:(?:tail|musttail|notail)\s+)?(?:alloca|getelementptr|load|store|extractelement|insertelement|add|sub|mul|udiv|sdiv|urem|srem|and|or|xor|shl|lshr|ashr|zext|sext|trunc|ptrtoint|inttoptr|bitcast|addrspacecast|freeze|icmp|select|phi|call|switch|br|ret|unreachable)\b/) ||
         line.match?(/\A[@%][-A-Za-z$._0-9]+\s*=.*\b(?:global|constant|alias)\b/)
     end
 
@@ -204,10 +236,9 @@ module PFC
     end
 
     def llvm_static_unsupported_type_message(line)
-      return "unsupported vector type" if line.match?(/(?:^|\s)<(?:vscale\s+x\s+)?\d+\s+x\s+[^>]+>/)
+      return "unsupported scalable vector type" if line.match?(/(?:^|\s)<vscale\s+x\s+/)
+      return "unsupported vector type" if line.match?(/(?:^|\s)<\d+\s+x\s+(?!i(?:1|8|16|32|64)\b)[^>]+>/)
       return "unsupported floating-point type" if line.match?(/\b(?:half|float|double|fp128|x86_fp80|ppc_fp128)\b/)
-      return "unsupported i128 type" if line.match?(/\bi128\b/)
-
       nil
     end
 
@@ -358,9 +389,10 @@ module PFC
       <<~TEXT
         LLVM subset capabilities:
           memory:
-            - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64
+            - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus limited i128 load/store
             - byte-addressed numeric globals, with global writable and constant read-only
             - struct/array global initializers and aggregate load/store byte copies
+            - fixed-length integer vector alloca/load/store byte copies
             - pointer load/store and pointer fields inside aggregates
             - read-only global string byte memory for load/getelementptr/ptrtoint
             - constant and dynamic getelementptr for integer, array, and struct element sizes
@@ -375,7 +407,7 @@ module PFC
             - true/false/undef/poison/zeroinitializer scalar constants
             - add/sub/mul, signed/unsigned division and remainder
             - bitwise and/or/xor, shl/lshr/ashr
-            - zext/sext/trunc
+            - zext/sext/trunc, including trunc from i128 to supported integer widths
             - ptrtoint and tagged inttoptr for local/global/string pointer values
             - bitcast ptr-to-ptr
             - addrspacecast for default address-space pointers
@@ -385,6 +417,7 @@ module PFC
             - freeze
             - llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics
             - extractvalue and insertvalue for scalar integer fields in aggregate values
+            - fixed-length <N x i8/i16/i32/i64> zeroinitializer, extractelement, and insertelement
           control:
             - br, switch, phi, ret
             - unreachable as runtime abort
@@ -398,8 +431,10 @@ module PFC
             - target datalayout used for pointer width and struct layout
             - module-level metadata and attributes blocks accepted as no-ops
             - common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops
-            - explicit diagnostics for vector, floating-point, i128, blockaddress, external globals, and non-zero address spaces
-            - llvm.assume and llvm.dbg.* accepted as no-op intrinsics
+            - llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals
+            - llvm-capabilities --check reports multi-error diagnostics with severity/opcode/hint/line_text in JSON mode
+            - explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces
+            - llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.expect.* accepted as identity intrinsic
           libc:
             - putchar, getchar, puts
@@ -410,9 +445,10 @@ module PFC
     def llvm_capabilities_data
       {
         memory: [
-          "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64",
+          "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus limited i128 load/store",
           "byte-addressed numeric globals with global writable and constant read-only semantics",
           "struct/array global initializers and aggregate load/store byte copies",
+          "fixed-length integer vector alloca/load/store byte copies",
           "pointer load/store and pointer fields inside aggregates",
           "read-only global string byte memory for load/getelementptr/ptrtoint",
           "constant and dynamic getelementptr for integer, array, and struct element sizes",
@@ -428,7 +464,7 @@ module PFC
           "true/false/undef/poison/zeroinitializer scalar constants",
           "add/sub/mul, signed/unsigned division and remainder",
           "bitwise and/or/xor, shl/lshr/ashr",
-          "zext/sext/trunc",
+          "zext/sext/trunc, including trunc from i128 to supported integer widths",
           "ptrtoint and tagged inttoptr for local/global/string pointer values",
           "bitcast ptr-to-ptr",
           "addrspacecast for default address-space pointers",
@@ -437,7 +473,8 @@ module PFC
           "pointer phi",
           "freeze",
           "llvm.smax/smin/umax/umin, llvm.abs, llvm.bswap, llvm.ctpop, llvm.ctlz, and llvm.cttz scalar intrinsics",
-          "extractvalue and insertvalue for scalar integer fields in aggregate values"
+          "extractvalue and insertvalue for scalar integer fields in aggregate values",
+          "fixed-length <N x i8/i16/i32/i64> zeroinitializer, extractelement, and insertelement"
         ],
         control: [
           "br, switch, phi, ret",
@@ -453,8 +490,10 @@ module PFC
           "target datalayout used for pointer width and struct layout",
           "module-level metadata and attributes blocks accepted as no-ops",
           "common noundef/nonnull/dereferenceable-style value attributes accepted as no-ops",
-          "explicit diagnostics for vector, floating-point, i128, blockaddress, external globals, and non-zero address spaces",
-          "llvm.assume and llvm.dbg.* accepted as no-op intrinsics",
+          "llvm.global_ctors and llvm.global_dtors accepted as no-op metadata globals",
+          "llvm-capabilities --check reports multi-error diagnostics with severity/opcode/hint/line_text in JSON mode",
+          "explicit diagnostics for unsupported vector shapes, floating-point, unsupported i128 operations, blockaddress, external globals, and non-zero address spaces",
+          "llvm.assume, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.expect.* accepted as identity intrinsic"
         ],
         libc: [

@@ -119,7 +119,7 @@ class CLITest < Minitest::Test
         define i32 @main() {
         entry:
           %x = fadd float 1.0, 2.0
-          %y = add <2 x i32> <i32 1, i32 2>, <i32 3, i32 4>
+          %y = add <vscale x 2 x i32> zeroinitializer, zeroinitializer
           ret i32 0
         }
       LLVM
@@ -133,7 +133,13 @@ class CLITest < Minitest::Test
       refute result.fetch("supported")
       messages = result.fetch("errors").map { |error| error.fetch("message") }.join("\n")
       assert_includes messages, "unsupported floating-point type"
-      assert_includes messages, "unsupported vector type"
+      assert_includes messages, "unsupported scalable vector type"
+
+      first_error = result.fetch("errors").first
+      assert_equal "error", first_error.fetch("severity")
+      assert first_error.key?("opcode")
+      assert first_error.key?("hint")
+      assert first_error.key?("line_text")
     end
   end
 
