@@ -418,6 +418,7 @@ module PFC
         candidates << llvm_opcode_suggestion(entry.fetch(:name), entry.fetch(:count))
       end
       candidates.compact!
+      candidates.map! { |candidate| llvm_enrich_next_suggestion(candidate, report) }
       intrinsic_names = report.fetch(:top_unsupported_intrinsics).map { |entry| entry.fetch(:name) }
       {
         schema_version: 1,
@@ -458,6 +459,15 @@ module PFC
       { feature:, count:, rationale: "Observed unsupported opcode #{name}. Prioritize only common patterns before adding general semantics." }
     end
 
+    def llvm_enrich_next_suggestion(candidate, report)
+      unsupported_files = report.fetch(:summary, {}).fetch(:unsupported_files, nil)
+      max_reduction = unsupported_files ? [candidate.fetch(:count), unsupported_files].min : candidate.fetch(:count)
+      candidate.merge(
+        fixture_candidate: "add or move a focused fixture when this feature is implemented",
+        unsupported_reduction_upper_bound: max_reduction
+      )
+    end
+
     def generic_call_suggestion_shadowed?(candidate, intrinsic_names)
       candidate.fetch(:feature) == "LLVM opcode call" && !intrinsic_names.empty?
     end
@@ -472,6 +482,7 @@ module PFC
       suggestions.fetch(:suggestions).each do |entry|
         puts "  #{entry.fetch(:feature)}: count=#{entry.fetch(:count)}"
         puts "    #{entry.fetch(:rationale)}"
+        puts "    fixture: #{entry.fetch(:fixture_candidate)}; max_unsupported_reduction=#{entry.fetch(:unsupported_reduction_upper_bound)}"
       end
     end
 
@@ -596,7 +607,7 @@ module PFC
       llvm_sarif_diagnostics(result).map do |diagnostic|
         {
           ruleId: llvm_sarif_rule_id(diagnostic),
-          level: diagnostic.fetch(:severity) == "warning" ? "warning" : "error",
+          level: diagnostic.fetch(:severity) == "info" ? "note" : (diagnostic.fetch(:severity) == "warning" ? "warning" : "error"),
           message: { text: diagnostic.fetch(:message) },
           properties: {
             suggestion: diagnostic.fetch(:suggestion),
@@ -742,6 +753,8 @@ module PFC
         if line.match?(/\bvolatile\b/) && line.match?(/\A(?:#{PFC::Backend::LLVMCEmitter::NAME}\s*=\s*)?(?:load|store)\b/)
           next llvm_check_diagnostic(line: line_number, line_text: line, message: "volatile memory access is accepted as backend-equivalent, not target-volatile")
         end
+        backend_equivalent = llvm_static_backend_equivalent_message(line)
+        next(llvm_check_diagnostic(line: line_number, line_text: line, message: backend_equivalent)) if backend_equivalent
         next if llvm_static_supported_line?(line)
 
         llvm_check_diagnostic(line: line_number, line_text: line, message: llvm_static_check_message(line))
@@ -788,6 +801,7 @@ module PFC
 
     def llvm_diagnostic_hint(message, line_text)
       text = [message, line_text].compact.join("\n")
+      return "This construct is accepted, but pfc lowers it to portable single-thread C semantics rather than target-specific LLVM semantics." if text.include?("backend-equivalent")
       return "Use supported fixed-length integer vector operations or explicitly lower vectors to scalar code." if text.include?("vector") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
       return "Lower floating-point operations to integer code before invoking pfc." if text.include?("floating-point")
       return "Use only supported i128 load/store, zeroinitializer, add/sub, bitwise and/or/xor, signed/unsigned comparisons, select, zext/sext, or truncation to a supported integer width." if text.include?("i128")
@@ -800,6 +814,7 @@ module PFC
 
     def llvm_diagnostic_explanation(message, line_text)
       text = [message, line_text].compact.join("\n")
+      return "The standalone backend has no target memory model or unwinder, so accepted atomic/fence/invoke constructs are documented as simplified backend-equivalent lowerings." if text.include?("backend-equivalent")
       return "Scalable vectors, non-integer vector lanes, and unsupported vector opcodes do not have a stable lowering in this subset." if text.include?("scalable vector") || text.include?("unsupported vector") || text.match?(/<\d+\s+x\s+i(?:1|8|16|32|64)>/)
       return "The backend models integer operations with unsigned host scalars, so floating-point semantics are intentionally not lowered." if text.include?("floating-point")
       return "i128 is represented as low and high 64-bit halves for memory movement, add/sub, bitwise operations, signed/unsigned comparisons, selection, extension, and narrowing." if text.include?("i128")
@@ -812,6 +827,7 @@ module PFC
 
     def llvm_fix_suggestions(message, line_text)
       text = [message, line_text].compact.join("\n")
+      return ["keep this construct only when portable single-thread backend-equivalent semantics are acceptable"] if text.include?("backend-equivalent")
       if text.match?(/\b(add|sub|mul|[us]div|[us]rem|and|or|xor|shl|lshr|ashr)\s+<\d+\s+x\s+i(?:1|8|16|32|64)>/)
         return [
           "replace vector arithmetic with extractelement per lane, scalar operations, and insertelement reconstruction",
@@ -943,6 +959,16 @@ module PFC
       return "unsupported scalable vector type" if line.match?(/(?:^|\s)<vscale\s+x\s+/)
       return "unsupported vector type" if line.match?(/(?:^|\s)<\d+\s+x\s+(?!(?:i(?:1|8|16|32|64)|ptr)\b)[^>]+>/)
       return "unsupported floating-point type" if line.match?(/\b(?:half|float|double|fp128|x86_fp80|ppc_fp128)\b/)
+      nil
+    end
+
+    def llvm_static_backend_equivalent_message(line)
+      return "nounwind invoke is accepted as backend-equivalent call plus normal branch" if line.match?(/\A(?:[@%][-A-Za-z$._0-9]+\s*=\s*)?invoke\b/) && line.match?(/\bnounwind\b/)
+      return "fence is accepted as backend-equivalent single-thread no-op" if line.start_with?("fence ")
+      return "atomic memory access is accepted as backend-equivalent single-thread memory access" if line.match?(/\A(?:#{PFC::Backend::LLVMCEmitter::NAME}\s*=\s*)?(?:load|store)\b/) && line.match?(/\batomic\b/)
+      return "atomic read-modify-write is accepted as backend-equivalent single-thread load/store lowering" if line.match?(/\A(?:#{PFC::Backend::LLVMCEmitter::NAME}\s*=\s*)?atomicrmw\b/)
+      return "cmpxchg is accepted as backend-equivalent single-thread compare-and-store lowering" if line.match?(/\A(?:#{PFC::Backend::LLVMCEmitter::NAME}\s*=\s*)?cmpxchg\b/)
+
       nil
     end
 
@@ -1098,13 +1124,13 @@ module PFC
         LLVM subset capabilities:
           memory:
             - scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus i128 load/store with high 64-bit preservation
-            - byte-addressed numeric globals and mutable byte-string globals, with global writable, constant read-only, and zero-initialized integer external-global stub storage
-            - struct/array global initializers and aggregate load/store byte copies in main and internal functions
+            - byte-addressed numeric globals and mutable byte-string globals, with global writable, constant read-only, and zero-initialized integer/aggregate external-global stub storage
+            - struct/array global initializers, including nested [N x i8] c"..." initializers, and aggregate load/store byte copies in main and internal functions
             - fixed-length integer vector alloca/load/store byte copies in main and internal functions
             - pointer load/store and pointer fields inside aggregates
             - read-only global string byte memory for load/getelementptr/ptrtoint
-            - constant and dynamic getelementptr for integer, array, struct, vector, and compound aggregate element sizes
-            - constant-expression getelementptr/bitcast/inttoptr pointer operands, ptrtoint scalar operands, and global initializer relocations
+            - constant and dynamic getelementptr for integer, array, struct, vector, and compound aggregate element sizes, including inrange(...) no-op bounds metadata
+            - constant-expression getelementptr/bitcast/inttoptr/select pointer operands, ptrtoint scalar operands, pointer icmp, and global initializer relocations
             - llvm.memcpy.inline.* over local/global memory
             - named struct alloca and struct field getelementptr
             - constant-count alloca, with dynamic-count alloca reserving tape-size capacity
@@ -1131,7 +1157,7 @@ module PFC
             - fixed-length <N x i8/i16/i32/i64> literals, zeroinitializer, add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr scalarization, arbitrary constant-mask shufflevector, pointer-vector shufflevector, vector icmp/select, extractelement, and insertelement with runtime index checks
             - fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns
           control:
-            - br, switch with bit-width-masked integer case comparisons, scalar/pointer/i128/vector/aggregate phi, ret
+            - br, dense switch lowered to C switch with bit-width-masked integer case comparisons, scalar/pointer/i128/vector/aggregate phi, ret
             - unreachable as runtime abort
             - tail/musttail/notail accepted as no-op call markers
             - void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments
@@ -1150,12 +1176,12 @@ module PFC
             - llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode
             - llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output
             - llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, severities, and top unsupported opcode/intrinsic rankings
-            - llvm-capabilities --suggest-next proposes next implementation candidates from coverage rankings
+            - llvm-capabilities --suggest-next proposes next implementation candidates from coverage rankings with fixture-candidate and unsupported-reduction context
             - llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning
             - docs/llvm-capabilities.schema.json publishes the check JSON contract
             - llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata
             - info-level diagnostics distinguish accepted backend-equivalent constructs from warnings and errors
-            - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces
+            - explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, non-zero address spaces, and accepted backend-equivalent simplifications
             - llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops
             - llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics
             - single-thread atomic load/store plus atomicrmw/cmpxchg accepted as normal memory access, including uinc_wrap/udec_wrap/usub_cond/usub_sat integer atomicrmw variants, and fence accepted as a no-op
@@ -1170,13 +1196,13 @@ module PFC
       {
         memory: [
           "scalar and fixed-array alloca/load/store over i1/i8/i16/i32/i64, plus i128 load/store with high 64-bit preservation",
-          "byte-addressed numeric globals and mutable byte-string globals with global writable, constant read-only, and zero-initialized integer external-global stub semantics",
-          "struct/array global initializers and aggregate load/store byte copies in main and internal functions",
+          "byte-addressed numeric globals and mutable byte-string globals with global writable, constant read-only, and zero-initialized integer/aggregate external-global stub semantics",
+          "struct/array global initializers, including nested [N x i8] c\"...\" initializers, and aggregate load/store byte copies in main and internal functions",
           "fixed-length integer vector alloca/load/store byte copies in main and internal functions",
           "pointer load/store and pointer fields inside aggregates",
           "read-only global string byte memory for load/getelementptr/ptrtoint",
-          "constant and dynamic getelementptr for integer, array, struct, vector, and compound aggregate element sizes",
-          "constant-expression getelementptr/bitcast/inttoptr pointer operands, ptrtoint scalar operands, and global initializer relocations",
+          "constant and dynamic getelementptr for integer, array, struct, vector, and compound aggregate element sizes, including inrange(...) no-op bounds metadata",
+          "constant-expression getelementptr/bitcast/inttoptr/select pointer operands, ptrtoint scalar operands, pointer icmp, and global initializer relocations",
           "llvm.memcpy.inline.* over local/global memory",
           "named struct alloca and struct field getelementptr",
           "constant-count alloca, with dynamic-count alloca reserving tape-size capacity",
@@ -1205,7 +1231,7 @@ module PFC
           "fixed-length <N x ptr> zeroinitializer, insert/extractelement, vector icmp/select, phi, aggregate fields, and internal-call arguments/returns"
         ],
         control: [
-          "br, switch with bit-width-masked integer case comparisons, scalar/pointer/i128/vector/aggregate phi, ret",
+          "br, dense switch lowered to C switch with bit-width-masked integer case comparisons, scalar/pointer/i128/vector/aggregate phi, ret",
           "unreachable as runtime abort",
           "tail/musttail/notail accepted as no-op call markers",
           "void @main and nested non-recursive internal calls with integer/pointer/void returns plus aggregate/i128/vector returns and integer/pointer/i128/vector/aggregate arguments",
@@ -1225,12 +1251,12 @@ module PFC
           "llvm-capabilities --check reports schema_version plus diagnostic summary, severity/opcode/hint/explanation/suggestion/fix_suggestions/docs_url/minimal_repro_hint/line_text in JSON mode",
           "llvm-capabilities --check-dir supports summary counts, include/exclude globs, fail-on policies, max warning limits, and SARIF output",
           "llvm-capabilities --coverage-report summarizes instruction opcode counts, diagnostic opcode counts, severities, and top unsupported opcode/intrinsic rankings",
-          "llvm-capabilities --suggest-next proposes next implementation candidates from coverage rankings",
+          "llvm-capabilities --suggest-next proposes next implementation candidates from coverage rankings with fixture-candidate and unsupported-reduction context",
           "llvm-capabilities --check/--check-dir --validate-schema validates the emitted JSON contract before returning",
           "docs/llvm-capabilities.schema.json publishes the check JSON contract",
           "llvm-capabilities --explain, --fix-suggestions, and --emit-lowering-plan print lowering guidance with replacement/risk/runtime-support metadata",
           "info-level diagnostics distinguish accepted backend-equivalent constructs from warnings and errors",
-          "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, and non-zero address spaces",
+          "explicit diagnostics for unsupported vector shapes/shuffles, floating-point, unsupported i128 operations, atomics, exception handling, varargs, blockaddress, external globals, non-zero address spaces, and accepted backend-equivalent simplifications",
           "llvm.assume.*, llvm.sideeffect, llvm.donothing, llvm.invariant.end, llvm.dbg.*, and #dbg_* debug records accepted as no-ops",
           "llvm.objectsize.*, llvm.is.constant.*, llvm.annotation.*, llvm.ptr.annotation.*, and llvm.invariant.start accepted as conservative identity/query intrinsics",
           "single-thread atomic load/store plus atomicrmw/cmpxchg accepted as normal memory access, including uinc_wrap/udec_wrap/usub_cond/usub_sat integer atomicrmw variants, and fence accepted as a no-op",

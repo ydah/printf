@@ -11,6 +11,7 @@ class LLVMConformanceTest < Minitest::Test
 
   SUPPORTED_FIXTURES = {
     "aggregate_phi_fields.ll" => "B",
+    "aggregate_string_initializer.ll" => "B",
     "aggregate_argument_abi.ll" => "B",
     "atomic_cmpxchg_single_thread.ll" => "B",
     "atomic_fence_single_thread.ll" => "B",
@@ -19,9 +20,12 @@ class LLVMConformanceTest < Minitest::Test
     "clang_noop_intrinsics.ll" => "B",
     "compound_gep_lifetime.ll" => "B",
     "constexpr_ptrtoint_gep.ll" => "B",
+    "constexpr_pointer_select_icmp.ll" => "B",
     "dynamic_function_pointer_tables.ll" => "B",
+    "external_struct_global_stub.ll" => "B",
     "external_global_stub.ll" => "B",
     "function_pointer_tables.ll" => "B",
+    "gep_inrange_instruction.ll" => "B",
     "global_byte_string_initializer.ll" => "B",
     "heap_alloc.ll" => "B",
     "integer_intrinsics_extended.ll" => "B",
@@ -48,6 +52,8 @@ class LLVMConformanceTest < Minitest::Test
     "shufflevector_limited.ll" => "B",
     "shufflevector_pointer.ll" => "B",
     "switch_narrow_negative.ll" => "B",
+    "switch_dense_lowering.ll" => "B",
+    "memory_intrinsic_attributes.ll" => "B",
     "overflow_intrinsics.ll" => "B",
     "select_phi_matrix.ll" => "B",
     "vector_add.ll" => "B",
@@ -111,6 +117,40 @@ class LLVMConformanceTest < Minitest::Test
 
     assert_empty err
     assert_includes out, "fix: lower this construct"
+  end
+
+  def test_backend_equivalent_constructs_are_reported_as_info
+    Dir.mktmpdir("pfc-info-diagnostic") do |dir|
+      path = File.join(dir, "info.ll")
+      File.write(path, <<~LLVM)
+        define i32 @main() {
+        entry:
+          fence syncscope("singlethread") seq_cst
+          ret i32 0
+        }
+      LLVM
+
+      out, err = capture_io do
+        assert_equal 0, PFC::CLI.new(["llvm-capabilities", "--check", "--json", path]).run
+      end
+
+      assert_empty err
+      result = JSON.parse(out)
+      diagnostic = result.fetch("diagnostics").find { |entry| entry.fetch("message").include?("backend-equivalent") }
+      refute_nil diagnostic
+      assert_equal "info", diagnostic.fetch("severity")
+    end
+  end
+
+  def test_suggest_next_reports_fixture_reduction_context
+    out, err = capture_io do
+      assert_equal 1, PFC::CLI.new(["llvm-capabilities", "--suggest-next", "--json", unsupported_path("vector_add.ll")]).run
+    end
+
+    assert_empty err
+    suggestion = JSON.parse(out).fetch("suggestions").first
+    assert suggestion.key?("fixture_candidate")
+    assert suggestion.key?("unsupported_reduction_upper_bound")
   end
 
   def test_lowering_plan_is_structured_json

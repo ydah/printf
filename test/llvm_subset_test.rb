@@ -90,6 +90,22 @@ class LLVMSubsetTest < Minitest::Test
     refute parsed.fetch(:global_strings).key?("@.buffer")
   end
 
+  def test_parser_decodes_aggregate_string_initializer
+    source = <<~LLVM
+      %struct.Payload = type { [3 x i8], i8 }
+      @.payload = global %struct.Payload { [3 x i8] c"AB\\00", i8 67 }, align 1
+
+      define i32 @main() {
+      entry:
+        ret i32 0
+      }
+    LLVM
+
+    parsed = PFC::Frontend::LLVMSubset::Parser.parse(source)
+
+    assert_equal [65, 66, 0, 67], parsed.fetch(:global_numeric_data).fetch("@.payload")
+  end
+
   def test_parser_rejects_undefined_branch_label
     source = <<~LLVM
       define i32 @main() {

@@ -246,6 +246,143 @@ class LLVMCompatibilityTest < Minitest::Test
     assert_equal "B", compile_llvm_source_and_run(source)
   end
 
+  def test_aggregate_string_initializer_inside_struct
+    source = <<~LLVM
+      %struct.Payload = type { [3 x i8], i8 }
+      @.payload = global %struct.Payload { [3 x i8] c"AB\\00", i8 78 }, align 1
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %second = getelementptr %struct.Payload, ptr @.payload, i64 0, i32 0, i64 1
+        %value = load i8, ptr %second, align 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_constant_expression_pointer_select_and_icmp
+    source = <<~LLVM
+      @.a = global i8 65, align 1
+      @.b = global i8 66, align 1
+
+      declare i32 @putchar(i32)
+
+      define internal i64 @id64(i64 %value) {
+      entry:
+        ret i64 %value
+      }
+
+      define i32 @main() {
+      entry:
+        %encoded = call i64 @id64(i64 ptrtoint (ptr select (i1 icmp eq (ptr @.a, ptr @.a), ptr @.b, ptr @.a) to i64))
+        %ptr = inttoptr i64 %encoded to ptr
+        %value = load i8, ptr %ptr, align 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_memory_intrinsic_pointer_attributes
+    source = <<~LLVM
+      declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %src = alloca [2 x i8], align 1
+        %dst = alloca [2 x i8], align 1
+        %src1 = getelementptr [2 x i8], ptr %src, i64 0, i64 1
+        store i8 66, ptr %src1, align 1
+        call void @llvm.memcpy.p0.p0.i64(ptr nonnull align 1 %dst, ptr readonly captures(none) %src, i64 noundef 2, i1 immarg false)
+        %dst1 = getelementptr [2 x i8], ptr %dst, i64 0, i64 1
+        %value = load i8, ptr %dst1, align 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_external_struct_global_stub
+    source = <<~LLVM
+      %struct.Pair = type { i8, i8 }
+      @external_pair = external global %struct.Pair, align 1
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %second = getelementptr %struct.Pair, ptr @external_pair, i64 0, i32 1
+        store i8 66, ptr %second, align 1
+        %value = load i8, ptr %second, align 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_getelementptr_inrange_instruction_flag
+    source = <<~LLVM
+      @.buffer = global [2 x i8] c"AB", align 1
+
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        %ptr = getelementptr inbounds inrange(0, 2) [2 x i8], ptr @.buffer, i64 0, i64 1
+        %value = load i8, ptr %ptr, align 1
+        %wide = zext i8 %value to i32
+        call i32 @putchar(i32 %wide)
+        ret i32 0
+      }
+    LLVM
+
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
+  def test_dense_switch_lowers_to_c_switch
+    source = <<~LLVM
+      declare i32 @putchar(i32)
+
+      define i32 @main() {
+      entry:
+        switch i32 4, label %default [
+          i32 0, label %default
+          i32 1, label %default
+          i32 2, label %default
+          i32 3, label %default
+          i32 4, label %hit
+        ]
+      hit:
+        call i32 @putchar(i32 66)
+        ret i32 0
+      default:
+        call i32 @putchar(i32 78)
+        ret i32 0
+      }
+    LLVM
+
+    generated = PFC::Backend::LLVMCEmitter.new(source).emit
+
+    assert_includes generated, "switch ((unsigned long long)(4) & 4294967295u)"
+    assert_equal "B", compile_llvm_source_and_run(source)
+  end
+
   def test_freeze_numeric_intrinsics_and_value_attributes
     source = <<~LLVM
       declare i32 @putchar(i32)

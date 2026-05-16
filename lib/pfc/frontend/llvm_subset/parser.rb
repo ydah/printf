@@ -208,7 +208,7 @@ module PFC
 
           def initialize(text)
             super
-            match = text.match(/\A(#{NAME})\s*=\s*getelementptr((?:\s+(?:inbounds|nuw|nusw|inrange))*)\s+(.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME}),\s+(.+)\z/)
+            match = text.match(/\A(#{NAME})\s*=\s*getelementptr((?:\s+(?:inbounds|nuw|nusw|inrange(?:\([^)]*\))?))*)\s+(.+?),\s+(?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(?:.+\s+)?(#{POINTER_NAME}),\s+(.+)\z/)
             return unless match
 
             @destination = match[1]
@@ -945,6 +945,9 @@ module PFC
         end
 
         def typed_initializer_bytes(type, value, line)
+          if (array_match = type.match(/\A\[(\d+)\s+x\s+i8\]\z/)) && (string_match = value.match(/\Ac"((?:[^"\\]|\\.)*)"\z/))
+            return llvm_string_initializer_bytes(type, array_match[1].to_i, string_match[1], line)
+          end
           if (match = type.match(/\Ai(1|8|16|32|64)\z/))
             return integer_bytes(value, match[1].to_i)
           end

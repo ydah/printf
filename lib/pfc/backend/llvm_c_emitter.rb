@@ -226,6 +226,7 @@ module PFC
 
       def collect_global_initializer_relocations(global, type, initializer, base_offset)
         return [] if initializer == "zeroinitializer"
+        return [] if string_array_initializer?(type, initializer)
 
         values = initializer.delete_prefix("{").delete_prefix("[").delete_suffix("}").delete_suffix("]")
         elements = Frontend::LLVMSubset::Parser::Instruction.split_arguments(values)
@@ -326,7 +327,13 @@ module PFC
       end
 
       def supported_external_global_stub_type?(type)
-        integer_type?(type) || pointer_type_name?(type) || type.match?(/\A\[\d+\s+x\s+i(?:1|8|16|32|64)\]\z/)
+        stripped = type.strip
+        return true if integer_type?(stripped) || stripped == "i128" || pointer_type_name?(stripped)
+        return aggregate_fields(stripped).all? { |field| supported_external_global_stub_type?(field) } if aggregate_type?(stripped)
+
+        false
+      rescue Frontend::LLVMSubset::ParseError
+        false
       end
 
       def function_pointer_phi_signature(line)
@@ -760,6 +767,10 @@ module PFC
         stripped_value = value.to_s.strip
         stripped_type = value_type.to_s.strip
         return Array.new(type_size(stripped_type), 0) if %w[zeroinitializer undef poison].include?(stripped_value)
+        if string_array_initializer?(stripped_type, stripped_value)
+          width = stripped_type[/\A\[(\d+)\s+x\s+i8\]\z/, 1].to_i
+          return llvm_string_initializer_bytes(width, stripped_value[/\Ac"((?:[^"\\]|\\.)*)"\z/, 1])
+        end
         if stripped_type.match(/\A<(\d+)\s+x\s+ptr>\z/)
           count = Regexp.last_match(1).to_i
           return Array.new(count * pointer_size, 0) if stripped_value == "zeroinitializer"
@@ -798,6 +809,38 @@ module PFC
 
       def byte_array_literal(bytes)
         "(unsigned char[]){#{bytes.map { |byte| "#{byte}u" }.join(', ')}}"
+      end
+
+      def string_array_initializer?(type, value)
+        type.to_s.strip.match?(/\A\[\d+\s+x\s+i8\]\z/) && value.to_s.strip.match?(/\Ac"(?:[^"\\]|\\.)*"\z/)
+      end
+
+      def llvm_string_initializer_bytes(width, raw)
+        bytes = decode_llvm_string(raw)
+        raise Frontend::LLVMSubset::ParseError, "global string exceeds declared width" if bytes.length > width
+
+        bytes + Array.new(width - bytes.length, 0)
+      end
+
+      def decode_llvm_string(raw)
+        bytes = []
+        index = 0
+        while index < raw.length
+          if raw[index] == "\\"
+            escape = raw[(index + 1), 2]
+            if escape&.match?(/\A[0-9A-Fa-f]{2}\z/)
+              bytes << escape.to_i(16)
+              index += 3
+            else
+              bytes << raw[(index + 1)].ord
+              index += 2
+            end
+          else
+            bytes << raw[index].ord
+            index += 1
+          end
+        end
+        bytes
       end
 
       def next_aggregate_copy_prefix
@@ -1016,7 +1059,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+\[(\d+)\s+x\s+i8\],\s+(?:ptr|.+?\*)\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange(?:\([^)]*\))?))*\s+\[(\d+)\s+x\s+i8\],\s+(?:ptr|.+?\*)\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
           pointers[match[1]] = GlobalStringPointer.new(
             name: match[3],
             offset: (match[4].to_i * match[2].to_i) + match[5].to_i
@@ -1024,7 +1067,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange(?:\([^)]*\))?))*\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           element_width = byte_width(match[3].to_i)
           aggregate_width = match[2].to_i * element_width
           base_address = memory_address(match[4])
@@ -1036,7 +1079,7 @@ module PFC
           return []
         end
 
-        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange(?:\([^)]*\))?))*\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
         base_address = memory_address(match[3])
@@ -2235,7 +2278,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+\[(\d+)\s+x\s+i8\],\s+(?:ptr|.+?\*)\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange(?:\([^)]*\))?))*\s+\[(\d+)\s+x\s+i8\],\s+(?:ptr|.+?\*)\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\z/)) && global_strings.key?(match[3])
           context.fetch(:pointers)[match[1]] = GlobalStringPointer.new(
             name: match[3],
             offset: (match[4].to_i * match[2].to_i) + match[5].to_i
@@ -2243,7 +2286,7 @@ module PFC
           return []
         end
 
-        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
+        if (match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange(?:\([^)]*\))?))*\s+\[(\d+)\s+x\s+i(1|8|16|32|64)\],\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+?),\s+i\d+\s+(.+)\z/))
           element_width = byte_width(match[3].to_i)
           aggregate_width = match[2].to_i * element_width
           base_address = memory_address(match[4], context:)
@@ -2255,7 +2298,7 @@ module PFC
           return []
         end
 
-        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+)\z/)
+        match = line.match(/\A(#{NAME})\s*=\s*getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange(?:\([^)]*\))?))*\s+i(1|8|16|32|64),\s+(?:ptr|.+?\*)\s+(#{POINTER_NAME}),\s+i\d+\s+(.+)\z/)
         raise Frontend::LLVMSubset::ParseError, "unsupported getelementptr: #{line}" unless match
 
         base_address = memory_address(match[3], context:)
@@ -2631,6 +2674,8 @@ module PFC
           default_label = match[3]
           cases = match[4].scan(/i(?:1|8|16|32|64)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
         end
+        return emit_c_switch(label, value, bits, default_label, cases, context:) if dense_switch_cases?(cases)
+
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
@@ -2782,6 +2827,8 @@ module PFC
           bits = match[1].to_i
           cases = match[4].scan(/i(?:1|8|16|32|64)\s+(-?\d+),\s+label\s+%([-A-Za-z$._0-9]+)/)
         end
+        return emit_c_switch(label, value, bits, default_label, cases) if dense_switch_cases?(cases)
+
         lines = []
         cases.each_with_index do |(case_value, case_label), index|
           prefix = index.zero? ? "if" : "else if"
@@ -3096,6 +3143,12 @@ module PFC
         if (match = stripped.match(/\Aicmp\s+(eq|ne|ugt|uge|ult|ule|sgt|sge|slt|sle)\s*\((.*)\)\z/))
           operands = split_call_arguments(match[2])
           return nil unless operands.length == 2
+          if %w[eq ne].include?(match[1]) && typed_pointer_expression?(operands.fetch(0)) && typed_pointer_expression?(operands.fetch(1))
+            operator = match[1] == "eq" ? "==" : "!="
+            left = typed_pointer_expression(operands.fetch(0), context:)
+            right = typed_pointer_expression(operands.fetch(1), context:)
+            return "(((#{left}) #{operator} (#{right})) ? 1u : 0u)"
+          end
 
           left = typed_scalar_expression(operands.fetch(0), context:)
           right = typed_scalar_expression(operands.fetch(1), context:)
@@ -3134,6 +3187,14 @@ module PFC
           type: match[1],
           value: context ? inline_value(match[3], context) : llvm_value(match[3])
         }
+      end
+
+      def typed_pointer_expression?(raw)
+        raw.to_s.strip.start_with?("ptr ") || raw.to_s.strip.match?(/\A.+?\*\s+/)
+      end
+
+      def typed_pointer_expression(raw, context:)
+        encoded_pointer_value(pointer_argument_value(raw.to_s.strip), context:)
       end
 
       def inline_label(context, label)
@@ -3589,8 +3650,8 @@ module PFC
         stripped = value.strip
         loop do
           before = stripped
-          stripped = stripped.sub(/\A(?:noundef|nonnull|readonly|readnone|writeonly|nocapture|noalias)\s+/, "")
-          stripped = stripped.sub(/\A(?:sret|byval|align|dereferenceable|dereferenceable_or_null|captures)\([^)]*\)\s+/, "")
+          stripped = stripped.sub(/\A(?:noundef|nonnull|readonly|readnone|writeonly|nocapture|noalias|returned|immarg|swifterror|swiftself)\s+/, "")
+          stripped = stripped.sub(/\A(?:sret|byval|align|dereferenceable|dereferenceable_or_null|captures|elementtype)\([^)]*\)\s+/, "")
           stripped = stripped.sub(/\Aalign\s+\d+\s+/, "")
           return stripped if stripped == before
         end
@@ -4436,7 +4497,7 @@ module PFC
       end
 
       def global_string_pointer_literal(raw_pointer)
-        if (match = raw_pointer.match(/getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange))*\s*\(\[(\d+)\s+x\s+i8\],\s+ptr(?:\s+addrspace\(\d+\))?\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\)/))
+        if (match = raw_pointer.match(/getelementptr(?:\s+(?:inbounds|nuw|nusw|inrange(?:\([^)]*\))?))*\s*\(\[(\d+)\s+x\s+i8\],\s+ptr(?:\s+addrspace\(\d+\))?\s+(#{GLOBAL_NAME}),\s+i\d+\s+(-?\d+),\s+i\d+\s+(-?\d+)\)/))
           return GlobalStringPointer.new(
             name: match[2],
             offset: (match[3].to_i * match[1].to_i) + match[4].to_i
@@ -4600,6 +4661,8 @@ module PFC
       def pointer_binding(raw, context: nil)
         stripped = strip_value_attributes(raw)
         raise Frontend::LLVMSubset::ParseError, "unsupported blockaddress constant expression: #{stripped}" if stripped.start_with?("blockaddress")
+        selected = constant_pointer_select_expression(stripped, context:)
+        return selected if selected
 
         if stripped.match(/\A(?:bitcast|addrspacecast)\s*\((?:ptr(?:\s+addrspace\(\d+\))?|.+?\*)\s+(.+?)\s+to\s+.+\)\z/)
           return pointer_binding(Regexp.last_match(1), context:)
@@ -4634,13 +4697,27 @@ module PFC
         stripped = raw.to_s.strip
         loop do
           updated = stripped
-          updated = updated.sub(/\A(?:noundef|nonnull|noalias|readonly|writeonly|returned|nocapture)\s+/, "")
-          updated = updated.sub(/\A(?:dereferenceable|dereferenceable_or_null|align|captures)\([^)]*\)\s+/, "")
+          updated = updated.sub(/\A(?:noundef|nonnull|noalias|readonly|writeonly|returned|nocapture|immarg|swifterror|swiftself)\s+/, "")
+          updated = updated.sub(/\A(?:dereferenceable|dereferenceable_or_null|align|captures|byval|sret|elementtype)\([^)]*\)\s+/, "")
           updated = updated.sub(/\Aalign\s+\d+\s+/, "")
           break stripped if updated == stripped
 
           stripped = updated
         end
+      end
+
+      def constant_pointer_select_expression(raw, context:)
+        match = raw.match(/\Aselect\s*\((.*)\)\z/)
+        return nil unless match
+
+        operands = split_call_arguments(match[1])
+        return nil unless operands.length == 3
+        return nil unless typed_pointer_expression?(operands.fetch(1)) && typed_pointer_expression?(operands.fetch(2))
+
+        condition = typed_scalar_expression(operands.fetch(0), context:).fetch(:value)
+        true_value = typed_pointer_expression(operands.fetch(1), context:)
+        false_value = typed_pointer_expression(operands.fetch(2), context:)
+        EncodedPointer.new(value: "(((#{condition}) != 0u) ? (#{true_value}) : (#{false_value}))")
       end
 
       def constant_gep_pointer(raw, context:)
@@ -4744,6 +4821,27 @@ module PFC
 
       def switch_case_literal(raw_value, bits)
         "#{raw_value.to_i & integer_mask(bits)}#{integer_suffix(bits)}"
+      end
+
+      def dense_switch_cases?(cases)
+        return false unless cases.length >= 4
+
+        values = cases.map { |case_value, _label| case_value.to_i }
+        values.max - values.min <= cases.length * 2
+      end
+
+      def emit_c_switch(label, value, bits, default_label, cases, context: nil)
+        lines = ["    switch ((unsigned long long)(#{value}) & #{integer_mask_literal(bits)}) {"]
+        cases.each do |case_value, case_label|
+          lines << "    case #{switch_case_literal(case_value, bits)}:"
+          lines.concat(context ? inline_phi_goto(context, label, case_label, indent: 2) : phi_goto(label, case_label, indent: 2))
+          lines << "        break;"
+        end
+        lines << "    default:"
+        lines.concat(context ? inline_phi_goto(context, label, default_label, indent: 2) : phi_goto(label, default_label, indent: 2))
+        lines << "        break;"
+        lines << "    }"
+        lines
       end
 
       def unsigned_cast(bits)
